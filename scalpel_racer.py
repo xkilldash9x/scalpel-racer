@@ -15,7 +15,6 @@ import socket
 import struct
 import threading
 from typing import List, AsyncIterator, Optional, Dict, Union
-# Step A: Import urlunparse
 from urllib.parse import urljoin, urlparse, urlunparse
 from collections import defaultdict
 import numpy as np
@@ -29,8 +28,13 @@ SYNC_MARKER = b"{{SYNC}}"
 CA_CERT_FILE = "scalpel_ca.pem"
 CA_KEY_FILE = "scalpel_ca.key"
 
+# Proxy Timeouts (Introduced for robustness)
+INITIAL_LINE_TIMEOUT = 15.0 # Timeout for the client to send the first request line
+HEADERS_TIMEOUT = 60.0      # Timeout for the entire header block
+BODY_READ_TIMEOUT = 120.0   # Timeout for reading the request body
+TUNNEL_IDLE_TIMEOUT = 60.0  # Timeout waiting for the next request inside a CONNECT tunnel
+
 # Define RFC 2616 Hop-by-Hop headers + others managed by httpx/proxies.
-# 'host' is included because it must be managed by the proxy during forwarding.
 HOP_BY_HOP_HEADERS = [
     'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
     'te', 'trailers', 'transfer-encoding', 'upgrade',
@@ -51,7 +55,6 @@ try:
 except ImportError:
     CRYPTOGRAPHY_AVAILABLE = False
     print("[!] 'cryptography' library not found. TLS interception (HTTPS proxy) will be disabled.")
-    print("[!] Install it using: pip install cryptography")
 
 # Hyper-h2 (HTTP/2 State Machine)
 try:
@@ -63,23 +66,17 @@ try:
 except ImportError:
     H2_AVAILABLE = False
     print("[!] 'h2' library not found. Advanced strategies (SPA, First-Seq) will be disabled.")
-    print("[!] Install it using: pip install h2")
 
 # NetfilterQueue (Linux Packet Manipulation)
 try:
-    # Dynamically import NetfilterQueue if available
     from netfilterqueue import NetfilterQueue
     NFQUEUE_AVAILABLE = True
 except ImportError:
     NFQUEUE_AVAILABLE = False
-    # Define a placeholder if not available, mainly for type hinting and testing mocks
     NetfilterQueue = None
-    # Only warn if on Linux, as it's not relevant for Windows/Mac
     if platform.system() == "Linux":
         print("[!] 'NetfilterQueue' not found. 'first-seq' strategy will be disabled.")
-        print("[!] Install it using: pip install NetfilterQueue (requires libnetfilter-queue-dev)")
 except Exception as e:
-    # Catch other potential issues during import (e.g. permission errors if not root)
     NFQUEUE_AVAILABLE = False
     if platform.system() == "Linux":
         print(f"[!] 'NetfilterQueue' import failed: {e}. 'first-seq' strategy will be disabled.")
@@ -107,18 +104,12 @@ class CapturedRequest:
     Represents a captured HTTP request that can be replayed or raced.
     """
     def __init__(self, id: int, method: str, url: str, headers: Dict[str, str], body: bytes):
-        """
-        Initialize a CapturedRequest.
-
-        Args:
-            headers (Dict[str, str]): The HTTP headers (safe for replay, original casing preserved).
-        """
         self.id = id
         self.method = method
         self.url = url
         self.headers = headers
         self.body = body
-        self.edited_body: Optional[bytes] = None # Stores modified body for attack
+        self.edited_body: Optional[bytes] = None
 
     def __str__(self):
         body_len = len(self.get_attack_payload())
@@ -130,7 +121,7 @@ class CapturedRequest:
         return self.edited_body if self.edited_body is not None else self.body
 
 # --- Advanced Engines (PacketController & HTTP2RaceEngine) ---
-# (No changes required for PacketController and HTTP2RaceEngine based on the prompt)
+# (Implementations remain the same as previous version)
 
 class PacketController:
     """
@@ -149,7 +140,6 @@ class PacketController:
 
     def setup_iptables(self):
         print("[*] Setting up iptables rule for traffic interception...")
-        # Queue outgoing traffic to specific IP/Port
         cmd = f"iptables -A OUTPUT -d {self.target_ip} -p tcp --dport {self.target_port} -j NFQUEUE --queue-num {self.queue_num}"
         os.system(cmd)
 
@@ -167,9 +157,7 @@ class PacketController:
             if self.first_packet is None:
                 print("[*] Intercepted First Sequence Packet. Holding...")
                 self.first_packet = packet
-                # Do NOT accept or drop yet. It stays in the queue.
             else:
-                # This is a subsequent packet (2, 3, ...). Let it pass immediately.
                 packet.accept()
 
     def start(self):
@@ -195,26 +183,21 @@ class PacketController:
         self.nfqueue.unbind()
 
 class HTTP2RaceEngine:
-    """
-    Custom HTTP/2 engine using hyper-h2 and raw sockets for
-    Single Packet Attacks (SPA) and frame manipulation.
-    """
+    # (HTTP2RaceEngine implementation remains the same)
     def __init__(self, request: CapturedRequest, concurrency: int, strategy: str, warmup_ms: int):
         self.request = request
         self.concurrency = concurrency
         self.strategy = strategy
         self.warmup_ms = warmup_ms
         self.results = []
-        self.conn = None # H2Connection
+        self.conn = None
         self.sock = None
         self.target_host = urlparse(request.url).hostname
         self.target_port = urlparse(request.url).port or 443
 
     def _create_connection(self):
-        # Create raw TCP socket
         sock = socket.create_connection((self.target_host, self.target_port), timeout=10)
         
-        # Wrap in SSL/TLS with ALPN
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -225,7 +208,6 @@ class HTTP2RaceEngine:
         if self.sock.selected_alpn_protocol() != 'h2':
             raise RuntimeError("Server did not negotiate HTTP/2 via ALPN")
 
-        # Initialize H2 State Machine
         config = h2.config.H2Configuration(client_side=True)
         self.conn = h2.connection.H2Connection(config=config)
         self.conn.initiate_connection()
@@ -237,7 +219,6 @@ class HTTP2RaceEngine:
             if not NFQUEUE_AVAILABLE or not sys.platform.startswith("linux"):
                 raise RuntimeError("First-Seq strategy requires Linux and NetfilterQueue.")
             
-            # Resolve IP for iptables
             target_ip = socket.gethostbyname(self.target_host)
             controller = PacketController(target_ip, self.target_port)
             try:
@@ -255,7 +236,7 @@ class HTTP2RaceEngine:
             if urlparse(self.request.url).query:
                 path += "?" + urlparse(self.request.url).query
 
-            # 1. Prepare Streams (Send HEADERS for all)
+            # 1. Prepare Streams
             stream_ids = []
             print(f"[*] Opening {self.concurrency} HTTP/2 streams...")
             
@@ -269,31 +250,27 @@ class HTTP2RaceEngine:
                     (':scheme', 'https'),
                     (':path', path),
                 ]
-                # Add original headers (excluding forbidden pseudo-headers)
                 for k, v in self.request.headers.items():
                     if k.lower() not in [':method', ':authority', ':scheme', ':path', 'connection', 'upgrade', 'host']:
                         headers.append((k, v))
 
                 self.conn.send_headers(stream_id, headers, end_stream=(len(payload) == 0))
             
-            # Flush Headers to network
             self.sock.sendall(self.conn.data_to_send())
 
-            # 2. Prepare Partial Body (if applicable)
+            # 2. Prepare Partial Body
             if len(payload) > 0:
                 print(f"[*] Sending partial bodies (Size: {len(payload)-1} bytes)...")
                 for stream_id in stream_ids:
-                    # Send all but last byte
                     self.conn.send_data(stream_id, payload[:-1], end_stream=False)
                 
-                # Flush Partial Data
                 self.sock.sendall(self.conn.data_to_send())
 
             # 3. Wait Warmup
             if self.warmup_ms > 0:
                 time.sleep(self.warmup_ms / 1000.0)
 
-            # 4. Prepare Trigger (Last Byte)
+            # 4. Prepare Trigger
             for stream_id in stream_ids:
                 if len(payload) > 0:
                     self.conn.send_data(stream_id, payload[-1:], end_stream=True)
@@ -306,21 +283,15 @@ class HTTP2RaceEngine:
             if self.strategy == "first-seq" and controller:
                 controller.arm()
                 self.sock.sendall(trigger_data)
-                
-                # Small delay to ensure subsequent packets went out
-                time.sleep(0.01) # 10ms
-                
-                # Release the trigger
+                time.sleep(0.01)
                 controller.release_first_packet()
             else:
-                # Standard SPA
                 self.sock.sendall(trigger_data)
 
             # 6. Read Responses
             print("[*] Reading responses...")
             self.sock.settimeout(5.0)
             
-            # Map stream_id to response data
             responses = {sid: {'status': 0, 'body': b'', 'start': 0, 'end': 0} for sid in stream_ids}
             
             while True:
@@ -372,14 +343,14 @@ class HTTP2RaceEngine:
         return self.results
 
 # --- Certificate Authority (CA) Manager ---
-# (No changes required for CAManager based on the prompt)
+# (Implementation remains the same)
 
 class CAManager:
     """Manages Root CA generation, loading, and signing of forged certificates for MiTM."""
     def __init__(self):
         self.ca_key = None
         self.ca_cert = None
-        self.cert_cache = {} # Cache for generated SSL contexts (host -> ssl_context)
+        self.cert_cache = {}
 
     def initialize(self):
         if not CRYPTOGRAPHY_AVAILABLE:
@@ -411,13 +382,11 @@ class CAManager:
         ])
         
         try:
-            # Handle different datetime implementations/versions
             if hasattr(datetime, 'timezone') and hasattr(datetime.datetime, 'now'):
                 now = datetime.datetime.now(datetime.timezone.utc)
             else:
                 now = datetime.datetime.utcnow()
         except TypeError:
-             # Fallback for older Python versions if timezone handling fails
              now = datetime.datetime.utcnow()
 
         self.ca_cert = (
@@ -432,7 +401,6 @@ class CAManager:
             .sign(self.ca_key, hashes.SHA256())
         )
 
-        # Save files
         try:
             with open(CA_KEY_FILE, "wb") as f:
                 f.write(self.ca_key.private_bytes(
@@ -454,7 +422,6 @@ class CAManager:
         try:
             context.minimum_version = ssl.TLSVersion.TLSv1_2
         except AttributeError:
-             # Fallback for older OpenSSL versions
              context.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
 
         try:
@@ -468,7 +435,6 @@ class CAManager:
         cert_path = None
         key_path = None
         try:
-            # Use delete=False and clean up manually for robustness
             with tempfile.NamedTemporaryFile(suffix=".pem", delete=False) as cert_file:
                 cert_file.write(cert_pem)
                 cert_path = cert_file.name
@@ -521,7 +487,7 @@ class CAManager:
         )
         return cert, key
 
-# --- Proxy Server Logic (Refactored for Robust Parsing) ---
+# --- Proxy Server Logic (Fixed Parsing and Timeouts) ---
 
 class CaptureServer:
     """
@@ -531,7 +497,6 @@ class CaptureServer:
         self.port = port
         
         self.target_override = target_override
-        # Ensure target override always ends with a slash for safe urljoin (Phase 4)
         if self.target_override and not self.target_override.endswith('/'):
             self.target_override += '/'
             
@@ -542,31 +507,10 @@ class CaptureServer:
         self.enable_tunneling = enable_tunneling
         self.proxy_client = None
 
-    # Step B: Add the Helper Method
     def construct_target_url(self, scheme: str, request_line_target: str, normalized_headers: Dict[str, str], explicit_host: Optional[str]) -> str:
-        """
-        Robustly constructs the final target URL based on context, request line, and headers (Phase 4).
-
-        Handles the "Tri-State" logic:
-        1. Target Override (Configuration wins)
-        2. Absolute-Form (Client specified full URL)
-        3. Origin-Form/Authority-Form (Combine Scheme + Host Header/CONNECT host + Path)
-
-        Args:
-            scheme (str): The transport/context scheme ('http' or 'https') (Phase 1).
-            request_line_target (str): The raw target from the request line (e.g., '/foo', 'http://bar.com/foo').
-            normalized_headers (Dict[str, str]): The normalized (lowercase keys) request headers (Phase 3).
-            explicit_host (Optional[str]): The host known from a CONNECT tunnel, if applicable (Phase 1).
-
-        Returns:
-            str: The final absolute URL.
-
-        Raises:
-            ValueError: If the target URL cannot be determined according to RFC 7230.
-        """
+        # (construct_target_url implementation remains the same as the previous version)
         
-        # 1. Parse the Request Line Target (Phase 2)
-        # This handles both origin-form (/path) and absolute-form (http://host/path)
+        # 1. Parse the Request Line Target
         try:
             parsed_target = urlparse(request_line_target)
         except ValueError:
@@ -577,7 +521,6 @@ class CaptureServer:
         target_path = parsed_target.path
         target_query = parsed_target.query
 
-        # Ensure path defaults to "/" if the request was absolute but had no path (e.g. "GET http://example.com")
         if (target_scheme or target_host) and not target_path:
              target_path = "/"
         
@@ -585,59 +528,47 @@ class CaptureServer:
 
         # 1. Target Override (Highest Priority)
         if self.target_override:
-            # If override is active, we ignore the host/scheme from the request line and headers.
-            # We only use the path and query from the request line target.
-            
             path_to_join = target_path or "/"
 
-            # Reconstruct path + query using urlunparse for safety
-            # (scheme, netloc, path, params, query, fragment)
+            # Reconstruct path + query
             path_with_query = urlunparse(('', '', path_to_join, parsed_target.params, target_query, ''))
                 
-            # Phase 4: Use urljoin. .lstrip('/') prevents double slashes.
             return urljoin(self.target_override, path_with_query.lstrip('/'))
 
-        # 2. Absolute-Form in Request Line (RFC 7230 Section 5.3.2)
+        # 2. Absolute-Form in Request Line
         if target_scheme and target_host:
-            # The client sent "GET http://example.com/foo". Use it directly.
-            # Note: We could validate against the Host header here, but generally trust the URI in a proxy context.
             return request_line_target
 
-        # 3. Relative-Form (Origin-Form) (RFC 7230 Section 5.3.1)
+        # 3. Relative-Form (Origin-Form)
         
-        # Validation: RFC 7230 Section 5.3.1 dictates origin-form must start with "/" (or be "*")
+        # Validation
         if request_line_target != "*" and not request_line_target.startswith("/"):
              raise ValueError(f"Invalid request target format (expected origin-form starting with '/'): {request_line_target}")
 
         final_scheme = scheme
         final_host = None
 
-        # Determine Host (Phase 1 & 3)
-        # Priority: explicit_host (from CONNECT) > Host header
+        # Determine Host
         if explicit_host:
             final_host = explicit_host
         elif 'host' in normalized_headers:
-            # Use the Host header (lookup is safe because headers are normalized).
             final_host = normalized_headers['host']
         
         if not final_host:
-            # RFC 7230 Section 5.4 requires a Host header for HTTP/1.1 if not absolute URI
             raise ValueError("Cannot determine target host (Missing Host header or CONNECT context).")
 
-        # Phase 4: The URL Builder (using urlunparse)
+        # The URL Builder
         return urlunparse((
             final_scheme,
             final_host,
             target_path,
             parsed_target.params,
             target_query,
-            '' # fragment
+            ''
         ))
 
     async def start(self):
-        """
-        Starts the proxy server and listens for incoming connections.
-        """
+        # (start implementation remains the same)
         if globals().get('CA_MANAGER'):
             try:
                 globals().get('CA_MANAGER').initialize()
@@ -670,49 +601,55 @@ class CaptureServer:
 
     async def handle_client(self, reader, writer):
         """
-        Handles an incoming client connection.
+        Handles an incoming client connection. (FIXED: Relaxed parsing)
         """
         try:
+            # Read the first line (Request Line)
             try:
-                # Read the first line (Request Line)
-                line = await asyncio.wait_for(reader.readline(), timeout=10.0)
-            except asyncio.TimeoutError:
-                writer.close()
-                return
+                # FIX: Use the defined constant for initial timeout
+                line = await asyncio.wait_for(reader.readline(), timeout=INITIAL_LINE_TIMEOUT)
+            except (asyncio.TimeoutError, ConnectionResetError, asyncio.IncompleteReadError):
+                # Handle timeout or connection issues during the initial read
+                return 
 
             if not line:
-                writer.close()
                 return
 
-            # Parse the request line (Phase 2)
-            parts = line.decode(errors='ignore').strip().split(maxsplit=2)
+            # Parse the request line (Phase 2 - Relaxed)
+            decoded_line = line.decode(errors='ignore').strip()
             
-            if not parts:
-                 writer.close()
+            # FIX: Use maxsplit=2 immediately to correctly handle potential spaces in the target URI and check length
+            parts_strict = decoded_line.split(maxsplit=2)
+            
+            if not parts_strict:
                  return
 
-            method = parts[0].upper()
+            method = parts_strict[0].upper()
 
             if method == "CONNECT":
                 # Authority-form (CONNECT host:port)
-                if len(parts) != 3: return
-                path = parts[1]
+                if len(parts_strict) < 2: return
+                
+                path = parts_strict[1]
                 if globals().get('CA_MANAGER'):
                     await self.handle_connect(reader, writer, path)
                 else:
                     print("[!] Received CONNECT request but TLS interception is disabled. Dropping connection.")
-                    writer.close()
                     return
             elif method in ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH"]:
-                 # Origin-form (GET /path) or Absolute-form (GET http://host/path)
-                 if len(parts) != 3: return
-                 request_target, version = parts[1], parts[2]
+                 # Origin-form or Absolute-form
+                 if len(parts_strict) < 2: return
+                 
+                 request_target = parts_strict[1]
+
+                 # FIX: Default version if missing (Lenient parsing). Defaulting to 1.0 is common.
+                 version = parts_strict[2] if len(parts_strict) == 3 else "HTTP/1.0"
+                 
                  # Scheme is 'http' for raw connections (Phase 1)
                  await self.process_http_request(reader, writer, method, request_target, version, initial_line=line, scheme="http")
             else:
                 if line.startswith(b'\x16\x03'):
                       print("[!] Received direct TLS handshake. Configure client to use HTTP Proxy (CONNECT).")
-                writer.close()
                 return
 
         except (ConnectionResetError, asyncio.IncompleteReadError):
@@ -720,6 +657,7 @@ class CaptureServer:
         except Exception as e:
             print(f"[!] Error handling request: {e}")
         finally:
+            # Ensure the connection is always closed
             if not writer.is_closing():
                 writer.close()
                 try:
@@ -729,10 +667,9 @@ class CaptureServer:
 
     async def handle_connect(self, client_reader, client_writer, path):
         """
-        Handles an HTTP CONNECT request for HTTPS tunneling/interception.
+        Handles an HTTP CONNECT request. (FIXED: Relaxed parsing inside tunnel)
         """
         try:
-            # Parse Authority-Form (host:port)
             host, port_str = path.split(':', 1)
         except ValueError:
             client_writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\nInvalid CONNECT target")
@@ -753,7 +690,7 @@ class CaptureServer:
         loop = asyncio.get_running_loop()
 
         if not hasattr(loop, 'start_tls'):
-            print("[!] Python environment does not support loop.start_tls (required for TLS interception).")
+            print("[!] Python environment does not support loop.start_tls.")
             return
 
         try:
@@ -762,117 +699,144 @@ class CaptureServer:
 
             await loop.start_tls(transport, protocol, ssl_context, server_side=True)
 
-            # Process requests within the tunnel
+            # Process requests within the tunnel (Relaxed Parsing)
             while not client_reader.at_eof() and not client_writer.is_closing():
                 try:
-                    line = await asyncio.wait_for(client_reader.readline(), timeout=60.0) 
+                    # FIX: Use idle timeout inside the tunnel
+                    line = await asyncio.wait_for(client_reader.readline(), timeout=TUNNEL_IDLE_TIMEOUT) 
                 except asyncio.TimeoutError:
                     break 
+                except (ConnectionResetError, asyncio.IncompleteReadError):
+                    # Handle client disconnecting inside the tunnel
+                    break
 
                 if not line:
                     break
 
-                parts = line.decode(errors='ignore').strip().split(maxsplit=2)
-                if len(parts) != 3:
+                # FIX: Apply relaxed parsing here as well
+                decoded_line = line.decode(errors='ignore').strip()
+                parts_strict = decoded_line.split(maxsplit=2)
+
+                if len(parts_strict) < 2:
                     break 
 
-                method, request_target_in_tunnel, version = parts
-                # Scheme is 'https' inside the tunnel, explicit_host is known (Phase 1)
-                # We use the full 'path' (host:port) as the explicit host authority.
+                method = parts_strict[0].upper()
+                request_target_in_tunnel = parts_strict[1]
+                version = parts_strict[2] if len(parts_strict) == 3 else "HTTP/1.0"
+
+                # Scheme is 'https', explicit_host is the authority (host:port)
                 await self.process_http_request(client_reader, client_writer, method, request_target_in_tunnel, version, initial_line=line, scheme="https", explicit_host=path)
 
-        except (ssl.SSLError, ConnectionResetError):
-            pass
-        except (asyncio.IncompleteReadError):
+        except (ssl.SSLError, ConnectionResetError, asyncio.IncompleteReadError):
             pass
         except Exception as e:
             print(f"[!] Unexpected error during TLS interception processing for {host}: {e}")
 
-    # Step C: Update process_http_request
     async def process_http_request(self, reader, writer, method, request_target, version, initial_line, scheme, explicit_host=None):
         """
-        Parses headers, body, constructs the URL, logs, and tunnels the request.
+        Parses headers, body, constructs the URL, logs, and tunnels the request. (FIXED: Timeouts applied correctly)
         """
         
-        # Phase 3: Initialize structures for normalized and original headers
+        # Initialize structures
         normalized_headers: Dict[str, str] = {}
-        # Keep original casing and order for capture/forwarding fidelity
         original_headers_list: List[tuple[str, str]] = [] 
-
         content_length = 0
         
-        # Determine connection persistence
-        connection_close = False
-        if version.upper() == "HTTP/1.0":
-            connection_close = True
+        # Determine initial connection persistence (important for relaxed parsing defaults)
+        initial_connection_close = False
+        if version.upper() in ["HTTP/1.0", "HTTP/0.9"]:
+            initial_connection_close = True
 
-        # --- Header Parsing and Canonicalization (Phase 3) ---
-        while True:
-            try:
-                # Use a timeout for reading headers
-                line = await asyncio.wait_for(reader.readline(), timeout=10.0)
-            except (asyncio.IncompleteReadError, ConnectionResetError, asyncio.TimeoutError):
-                # Client disconnected or timed out before sending full headers
-                if not writer.is_closing():
-                    writer.close()
-                return
-            
-            if line == b'\r\n' or not line: break
+        # FIX: Helper function to encapsulate header reading logic for timeout application
+        async def read_headers():
+            normalized = {}
+            original_list = []
+            content_len = 0
+            conn_close = initial_connection_close
 
-            try:
-                line_str = line.decode(errors='ignore').strip()
-                if ':' in line_str:
-                    key, value = line_str.split(':', 1)
-                    original_key = key.strip()
-                    value = value.strip()
-                    key_lower = original_key.lower()
+            while True:
+                # FIX: Wait indefinitely for the next line, relying on the outer wait_for timeout
+                # Connection errors during readline() are caught by the outer try/except block.
+                line = await reader.readline()
+                
+                if line == b'\r\n' or not line: break
 
-                    # Store normalized and original
-                    normalized_headers[key_lower] = value
-                    original_headers_list.append((original_key, value))
+                try:
+                    line_str = line.decode(errors='ignore').strip()
+                    if ':' in line_str:
+                        key, value = line_str.split(':', 1)
+                        original_key = key.strip()
+                        value = value.strip()
+                        key_lower = original_key.lower()
 
-                    if key_lower == 'content-length':
-                        try:
-                            content_length = int(value)
-                        except ValueError:
-                            content_length = 0 # Ignore invalid CL
-                    elif key_lower == 'connection':
-                        if 'close' in value.lower():
-                            connection_close = True
-                        elif 'keep-alive' in value.lower():
-                            connection_close = False
-            except Exception:
-                # Tolerate malformed headers
-                pass 
+                        # Store normalized and original
+                        normalized[key_lower] = value
+                        original_list.append((original_key, value))
+
+                        if key_lower == 'content-length':
+                            try:
+                                content_len = int(value)
+                            except ValueError:
+                                content_len = 0 # Ignore invalid CL
+                        elif key_lower == 'connection':
+                            if 'close' in value.lower():
+                                conn_close = True
+                            elif 'keep-alive' in value.lower():
+                                conn_close = False
+                except Exception:
+                    # Tolerate malformed headers
+                    pass
+            return normalized, original_list, content_len, conn_close
+
+        # --- Header Parsing (Phase 3) with Timeout ---
+        try:
+            # FIX: Apply a timeout to the entire header reading process
+            normalized_headers, original_headers_list, content_length, connection_close = await asyncio.wait_for(read_headers(), timeout=HEADERS_TIMEOUT)
+        
+        except (asyncio.IncompleteReadError, ConnectionResetError, asyncio.TimeoutError) as e:
+             # Client disconnected or timed out during header reading
+             if isinstance(e, asyncio.TimeoutError):
+                 print(f"[!] Timeout ({HEADERS_TIMEOUT}s) while reading headers.")
+             
+             # Connection will be closed by the finally block in handle_client
+             return
 
         # --- Body Reading (Hardening) ---
         body = b""
         if content_length > 0:
              try:
-                 body = await reader.readexactly(content_length)
-             except (asyncio.IncompleteReadError, ConnectionResetError) as e:
-                 # Handle incomplete body read
-                 actual_len = len(e.partial) if isinstance(e, asyncio.IncompleteReadError) else 0
-                 print(f"[!] Incomplete body read. Expected {content_length}, got {actual_len}.")
+                 # FIX: Apply timeout to body reading
+                 body = await asyncio.wait_for(reader.readexactly(content_length), timeout=BODY_READ_TIMEOUT)
+             except (asyncio.IncompleteReadError, ConnectionResetError, asyncio.TimeoutError) as e:
+                 # Handle incomplete body read or timeout
                  
-                 # Reject the request with 400
+                 # Determine error message and status
+                 if isinstance(e, asyncio.TimeoutError):
+                     error_msg = f"Timeout ({BODY_READ_TIMEOUT}s) while reading body."
+                     http_status = "408 Request Timeout"
+                 else:
+                     actual_len = len(e.partial) if isinstance(e, asyncio.IncompleteReadError) else 0
+                     error_msg = f"Incomplete body read. Expected {content_length}, got {actual_len}."
+                     http_status = "400 Bad Request"
+                 
+                 print(f"[!] {error_msg}")
+                 
+                 # Reject the request
                  if not writer.is_closing():
                     try:
-                        msg = b"Incomplete body read."
-                        writer.write(f"HTTP/1.1 400 Bad Request\r\nContent-Length: {len(msg)}\r\nConnection: close\r\n\r\n".encode('ascii') + msg)
+                        msg_bytes = error_msg.encode('utf-8')
+                        writer.write(f"HTTP/1.1 {http_status}\r\nContent-Length: {len(msg_bytes)}\r\nConnection: close\r\n\r\n".encode('ascii') + msg_bytes)
                         await writer.drain()
                     except ConnectionError:
                         pass
-                 if not writer.is_closing():
-                    writer.close()
+                 # Connection will be closed by the finally block in handle_client
                  return
 
         # --- URL Construction (Phase 1, 2, 4) ---
         try:
-            # Pass normalized headers to the constructor
             final_url = self.construct_target_url(scheme, request_target, normalized_headers, explicit_host)
         except ValueError as e:
-            # Handle failure to determine target (e.g., missing Host header, invalid format)
+            # Handle failure to determine target
             print(f"[!] URL Construction Error: {e}")
             if not writer.is_closing():
                 msg = str(e).encode('utf-8')
@@ -883,20 +847,16 @@ class CaptureServer:
                 except ConnectionError:
                      pass
             
-            if not writer.is_closing():
-               writer.close()
+            # Connection will be closed by the finally block in handle_client
             return
 
-        # Create a dictionary from the original headers list for forwarding/capture fidelity
-        # Note: If duplicate header keys existed, this conversion might lose some values, 
-        # but this matches the behavior of the original code's header handling.
+        # Create a dictionary from the original headers list
         original_headers_dict = dict(original_headers_list)
 
         # --- Request Processing (Scope check, Logging, Tunneling) ---
 
         if self.scope_pattern and not self.scope_pattern.search(final_url):
             if self.enable_tunneling:
-                 # Use original headers for tunneling
                  await self.tunnel_request(final_url, method, original_headers_dict, body, writer)
             else:
                  if not writer.is_closing():
@@ -910,7 +870,6 @@ class CaptureServer:
         req_id = len(self.request_log)
         
         # Filter Hop-by-Hop headers for the CapturedRequest object
-        # Use the original casing dictionary for this to preserve fidelity
         safe_headers = {k: v for k, v in original_headers_dict.items()
                         if k.lower() not in HOP_BY_HOP_HEADERS}
 
@@ -920,7 +879,6 @@ class CaptureServer:
         print(f"[+] Captured ({scheme.upper()}) {captured}")
 
         if self.enable_tunneling:
-            # Use original headers for tunneling
             await self.tunnel_request(final_url, method, original_headers_dict, body, writer)
         else:
             # Dummy response
@@ -933,31 +891,22 @@ class CaptureServer:
             writer.close()
 
     async def tunnel_request(self, url, method, headers, body, client_writer):
-        """
-        Forwards the request to the upstream server and relays the response back to the client.
-
-        Args:
-            headers (Dict): The headers to forward (original casing).
-        """
+        # (tunnel_request implementation remains the same)
         if self.proxy_client is None:
             self.proxy_client = httpx.AsyncClient(verify=False, timeout=60.0, http2=True)
 
-        # Filter Hop-by-Hop headers before sending upstream
         forward_headers = {k: v for k, v in headers.items()
                            if k.lower() not in HOP_BY_HOP_HEADERS}
 
         try:
-            # httpx will automatically set/update the Host header based on the URL
             async with self.proxy_client.stream(method, url, content=body, headers=forward_headers) as response:
                 
                 if client_writer.is_closing(): return
 
-                # Relay status line
                 response_line = f"HTTP/1.1 {response.status_code} {response.reason_phrase}\r\n"
                 client_writer.write(response_line.encode('utf-8'))
 
                 # Relay headers (excluding Hop-by-Hop from response)
-                # Using a specific list for response filtering common in proxies.
                 response_filter = ['connection', 'keep-alive', 'transfer-encoding', 'proxy-connection', 'upgrade']
                 for key, value in response.headers.items():
                     if key.lower() not in response_filter:
@@ -967,7 +916,6 @@ class CaptureServer:
                 client_writer.write(b"\r\n")
                 await client_writer.drain()
 
-                # Stream body
                 async for chunk in response.aiter_raw():
                     if not chunk: continue
                     if client_writer.is_closing(): break
@@ -987,7 +935,7 @@ class CaptureServer:
             print(f"[!] Error during tunneling: {e}")
 
 # --- Legacy Attack Logic (httpx based) ---
-# (No changes required for Attack Logic based on the prompt, except minor updates)
+# (Attack logic remains the same)
 
 async def Last_Byte_Stream_Body(payload: bytes, barrier: asyncio.Barrier, warmup_ms: int) -> AsyncIterator[bytes]:
     if len(payload) <= 1:
@@ -1034,13 +982,11 @@ async def send_probe_advanced(client: httpx.AsyncClient, request: CapturedReques
     body_snippet = None
 
     try:
-        # Use copy to avoid modifying the original CapturedRequest headers
         req_headers = request.headers.copy()
-        req_headers["User-Agent"] = "Scalpel-CLI/5.1-Refactored"
+        req_headers["User-Agent"] = "Scalpel-CLI/5.2-Hotfix"
         req_headers["X-Scalpel-Probe"] = f"{index}_{int(time.time())}"
 
-        # Add default Content-Type if missing for methods that typically have a body
-        # Use case-insensitive check on existing headers (which preserve original casing)
+        # Add default Content-Type if missing (case-insensitive check)
         has_content_type = any(k.lower() == 'content-type' for k in req_headers.keys())
         
         if not has_content_type and request.method in ["POST", "PUT", "PATCH"] and len(payload) > 0:
@@ -1055,7 +1001,6 @@ async def send_probe_advanced(client: httpx.AsyncClient, request: CapturedReques
             
         content = content_stream
 
-        # httpx handles Host header automatically based on URL
         async with client.stream(
             method=request.method,
             url=request.url,
@@ -1080,7 +1025,7 @@ async def send_probe_advanced(client: httpx.AsyncClient, request: CapturedReques
         return ScanResult(index, 0, duration, error=str(e))
 
 # --- Main Attack Dispatcher ---
-# (No changes required for run_scan, analyze_results, edit_request_body, main based on the prompt)
+# (Dispatcher logic remains the same)
 
 async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warmup: int, strategy: str = "auto"):
     
@@ -1091,7 +1036,6 @@ async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warm
     use_h2_engine = False
     
     if sync_markers_count > 0:
-        # Staged attacks force the 'auto' (httpx) strategy
         if strategy != "auto":
             print("[!] Warning: Staged Attacks ({{SYNC}}) are only supported with the 'auto' strategy. Switching to auto.")
         strategy = "auto"
@@ -1108,7 +1052,6 @@ async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warm
         print(f"\n[!] REPLAYING ATTACK (Advanced H2 Engine): {request.method} {request.url}")
         print(f"[*] Payload: {len(attack_payload)} bytes | Concurrency: {concurrency} | Strategy: {strategy} | Warmup: {warmup}ms")
 
-        # Run synchronous H2 engine in thread pool
         def synchronous_h2_attack():
             engine = HTTP2RaceEngine(request, concurrency, strategy, warmup)
             try:
@@ -1127,7 +1070,6 @@ async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warm
         return
 
     # 3. Execution Path: Legacy httpx Engine
-    # Setup barriers for legacy strategies
     barriers = []
     if sync_markers_count > 0:
         for _ in range(sync_markers_count):
@@ -1155,14 +1097,11 @@ async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warm
     analyze_results(results)
 
 def analyze_results(results: List[ScanResult]):
-    """
-    Analyzes and prints the results of the race condition scan.
-    """
+    # (analyze_results implementation remains the same)
     successful = [r for r in results if r.error is None]
     
     print("\n--- Analysis Summary ---")
 
-    # Group results by (Status Code, Status Code Family, Body Hash)
     signatures = defaultdict(list)
     for r in successful:
         key = (r.status_code, r.status_code//100, r.body_hash) 
@@ -1237,6 +1176,7 @@ def analyze_results(results: List[ScanResult]):
             print(f"  Probe {err.index}: {err.error} ({err.duration:.2f}ms)")
 
 def edit_request_body(request: CapturedRequest):
+    # (edit_request_body implementation remains the same)
     print(f"\nEditing Body for Request {request.id}")
     print("Instructions: Use {{SYNC}} to insert synchronization points for Staged Attacks.")
     print("Current Body Preview (first 500 bytes):")
@@ -1282,6 +1222,7 @@ def edit_request_body(request: CapturedRequest):
     print(f"\n[*] Body updated. New length: {len(new_body)} bytes. Sync points: {new_body.count(SYNC_MARKER)}")
 
 def main():
+    # (main implementation remains the same)
     if platform.system() == "Windows":
         try:
             if hasattr(asyncio, 'WindowsSelectorEventLoopPolicy'):
@@ -1293,7 +1234,7 @@ def main():
         global CA_MANAGER
         CA_MANAGER = CAManager()
 
-    parser = argparse.ArgumentParser(description="Scalpel Racer v5.1 - Advanced Race Condition Tester with Robust Proxying")
+    parser = argparse.ArgumentParser(description="Scalpel Racer v5.2 - Advanced Race Condition Tester with Robust Proxying")
 
     # Capture Mode
     parser.add_argument("-l", "--listen", type=int, default=8080, help="Listening port (default: 8080)")
@@ -1318,7 +1259,6 @@ def main():
     if args.strategy == 'first-seq':
         is_linux = sys.platform.startswith("linux")
         is_root = False
-        # Check for root privileges only if geteuid exists (non-Windows)
         if hasattr(os, 'geteuid'):
             is_root = os.geteuid() == 0
         
@@ -1342,7 +1282,6 @@ def main():
         try:
             asyncio.run(capture_server.proxy_client.aclose())
         except RuntimeError:
-            # Loop might be closed if we exited via exception
             pass
         except Exception as e:
              print(f"[!] Error closing proxy client: {e}")
