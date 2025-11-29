@@ -1,0 +1,9 @@
+httpx==0.28.0
+numpy==1.26.4
+pytest==8.0.0
+pytest-asyncio==0.23.5
+cryptography>=42.0.0
+# New dependencies for First Sequence Sync
+h2>=4.1.0
+NetfilterQueue>=1.0.0
+scapy>=2.4.5
