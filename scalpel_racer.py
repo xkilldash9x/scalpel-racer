@@ -19,331 +19,65 @@ from urllib.parse import urljoin, urlparse, urlunparse
 from collections import defaultdict
 import numpy as np
 
-# -- Configuration --
+# Import data structures
+from structures import (
+    ScanResult, 
+    CapturedRequest, 
+    MAX_RESPONSE_BODY_READ,
+    SYNC_MARKER,
+    HOP_BY_HOP_HEADERS
+)
+
+# -- Configuration Constants --
 DEFAULT_CONCURRENCY = 15
 DEFAULT_TIMEOUT = 10.0
 DEFAULT_WARMUP = 100  # ms
-MAX_RESPONSE_BODY_READ = 1024 * 1024 # 1MB max read for analysis
-SYNC_MARKER = b"{{SYNC}}"
 CA_CERT_FILE = "scalpel_ca.pem"
 CA_KEY_FILE = "scalpel_ca.key"
 
-# Proxy Timeouts (Introduced for robustness)
-INITIAL_LINE_TIMEOUT = 15.0 # Timeout for the client to send the first request line
-HEADERS_TIMEOUT = 60.0      # Timeout for the entire header block
-BODY_READ_TIMEOUT = 120.0   # Timeout for reading the request body
-TUNNEL_IDLE_TIMEOUT = 60.0  # Timeout waiting for the next request inside a CONNECT tunnel
+# Timeouts for Proxy Server (Fixed Missing Constants)
+INITIAL_LINE_TIMEOUT = 5.0
+HEADERS_TIMEOUT = 5.0
+BODY_READ_TIMEOUT = 10.0
+TUNNEL_IDLE_TIMEOUT = 30.0
 
-# Define RFC 2616 Hop-by-Hop headers + others managed by httpx/proxies.
-HOP_BY_HOP_HEADERS = [
-    'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
-    'te', 'trailers', 'transfer-encoding', 'upgrade',
-    'host', 'accept-encoding', 'upgrade-insecure-requests',
-    'proxy-connection'
-]
+# -- Optional Dependencies & Imports --
 
-# --- Import Libraries ---
+# 1. HTTP/2 Engine (h2)
+try:
+    from low_level import HTTP2RaceEngine
+    H2_AVAILABLE = True
+except ImportError:
+    HTTP2RaceEngine = None
+    H2_AVAILABLE = False
 
-# Cryptography
+# 2. Packet Controller (NetfilterQueue)
+try:
+    from packet_controller import PacketController, NFQUEUE_AVAILABLE
+except ImportError:
+    PacketController = None
+    NFQUEUE_AVAILABLE = False
+
+# 3. Cryptography (For CA Manager)
 try:
     from cryptography import x509
-    from cryptography.x509.oid import NameOID
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
     from cryptography.hazmat.primitives.serialization import Encoding, PrivateFormat, NoEncryption
+    from cryptography.x509.oid import NameOID
     CRYPTOGRAPHY_AVAILABLE = True
 except ImportError:
     CRYPTOGRAPHY_AVAILABLE = False
-    print("[!] 'cryptography' library not found. TLS interception (HTTPS proxy) will be disabled.")
+    # Define dummy placeholders to prevent NameErrors if interpreted
+    x509 = None
+    hashes = None
+    serialization = None
+    rsa = None
+    Encoding = None
+    PrivateFormat = None
+    NoEncryption = None
+    NameOID = None
 
-# Hyper-h2 (HTTP/2 State Machine)
-try:
-    import h2.connection
-    import h2.events
-    import h2.config
-    import h2.errors
-    H2_AVAILABLE = True
-except ImportError:
-    H2_AVAILABLE = False
-    print("[!] 'h2' library not found. Advanced strategies (SPA, First-Seq) will be disabled.")
-
-# NetfilterQueue (Linux Packet Manipulation)
-try:
-    from netfilterqueue import NetfilterQueue
-    NFQUEUE_AVAILABLE = True
-except ImportError:
-    NFQUEUE_AVAILABLE = False
-    NetfilterQueue = None
-    if platform.system() == "Linux":
-        print("[!] 'NetfilterQueue' not found. 'first-seq' strategy will be disabled.")
-except Exception as e:
-    NFQUEUE_AVAILABLE = False
-    if platform.system() == "Linux":
-        print(f"[!] 'NetfilterQueue' import failed: {e}. 'first-seq' strategy will be disabled.")
-
-
-# Global CA Manager instance (initialized in main)
-CA_MANAGER = None
-
-# --- Data Structures ---
-
-class ScanResult:
-    """
-    Represents the result of a single race attempt (one probe).
-    """
-    def __init__(self, index: int, status_code: int, duration: float, body_hash: str = None, body_snippet: str = None, error: str = None):
-        self.index = index
-        self.status_code = status_code
-        self.duration = duration
-        self.body_hash = body_hash
-        self.body_snippet = body_snippet
-        self.error = error
-
-class CapturedRequest:
-    """
-    Represents a captured HTTP request that can be replayed or raced.
-    """
-    def __init__(self, id: int, method: str, url: str, headers: Dict[str, str], body: bytes):
-        self.id = id
-        self.method = method
-        self.url = url
-        self.headers = headers
-        self.body = body
-        self.edited_body: Optional[bytes] = None
-
-    def __str__(self):
-        body_len = len(self.get_attack_payload())
-        edited_flag = "[E]" if self.edited_body is not None else ""
-        display_url = self.url if len(self.url) < 80 else self.url[:77] + "..."
-        return f"{self.id:<5} {self.method:<7} {display_url} ({body_len} bytes) {edited_flag}"
-
-    def get_attack_payload(self) -> bytes:
-        return self.edited_body if self.edited_body is not None else self.body
-
-# --- Advanced Engines (PacketController & HTTP2RaceEngine) ---
-# (Implementations remain the same as previous version)
-
-class PacketController:
-    """
-    Manages iptables rules and NetfilterQueue for the 'First Sequence Sync' strategy.
-    """
-    def __init__(self, target_ip: str, target_port: int):
-        if not NFQUEUE_AVAILABLE:
-             raise RuntimeError("PacketController initialized but NetfilterQueue is not available.")
-        self.target_ip = target_ip
-        self.target_port = target_port
-        self.queue_num = 1
-        self.nfqueue = NetfilterQueue()
-        self.first_packet = None
-        self.armed = False
-        self.lock = threading.Lock()
-
-    def setup_iptables(self):
-        print("[*] Setting up iptables rule for traffic interception...")
-        cmd = f"iptables -A OUTPUT -d {self.target_ip} -p tcp --dport {self.target_port} -j NFQUEUE --queue-num {self.queue_num}"
-        os.system(cmd)
-
-    def teardown_iptables(self):
-        print("[*] Cleaning up iptables rules...")
-        cmd = f"iptables -D OUTPUT -d {self.target_ip} -p tcp --dport {self.target_port} -j NFQUEUE --queue-num {self.queue_num}"
-        os.system(cmd)
-
-    def process_packet(self, packet):
-        if not self.armed:
-            packet.accept()
-            return
-
-        with self.lock:
-            if self.first_packet is None:
-                print("[*] Intercepted First Sequence Packet. Holding...")
-                self.first_packet = packet
-            else:
-                packet.accept()
-
-    def start(self):
-        self.nfqueue.bind(self.queue_num, self.process_packet)
-        self.thread = threading.Thread(target=self.nfqueue.run)
-        self.thread.daemon = True
-        self.thread.start()
-
-    def arm(self):
-        with self.lock:
-            self.armed = True
-            self.first_packet = None
-
-    def release_first_packet(self):
-        with self.lock:
-            if self.first_packet:
-                print("[*] Releasing First Sequence Packet (Trigger)!")
-                self.first_packet.accept()
-                self.first_packet = None
-            self.armed = False
-
-    def stop(self):
-        self.nfqueue.unbind()
-
-class HTTP2RaceEngine:
-    # (HTTP2RaceEngine implementation remains the same)
-    def __init__(self, request: CapturedRequest, concurrency: int, strategy: str, warmup_ms: int):
-        self.request = request
-        self.concurrency = concurrency
-        self.strategy = strategy
-        self.warmup_ms = warmup_ms
-        self.results = []
-        self.conn = None
-        self.sock = None
-        self.target_host = urlparse(request.url).hostname
-        self.target_port = urlparse(request.url).port or 443
-
-    def _create_connection(self):
-        sock = socket.create_connection((self.target_host, self.target_port), timeout=10)
-        
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        ctx.set_alpn_protocols(['h2'])
-        
-        self.sock = ctx.wrap_socket(sock, server_hostname=self.target_host)
-        
-        if self.sock.selected_alpn_protocol() != 'h2':
-            raise RuntimeError("Server did not negotiate HTTP/2 via ALPN")
-
-        config = h2.config.H2Configuration(client_side=True)
-        self.conn = h2.connection.H2Connection(config=config)
-        self.conn.initiate_connection()
-        self.sock.sendall(self.conn.data_to_send())
-
-    def run_attack(self) -> List[ScanResult]:
-        controller = None
-        if self.strategy == "first-seq":
-            if not NFQUEUE_AVAILABLE or not sys.platform.startswith("linux"):
-                raise RuntimeError("First-Seq strategy requires Linux and NetfilterQueue.")
-            
-            target_ip = socket.gethostbyname(self.target_host)
-            controller = PacketController(target_ip, self.target_port)
-            try:
-                controller.setup_iptables()
-                controller.start()
-            except Exception as e:
-                controller.teardown_iptables()
-                raise e
-
-        try:
-            self._create_connection()
-            
-            payload = self.request.get_attack_payload()
-            path = urlparse(self.request.url).path or "/"
-            if urlparse(self.request.url).query:
-                path += "?" + urlparse(self.request.url).query
-
-            # 1. Prepare Streams
-            stream_ids = []
-            print(f"[*] Opening {self.concurrency} HTTP/2 streams...")
-            
-            for i in range(self.concurrency):
-                stream_id = self.conn.get_next_available_stream_id()
-                stream_ids.append(stream_id)
-                
-                headers = [
-                    (':method', self.request.method),
-                    (':authority', self.target_host),
-                    (':scheme', 'https'),
-                    (':path', path),
-                ]
-                for k, v in self.request.headers.items():
-                    if k.lower() not in [':method', ':authority', ':scheme', ':path', 'connection', 'upgrade', 'host']:
-                        headers.append((k, v))
-
-                self.conn.send_headers(stream_id, headers, end_stream=(len(payload) == 0))
-            
-            self.sock.sendall(self.conn.data_to_send())
-
-            # 2. Prepare Partial Body
-            if len(payload) > 0:
-                print(f"[*] Sending partial bodies (Size: {len(payload)-1} bytes)...")
-                for stream_id in stream_ids:
-                    self.conn.send_data(stream_id, payload[:-1], end_stream=False)
-                
-                self.sock.sendall(self.conn.data_to_send())
-
-            # 3. Wait Warmup
-            if self.warmup_ms > 0:
-                time.sleep(self.warmup_ms / 1000.0)
-
-            # 4. Prepare Trigger
-            for stream_id in stream_ids:
-                if len(payload) > 0:
-                    self.conn.send_data(stream_id, payload[-1:], end_stream=True)
-
-            trigger_data = self.conn.data_to_send()
-
-            # 5. Execute Attack
-            print(f"[*] Executing Trigger (Size: {len(trigger_data)} bytes)...")
-            
-            if self.strategy == "first-seq" and controller:
-                controller.arm()
-                self.sock.sendall(trigger_data)
-                time.sleep(0.01)
-                controller.release_first_packet()
-            else:
-                self.sock.sendall(trigger_data)
-
-            # 6. Read Responses
-            print("[*] Reading responses...")
-            self.sock.settimeout(5.0)
-            
-            responses = {sid: {'status': 0, 'body': b'', 'start': 0, 'end': 0} for sid in stream_ids}
-            
-            while True:
-                try:
-                    data = self.sock.recv(65535)
-                    if not data: break
-                    
-                    events = self.conn.receive_data(data)
-                    for event in events:
-                        if isinstance(event, h2.events.ResponseReceived):
-                            sid = event.stream_id
-                            if sid in responses:
-                                status = next((v for k, v in event.headers if k == b':status'), b'0')
-                                responses[sid]['status'] = int(status)
-                                responses[sid]['start'] = time.perf_counter()
-                        elif isinstance(event, h2.events.DataReceived):
-                            sid = event.stream_id
-                            if sid in responses:
-                                responses[sid]['body'] += event.data
-                        elif isinstance(event, h2.events.StreamEnded):
-                            sid = event.stream_id
-                            if sid in responses:
-                                responses[sid]['end'] = time.perf_counter()
-                    
-                except socket.timeout:
-                    break
-                except Exception as e:
-                    print(f"[!] Read error: {e}")
-                    break
-            
-            # Compile Results
-            for i, sid in enumerate(stream_ids):
-                r = responses[sid]
-                duration = (r['end'] - r['start']) * 1000 if r['end'] > 0 else 0
-                
-                body_hash = hashlib.sha256(r['body']).hexdigest() if r['body'] else None
-                snippet = r['body'][:100].decode(errors='ignore').replace('\n', ' ') if r['body'] else ""
-                
-                self.results.append(ScanResult(i, r['status'], duration, body_hash, snippet))
-
-            self.conn.close_connection()
-            self.sock.close()
-
-        finally:
-            if self.strategy == "first-seq" and controller:
-                controller.stop()
-                controller.teardown_iptables()
-
-        return self.results
-
-# --- Certificate Authority (CA) Manager ---
-# (Implementation remains the same)
 
 class CAManager:
     """Manages Root CA generation, loading, and signing of forged certificates for MiTM."""
@@ -387,7 +121,7 @@ class CAManager:
             else:
                 now = datetime.datetime.utcnow()
         except TypeError:
-             now = datetime.datetime.utcnow()
+            now = datetime.datetime.utcnow()
 
         self.ca_cert = (
             x509.CertificateBuilder()
@@ -422,7 +156,7 @@ class CAManager:
         try:
             context.minimum_version = ssl.TLSVersion.TLSv1_2
         except AttributeError:
-             context.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
+            context.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
 
         try:
             context.set_alpn_protocols(["h2", "http/1.1"])
@@ -508,7 +242,6 @@ class CaptureServer:
         self.proxy_client = None
 
     def construct_target_url(self, scheme: str, request_line_target: str, normalized_headers: Dict[str, str], explicit_host: Optional[str]) -> str:
-        # (construct_target_url implementation remains the same as the previous version)
         
         # 1. Parse the Request Line Target
         try:
@@ -531,7 +264,9 @@ class CaptureServer:
             path_to_join = target_path or "/"
 
             # Reconstruct path + query
-            path_with_query = urlunparse(('', '', path_to_join, parsed_target.params, target_query, ''))
+            path_with_query = urlunparse((
+                '', '', path_to_join, parsed_target.params, target_query, ''
+            ))
                 
             return urljoin(self.target_override, path_with_query.lstrip('/'))
 
@@ -568,7 +303,6 @@ class CaptureServer:
         ))
 
     async def start(self):
-        # (start implementation remains the same)
         if globals().get('CA_MANAGER'):
             try:
                 globals().get('CA_MANAGER').initialize()
@@ -601,7 +335,8 @@ class CaptureServer:
 
     async def handle_client(self, reader, writer):
         """
-        Handles an incoming client connection. (FIXED: Relaxed parsing)
+        Handles an incoming client connection.
+        (FIXED: Relaxed parsing)
         """
         try:
             # Read the first line (Request Line)
@@ -622,7 +357,7 @@ class CaptureServer:
             parts_strict = decoded_line.split(maxsplit=2)
             
             if not parts_strict:
-                 return
+                return
 
             method = parts_strict[0].upper()
 
@@ -667,7 +402,8 @@ class CaptureServer:
 
     async def handle_connect(self, client_reader, client_writer, path):
         """
-        Handles an HTTP CONNECT request. (FIXED: Relaxed parsing inside tunnel)
+        Handles an HTTP CONNECT request.
+        (FIXED: Relaxed parsing inside tunnel)
         """
         try:
             host, port_str = path.split(':', 1)
@@ -734,7 +470,8 @@ class CaptureServer:
 
     async def process_http_request(self, reader, writer, method, request_target, version, initial_line, scheme, explicit_host=None):
         """
-        Parses headers, body, constructs the URL, logs, and tunnels the request. (FIXED: Timeouts applied correctly)
+        Parses headers, body, constructs the URL, logs, and tunnels the request.
+        (FIXED: Timeouts applied correctly)
         """
         
         # Initialize structures
@@ -796,7 +533,7 @@ class CaptureServer:
         except (asyncio.IncompleteReadError, ConnectionResetError, asyncio.TimeoutError) as e:
              # Client disconnected or timed out during header reading
              if isinstance(e, asyncio.TimeoutError):
-                 print(f"[!] Timeout ({HEADERS_TIMEOUT}s) while reading headers.")
+                print(f"[!] Timeout ({HEADERS_TIMEOUT}s) while reading headers.")
              
              # Connection will be closed by the finally block in handle_client
              return
@@ -859,7 +596,7 @@ class CaptureServer:
             if self.enable_tunneling:
                  await self.tunnel_request(final_url, method, original_headers_dict, body, writer)
             else:
-                 if not writer.is_closing():
+                if not writer.is_closing():
                     writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\n\r\nOut of scope.")
                     await writer.drain()
                  
@@ -891,7 +628,6 @@ class CaptureServer:
             writer.close()
 
     async def tunnel_request(self, url, method, headers, body, client_writer):
-        # (tunnel_request implementation remains the same)
         if self.proxy_client is None:
             self.proxy_client = httpx.AsyncClient(verify=False, timeout=60.0, http2=True)
 
@@ -935,7 +671,6 @@ class CaptureServer:
             print(f"[!] Error during tunneling: {e}")
 
 # --- Legacy Attack Logic (httpx based) ---
-# (Attack logic remains the same)
 
 async def Last_Byte_Stream_Body(payload: bytes, barrier: asyncio.Barrier, warmup_ms: int) -> AsyncIterator[bytes]:
     if len(payload) <= 1:
@@ -1025,7 +760,6 @@ async def send_probe_advanced(client: httpx.AsyncClient, request: CapturedReques
         return ScanResult(index, 0, duration, error=str(e))
 
 # --- Main Attack Dispatcher ---
-# (Dispatcher logic remains the same)
 
 async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warmup: int, strategy: str = "auto"):
     
@@ -1097,7 +831,6 @@ async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warm
     analyze_results(results)
 
 def analyze_results(results: List[ScanResult]):
-    # (analyze_results implementation remains the same)
     successful = [r for r in results if r.error is None]
     
     print("\n--- Analysis Summary ---")
@@ -1176,7 +909,6 @@ def analyze_results(results: List[ScanResult]):
             print(f"  Probe {err.index}: {err.error} ({err.duration:.2f}ms)")
 
 def edit_request_body(request: CapturedRequest):
-    # (edit_request_body implementation remains the same)
     print(f"\nEditing Body for Request {request.id}")
     print("Instructions: Use {{SYNC}} to insert synchronization points for Staged Attacks.")
     print("Current Body Preview (first 500 bytes):")
@@ -1188,6 +920,7 @@ def edit_request_body(request: CapturedRequest):
     print("\nEnter the new body (Stop with Ctrl+D (Unix) or Ctrl+Z+Enter (Windows) on a new line):")
     
     lines = []
+    
     while True:
         try:
             try:
@@ -1222,7 +955,6 @@ def edit_request_body(request: CapturedRequest):
     print(f"\n[*] Body updated. New length: {len(new_body)} bytes. Sync points: {new_body.count(SYNC_MARKER)}")
 
 def main():
-    # (main implementation remains the same)
     if platform.system() == "Windows":
         try:
             if hasattr(asyncio, 'WindowsSelectorEventLoopPolicy'):
@@ -1263,7 +995,7 @@ def main():
             is_root = os.geteuid() == 0
         
         if not is_linux or not is_root:
-             print("[!] Warning: 'first-seq' strategy requires Linux and Root privileges.")
+            print("[!] Warning: 'first-seq' strategy requires Linux and Root privileges.")
 
     # 1. Start Capture Server
     capture_server = CaptureServer(args.listen, args.target, args.scope, enable_tunneling=True)
@@ -1317,16 +1049,16 @@ def main():
         command = parts[0].lower()
 
         if command == 'e' and len(parts) == 2:
-             try:
+            try:
                  req_id = int(parts[1])
                  selected_req = next((r for r in log if r.id == req_id), None)
                  if selected_req:
                      edit_request_body(selected_req)
                  else:
                      print("Invalid ID.")
-             except ValueError:
+            except ValueError:
                  print("Invalid ID format for edit command.")
-             continue
+            continue
 
         try:
             req_id = int(command)

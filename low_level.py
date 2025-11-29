@@ -38,7 +38,7 @@ MAX_RESPONSE_BODY_READ = 1024 * 1024
 
 try:
     # Attempt to import the actual definitions when running via scalpel_racer.py
-    from scalpel_racer import ScanResult, CapturedRequest, MAX_RESPONSE_BODY_READ
+    from structures import ScanResult, CapturedRequest, MAX_RESPONSE_BODY_READ
 except ImportError:
     # This is expected if running low_level_h2.py independently
     pass
