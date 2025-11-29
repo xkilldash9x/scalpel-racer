@@ -34,6 +34,17 @@ class PacketController:
     Implements the core mechanism for the First Sequence Sync attack.
     """
     def __init__(self, target_ip: str, target_port: int, source_port: int):
+        """
+        Initialize the PacketController.
+
+        Args:
+            target_ip (str): The IP address of the target server.
+            target_port (int): The port number of the target server.
+            source_port (int): The local source port used for the connection.
+
+        Raises:
+            ImportError: If NetfilterQueue is not available or supported on the system.
+        """
         if not NFQUEUE_AVAILABLE:
             # Safety guard against attempting to use the class when dependencies are missing
             raise ImportError("NetfilterQueue is not available or supported on this system.")
@@ -59,7 +70,16 @@ class PacketController:
         self.subsequent_packets_released = threading.Event()
 
     def start(self):
-        """Sets up iptables rules and starts the NFQueue listener thread."""
+        """
+        Sets up iptables rules and starts the NFQueue listener thread.
+
+        This method configures iptables to redirect specific outbound TCP packets to the
+        NetfilterQueue and starts background threads to process intercepted packets.
+
+        Raises:
+             PermissionError: If the process lacks root privileges required for iptables/NFQueue.
+             RuntimeError: If binding to the NetfilterQueue fails.
+        """
         print(f"[*] PacketController: Starting interception for {self.target_ip}:{self.target_port} (Source Port: {self.source_port})")
         
         # 1. Set up the iptables rule
@@ -90,7 +110,12 @@ class PacketController:
         print("[*] PacketController: Active and listening on NFQueue.")
 
     def stop(self):
-        """Stops the NFQueue listener and cleans up iptables rules."""
+        """
+        Stops the NFQueue listener and cleans up iptables rules.
+
+        This method signals the background threads to stop, unbinds the NetfilterQueue,
+        and removes the added iptables rules.
+        """
         if not self.active:
             return
             
@@ -120,7 +145,19 @@ class PacketController:
         print("[*] PacketController: Stopped.")
 
     def _manage_iptables(self, action: str):
-        """Helper to add ('A') or delete ('D') the required iptables rule."""
+        """
+        Helper to add ('A') or delete ('D') the required iptables rule.
+
+        The rule targets outgoing TCP packets with the PSH flag set, destined for
+        the target IP and port, and originating from the specified source port.
+
+        Args:
+            action (str): The iptables action flag, either 'A' (Append) or 'D' (Delete).
+
+        Raises:
+            PermissionError: If the iptables command fails due to permission issues.
+            RuntimeError: If the iptables command fails for other reasons.
+        """
         
         # The rule specifically targets the exact connection parameters.
         # Optimization: We specifically target packets with the PSH flag set, 
@@ -151,7 +188,12 @@ class PacketController:
             # If deletion fails (e.g., rule didn't exist), we ignore it.
 
     def _listener_loop(self):
-        """The main loop for the NFQueue listener thread."""
+        """
+        The main loop for the NFQueue listener thread.
+
+        This method calls `nfqueue.run()` which blocks and processes packets via
+        the registered callback function. It runs until the queue is unbound.
+        """
         try:
             # This call blocks and processes packets via the callback
             self.nfqueue.run()
@@ -161,7 +203,16 @@ class PacketController:
                 print(f"[!] NFQueue listener loop error: {e}")
 
     def _queue_callback(self, pkt):
-        """The core logic executed for every intercepted packet."""
+        """
+        The core logic executed for every intercepted packet.
+
+        This callback inspects the packet sequence number to determine if it is
+        the first packet of the burst or a subsequent one. It holds the first
+        packet and releases subsequent ones to achieve reordering.
+
+        Args:
+            pkt: The NetfilterQueue packet object.
+        """
         if not self.active:
             pkt.accept()
             return
@@ -218,7 +269,13 @@ class PacketController:
             pkt.accept()
 
     def _delayed_release_first_packet(self):
-        """Thread responsible for releasing the first packet after synchronization."""
+        """
+        Thread responsible for releasing the first packet after synchronization.
+
+        This method waits for the first packet to be held, then waits for subsequent
+        packets to be released (or a timeout), applies a delay, and finally releases
+        the held first packet.
+        """
         
         # 1. Wait until the first packet is intercepted and held
         if not self.first_packet_held.wait(timeout=5):
