@@ -108,7 +108,7 @@ class CaptureServer:
             print(f"[+] Captured {captured}")
 
             # Respond to client
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nCaptured.")
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nCaptured.")
             await writer.drain()
 
         except Exception as e:
