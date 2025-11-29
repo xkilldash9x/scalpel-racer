@@ -9,3 +9,4 @@ venv/
 .pem
 .key
 
+collect_code.sh
