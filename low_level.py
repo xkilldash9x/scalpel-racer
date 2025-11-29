@@ -11,14 +11,27 @@ from typing import List, Dict, Tuple, Optional
 # Define placeholders for data structures to allow parsing and type hinting.
 # We attempt to import the actual definitions from the main script (scalpel_racer.py).
 class ScanResult:
-     # Minimal definition for type hinting if not imported
+     """
+     Placeholder class for ScanResult to allow type hinting.
+     Actual definition is imported from scalpel_racer.py.
+     """
      def __init__(self, index: int, status_code: int, duration: float, body_hash: str = None, body_snippet: str = None, error: str = None):
         self.index = index; self.status_code = status_code; self.duration = duration
         self.body_hash = body_hash; self.body_snippet = body_snippet; self.error = error
 
 class CapturedRequest:
-    # Minimal definition for type hinting if not imported
-    def get_attack_payload(self) -> bytes: pass
+    """
+    Placeholder class for CapturedRequest to allow type hinting.
+    Actual definition is imported from scalpel_racer.py.
+    """
+    def get_attack_payload(self) -> bytes:
+        """
+        Placeholder method for get_attack_payload.
+
+        Returns:
+            bytes: The attack payload.
+        """
+        pass
     pass 
 
 MAX_RESPONSE_BODY_READ = 1024 * 1024
@@ -57,6 +70,15 @@ class HTTP2RaceEngine:
     This engine operates synchronously (blocking I/O managed via threads) as required for precise packet control.
     """
     def __init__(self, request: CapturedRequest, concurrency: int, strategy="spa", warmup_ms=100):
+        """
+        Initialize the HTTP2RaceEngine.
+
+        Args:
+            request (CapturedRequest): The request to race.
+            concurrency (int): The number of concurrent requests to send.
+            strategy (str, optional): The attack strategy ('spa' or 'first-seq'). Defaults to "spa".
+            warmup_ms (int, optional): The warm-up delay in milliseconds before the trigger phase. Defaults to 100.
+        """
         self.request = request
         self.concurrency = concurrency
         self.strategy = strategy
@@ -77,7 +99,15 @@ class HTTP2RaceEngine:
         self._parse_target()
 
     def _parse_target(self):
-        """Extracts target host and port from the request URL."""
+        """
+        Extracts target host and port from the request URL.
+
+        Parses the URL stored in the request object to determine the target hostname
+        and port. Defaults to port 443 for HTTPS.
+
+        Raises:
+            ValueError: If the URL scheme is not supported.
+        """
         parsed_url = urlparse(self.request.url)
         self.target_host = parsed_url.hostname
         
@@ -91,7 +121,15 @@ class HTTP2RaceEngine:
             raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme}")
 
     def connect(self):
-        """Establishes the TCP connection, performs SSL handshake, and initiates H2 connection."""
+        """
+        Establishes the TCP connection, performs SSL handshake, and initiates H2 connection.
+
+        This method resolves the target IP, creates a raw TCP socket (with TCP_NODELAY),
+        wraps it in SSL with ALPN set to 'h2', and initializes the HTTP/2 state machine.
+
+        Raises:
+            ConnectionError: If connection fails, SSL handshake fails, or HTTP/2 is not negotiated.
+        """
         print(f"[*] Connecting to {self.target_host}:{self.target_port}...")
         
         # 1. Resolve IP (Crucial for PacketController targeting)
@@ -149,7 +187,16 @@ class HTTP2RaceEngine:
         print("[*] Connection established and H2 handshake initiated.")
 
     def run_attack(self) -> List[ScanResult]:
-        """Executes the attack sequence: Connect, Prepare, Trigger, Receive."""
+        """
+        Executes the attack sequence: Connect, Prepare, Trigger, Receive.
+
+        This method coordinates the entire attack lifecycle, including setting up
+        the PacketController (if using 'first-seq' strategy), sending requests,
+        and collecting results.
+
+        Returns:
+            List[ScanResult]: A list of ScanResult objects containing the outcome of each request.
+        """
         
         # --- Pre-flight checks ---
         if self.strategy == "first-seq":
@@ -244,7 +291,13 @@ class HTTP2RaceEngine:
         return self._finalize_results()
 
     def _prepare_requests(self):
-        """Sends HEADERS and partial DATA frames for all requests."""
+        """
+        Sends HEADERS and partial DATA frames for all requests.
+
+        This initializes the HTTP/2 streams and sends the initial part of the
+        payload, up to the last byte. This prepares the server to receive the
+        trigger (last byte) later.
+        """
         print("[*] Preparing requests (Sending HEADERS and partial DATA)...")
         
         payload = self.request.get_attack_payload()
@@ -288,7 +341,13 @@ class HTTP2RaceEngine:
         print(f"[*] Prepared {self.concurrency} requests. Preparation payload size: {len(data_to_send)} bytes.")
 
     def _trigger_requests(self):
-        """Generates and sends the final DATA frames (the trigger) in a single sendall() call."""
+        """
+        Generates and sends the final DATA frames (the trigger) in a single sendall() call.
+
+        This sends the last byte of data for all streams, triggering the backend
+        processing. If 'first-seq' strategy is active, the first packet of this
+        burst is intercepted by the PacketController.
+        """
         print("[*] Sending trigger frames (Final DATA)...")
         
         payload = self.request.get_attack_payload()
@@ -329,7 +388,15 @@ class HTTP2RaceEngine:
         print("[*] Trigger frames sent.")
 
     def _construct_h2_headers(self, content_length: int) -> List[Tuple[str, str]]:
-        """Creates the list of HTTP/2 headers, including pseudo-headers."""
+        """
+        Creates the list of HTTP/2 headers, including pseudo-headers.
+
+        Args:
+            content_length (int): The length of the request body.
+
+        Returns:
+            List[Tuple[str, str]]: A list of header tuples (name, value).
+        """
         parsed_url = urlparse(self.request.url)
         path = parsed_url.path or '/'
         if parsed_url.query:
@@ -371,7 +438,12 @@ class HTTP2RaceEngine:
         return headers
 
     def _receive_loop(self):
-        """Background thread to read data from the socket and process H2 events."""
+        """
+        Background thread to read data from the socket and process H2 events.
+
+        This loop continuously reads from the socket, feeds data to the H2 connection
+        state machine, and delegates event processing to `_process_events`.
+        """
         while not self.all_streams_finished.is_set():
             try:
                 # Use select for non-blocking read with a short timeout
@@ -409,7 +481,15 @@ class HTTP2RaceEngine:
         self.all_streams_finished.set()
 
     def _process_events(self, events):
-        """Handles H2 events (headers received, data received, stream end/reset)."""
+        """
+        Handles H2 events (headers received, data received, stream end/reset).
+
+        Updates the internal stream state based on the events received from the
+        H2 state machine.
+
+        Args:
+            events (List[h2.events.Event]): A list of H2 events to process.
+        """
         with self.lock:
             for event in events:
                 stream_id = getattr(event, 'stream_id', None)
@@ -454,7 +534,12 @@ class HTTP2RaceEngine:
                 self.all_streams_finished.set()
 
     def _handle_connection_closed(self, reason: str):
-        """Marks all pending streams as finished with an error."""
+        """
+        Marks all pending streams as finished with an error.
+
+        Args:
+            reason (str): The reason why the connection was closed.
+        """
         with self.lock:
             for stream_data in self.streams.values():
                 if not stream_data["finished"]:
@@ -463,7 +548,12 @@ class HTTP2RaceEngine:
         self.all_streams_finished.set()
 
     def _finalize_results(self) -> List[ScanResult]:
-        """Converts internal stream data into ScanResult objects."""
+        """
+        Converts internal stream data into ScanResult objects.
+
+        Returns:
+            List[ScanResult]: A list of ScanResult objects representing the attack outcome.
+        """
         final_results = []
         
         with self.lock:
