@@ -176,7 +176,10 @@ async def test_handle_connect_logic(monkeypatch):
         # Mock the transport and protocol required by start_tls
         mock_transport = MagicMock()
         mock_protocol = MagicMock()
-        writer.get_transport.return_value = mock_transport
+        
+        # FIX: Directly set the transport attribute on the mock writer
+        # instead of mocking a get_transport() method which does not exist.
+        writer.transport = mock_transport
         mock_transport.get_protocol.return_value = mock_protocol
 
         # 3. Simulate the request that comes *after* the conceptual upgrade

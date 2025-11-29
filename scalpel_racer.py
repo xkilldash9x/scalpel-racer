@@ -791,7 +791,8 @@ class CaptureServer:
             return
 
         try:
-            transport = client_writer.get_transport()
+            # FIX: Use .transport attribute instead of .get_transport() method
+            transport = client_writer.transport
             protocol = transport.get_protocol()
 
             await loop.start_tls(transport, protocol, ssl_context, server_side=True)
