@@ -32,7 +32,7 @@ CA_KEY_FILE = "scalpel_ca.key"
 HOP_BY_HOP_HEADERS = [
     'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
     'te', 'trailers', 'transfer-encoding', 'upgrade',
-    'content-length', 'host', 'accept-encoding', 'upgrade-insecure-requests',
+    'host', 'accept-encoding', 'upgrade-insecure-requests',
     'proxy-connection'
 ]
 
@@ -798,7 +798,8 @@ class CaptureServer:
             print(f"[!] Upstream request failed: {e} (URL: {url})")
             if not client_writer.is_closing():
                 try:
-                    client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 21\r\n\r\nUpstream request failed")
+                    msg = b"Upstream request failed"
+                    client_writer.write(f"HTTP/1.1 502 Bad Gateway\r\nContent-Length: {len(msg)}\r\n\r\n".encode('ascii') + msg)
                     await client_writer.drain()
                 except Exception:
                     pass
