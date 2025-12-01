@@ -296,6 +296,8 @@ def create_event(EventType, **kwargs):
 
 def test_process_events(engine, mock_dependencies):
     engine.conn = mock_dependencies["h2_conn"]
+    # [Fix] Match concurrency to the number of streams defined in this test (2)
+    engine.concurrency = 2
     # Setup initial stream state
     engine.streams = {
         1: {"index": 0, "headers": {}, "body": bytearray(), "finished": False, "error": None},

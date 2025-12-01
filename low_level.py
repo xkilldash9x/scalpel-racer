@@ -98,6 +98,8 @@ class HTTP2RaceEngine:
 
         self._parse_target()
 
+    # (_parse_target, connect, run_attack, _prepare_requests, _trigger_requests, _receive_loop, _handle_connection_closed, _finalize_results remain the same)
+
     def _parse_target(self):
         """
         Extracts target host and port from the request URL.
@@ -390,12 +392,7 @@ class HTTP2RaceEngine:
     def _construct_h2_headers(self, content_length: int) -> List[Tuple[str, str]]:
         """
         Creates the list of HTTP/2 headers, including pseudo-headers.
-
-        Args:
-            content_length (int): The length of the request body.
-
-        Returns:
-            List[Tuple[str, str]]: A list of header tuples (name, value).
+		...
         """
         parsed_url = urlparse(self.request.url)
         path = parsed_url.path or '/'
@@ -433,16 +430,14 @@ class HTTP2RaceEngine:
         
         # Add default User-Agent if not present
         if 'user-agent' not in header_keys:
-            headers.append(('user-agent', 'Scalpel-CLI/5.0-LowLevelH2'))
+            headers.append(('user-agent', 'Scalpel-CLI/5.3-LowLevelH2')) # C03 Version Bump
         
         return headers
 
     def _receive_loop(self):
         """
         Background thread to read data from the socket and process H2 events.
-
-        This loop continuously reads from the socket, feeds data to the H2 connection
-        state machine, and delegates event processing to `_process_events`.
+		...
         """
         while not self.all_streams_finished.is_set():
             try:
@@ -483,12 +478,7 @@ class HTTP2RaceEngine:
     def _process_events(self, events):
         """
         Handles H2 events (headers received, data received, stream end/reset).
-
-        Updates the internal stream state based on the events received from the
-        H2 state machine.
-
-        Args:
-            events (List[h2.events.Event]): A list of H2 events to process.
+		...
         """
         with self.lock:
             for event in events:
@@ -530,15 +520,17 @@ class HTTP2RaceEngine:
                     stream_data["error"] = f"Stream reset by server (Error code: {event.error_code})"
 
             # Check if all initiated streams have finished.
-            if self.streams and all(s["finished"] for s in self.streams.values()):
+            # B05 FIX: Ensure we check against the expected concurrency count.
+            # This prevents premature termination if _process_events is called before all streams are initialized in _prepare_requests.
+            finished_count = sum(1 for s in self.streams.values() if s.get("finished"))
+
+            if finished_count >= self.concurrency:
                 self.all_streams_finished.set()
 
     def _handle_connection_closed(self, reason: str):
         """
         Marks all pending streams as finished with an error.
-
-        Args:
-            reason (str): The reason why the connection was closed.
+		...
         """
         with self.lock:
             for stream_data in self.streams.values():
@@ -550,9 +542,7 @@ class HTTP2RaceEngine:
     def _finalize_results(self) -> List[ScanResult]:
         """
         Converts internal stream data into ScanResult objects.
-
-        Returns:
-            List[ScanResult]: A list of ScanResult objects representing the attack outcome.
+		...
         """
         final_results = []
         

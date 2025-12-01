@@ -40,6 +40,7 @@ INITIAL_LINE_TIMEOUT = 5.0
 HEADERS_TIMEOUT = 5.0
 BODY_READ_TIMEOUT = 10.0
 TUNNEL_IDLE_TIMEOUT = 30.0
+TLS_HANDSHAKE_TIMEOUT = 10.0
 
 # [Integration Fix B03] Define RFC 2616 Hop-by-Hop headers + others managed by httpx.
 # We override the imported one to include 'host' and 'upgrade-insecure-requests'.
@@ -400,7 +401,12 @@ class CaptureServer:
         try:
             transport = client_writer.transport
             protocol = transport.get_protocol()
-            await loop.start_tls(transport, protocol, ssl_context, server_side=True)
+            
+            # [Best Practice] Enforce timeout on TLS handshake to prevent resource exhaustion
+            await asyncio.wait_for(
+                loop.start_tls(transport, protocol, ssl_context, server_side=True),
+                timeout=TLS_HANDSHAKE_TIMEOUT
+            )
 
             while not client_reader.at_eof() and not client_writer.is_closing():
                 try:
