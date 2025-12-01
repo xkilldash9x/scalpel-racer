@@ -36,14 +36,7 @@ class PacketController:
     def __init__(self, target_ip: str, target_port: int, source_port: int):
         """
         Initialize the PacketController.
-
-        Args:
-            target_ip (str): The IP address of the target server.
-            target_port (int): The port number of the target server.
-            source_port (int): The local source port used for the connection.
-
-        Raises:
-            ImportError: If NetfilterQueue is not available or supported on the system.
+		...
         """
         if not NFQUEUE_AVAILABLE:
             # Safety guard against attempting to use the class when dependencies are missing
@@ -72,17 +65,11 @@ class PacketController:
     def start(self):
         """
         Sets up iptables rules and starts the NFQueue listener thread.
-
-        This method configures iptables to redirect specific outbound TCP packets to the
-        NetfilterQueue and starts background threads to process intercepted packets.
-
-        Raises:
-             PermissionError: If the process lacks root privileges required for iptables/NFQueue.
-             RuntimeError: If binding to the NetfilterQueue fails.
+		...
         """
         print(f"[*] PacketController: Starting interception for {self.target_ip}:{self.target_port} (Source Port: {self.source_port})")
         
-        # 1. Set up the iptables rule
+        # 1. Set up the iptables rule (B06: Now idempotent)
         self._manage_iptables(action='A')
 
         # 2. Initialize and bind NetfilterQueue
@@ -112,9 +99,7 @@ class PacketController:
     def stop(self):
         """
         Stops the NFQueue listener and cleans up iptables rules.
-
-        This method signals the background threads to stop, unbinds the NetfilterQueue,
-        and removes the added iptables rules.
+		...
         """
         if not self.active:
             return
@@ -129,7 +114,7 @@ class PacketController:
             except Exception:
                 pass
         
-        # 2. Clean up iptables rule
+        # 2. Clean up iptables rule (B06: Now idempotent)
         self._manage_iptables(action='D')
         
         # 3. Ensure threads are finished
@@ -146,25 +131,17 @@ class PacketController:
 
     def _manage_iptables(self, action: str):
         """
-        Helper to add ('A') or delete ('D') the required iptables rule.
-
-        The rule targets outgoing TCP packets with the PSH flag set, destined for
-        the target IP and port, and originating from the specified source port.
-
-        Args:
-            action (str): The iptables action flag, either 'A' (Append) or 'D' (Delete).
-
-        Raises:
-            PermissionError: If the iptables command fails due to permission issues.
-            RuntimeError: If the iptables command fails for other reasons.
+        Helper to add ('A') or delete ('D') the required iptables rule idempotently (B06).
+		...
         """
         
-        # The rule specifically targets the exact connection parameters.
+        # Base rule definition (excluding the action flag)
         # Optimization: We specifically target packets with the PSH flag set, 
         # which the OS typically sets when sending the application data burst from sendall().
-        rule = [
+        base_rule = [
             'iptables',
-            f'-{action}', 'OUTPUT',
+            # Action flag will be inserted here later
+            'OUTPUT',
             '-p', 'tcp',
             '--dport', str(self.target_port),
             '--sport', str(self.source_port),
@@ -173,19 +150,48 @@ class PacketController:
             '-j', 'NFQUEUE',
             '--queue-num', str(self.queue_num)
         ]
+
+        # B06 FIX: Idempotency Check using -C
+        check_rule = base_rule.copy()
+        check_rule.insert(1, '-C') # Insert Check command
+
+        try:
+            # Check the rule status. Returns 0 if exists, non-zero otherwise.
+            subprocess.check_call(check_rule, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            rule_exists = True
+        except subprocess.CalledProcessError:
+            rule_exists = False
+        except FileNotFoundError:
+            raise RuntimeError("iptables command not found. Ensure it is installed and in PATH.")
+
+        if action == 'A' and rule_exists:
+            # Rule already present, no action needed.
+            return
+        elif action == 'D' and not rule_exists:
+            # Rule already absent, no action needed.
+            return
+
+        # Define the actual action rule
+        action_rule = base_rule.copy()
+        action_rule.insert(1, f'-{action}')
         
         try:
-            # Execute the iptables command, hiding output unless an error occurs
-            subprocess.check_call(rule, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            # Execute the iptables command
+            subprocess.check_call(action_rule, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
         except subprocess.CalledProcessError as e:
             # Handle errors during iptables configuration
             if action == 'A':
-                self._manage_iptables(action='D') # Attempt cleanup
+                # B06: Removed recursive cleanup attempt. stop() handles final cleanup.
+                
                 # Check common error codes related to permissions
                 if e.returncode in [1, 4]: 
                      raise PermissionError("Failed to configure iptables. Ensure running as root and iptables is installed/functional.")
                 raise RuntimeError(f"Failed to configure iptables (Return code {e.returncode}).")
-            # If deletion fails (e.g., rule didn't exist), we ignore it.
+            # If deletion fails (rare due to the check), log a warning.
+            elif action == 'D':
+                print(f"[!] Warning: Failed to remove iptables rule (Return code {e.returncode}). Rule might need manual removal.")
+
+    # (_listener_loop, _queue_callback remain the same)
 
     def _listener_loop(self):
         """
@@ -271,10 +277,7 @@ class PacketController:
     def _delayed_release_first_packet(self):
         """
         Thread responsible for releasing the first packet after synchronization.
-
-        This method waits for the first packet to be held, then waits for subsequent
-        packets to be released (or a timeout), applies a delay, and finally releases
-        the held first packet.
+		...
         """
         
         # 1. Wait until the first packet is intercepted and held
@@ -294,7 +297,8 @@ class PacketController:
 
         # 4. Release the first packet
         with self.lock:
-            if self.first_packet_info:
+            # B03 FIX: Check if active and info exists before releasing, ensuring queue is likely still bound.
+            if self.first_packet_info and self.active:
                 seq, pkt = self.first_packet_info
                 try:
                     print(f"[*] Releasing First Packet (Seq: {seq})")
