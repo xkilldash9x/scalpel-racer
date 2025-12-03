@@ -113,57 +113,45 @@ def test_c03_attack_thread_synchronization(MockHTTPResponse, engine, mock_depend
 
     # We will run the attack thread logic directly and control the barrier manually.
     
-    # Reset the barrier for the test (concurrency 1 for this specific test)
-    engine.barrier = threading.Barrier(1) 
+    # Reset the barrier for the test. We use 2 parties: the attack thread and this test thread.
+    engine.barrier = threading.Barrier(2)
 
     # Run the attack thread (index 0)
-    # We run it in a separate thread so we can test the barrier waiting behavior
     thread = threading.Thread(target=engine._attack_thread, args=(0,))
     thread.start()
 
-    # Wait briefly for the thread to execute the initial phase
+    # Wait briefly for the thread to reach the first barrier
     time.sleep(0.1)
 
     # Verify: Initial send (Headers + Stage1) occurred
-    # We check the calls made to sendall on the mock socket.
     calls = mock_sock.sendall.call_args_list
     assert len(calls) == 1
+
+    # Release barrier for Stage 2
+    engine.barrier.wait()
+    time.sleep(0.1)
+    assert len(calls) == 2
+
+    # Release barrier for Stage 3
+    engine.barrier.wait()
+    time.sleep(0.1)
+    assert len(calls) == 3
+
+    # Verify payloads
+    calls = mock_sock.sendall.call_args_list
     initial_payload = calls[0][0][0]
     assert b"HTTP/1.1\r\n" in initial_payload
     assert b"Stage1" in initial_payload
     assert b"Stage2" not in initial_payload
 
-    # The thread should now be waiting at the first barrier (before Stage2).
-    assert engine.barrier.n_waiting == 1
-
-    # Release the barrier
-    try:
-        engine.barrier.wait(timeout=1)
-    except threading.BrokenBarrierError:
-        pytest.fail("Barrier broke unexpectedly")
-
-    # Wait briefly for the thread to execute the next stage
-    time.sleep(0.1)
-
-    # Verify: Second send (Stage2) occurred
-    calls = mock_sock.sendall.call_args_list
-    assert len(calls) == 2
     stage2_payload = calls[1][0][0]
     assert stage2_payload == b"Stage2"
 
-    # The thread should now be waiting at the second barrier (before Stage3).
-    assert engine.barrier.n_waiting == 1
-    
-    # Release the barrier again
-    engine.barrier.wait(timeout=1)
+    stage3_payload = calls[2][0][0]
+    assert stage3_payload == b"Stage3"
     
     # Wait for the thread to finish
     thread.join(timeout=1)
-
-    # Verify: Third send (Stage3) occurred
-    calls = mock_sock.sendall.call_args_list
-    assert len(calls) == 3
-    assert calls[2][0][0] == b"Stage3"
 
     # Verify response processing
     MockHTTPResponse.assert_called_once_with(mock_sock, method="POST")

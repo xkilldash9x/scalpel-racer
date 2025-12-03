@@ -403,10 +403,15 @@ class CaptureServer:
             protocol = transport.get_protocol()
             
             # [Best Practice] Enforce timeout on TLS handshake to prevent resource exhaustion
-            await asyncio.wait_for(
+            new_transport = await asyncio.wait_for(
                 loop.start_tls(transport, protocol, ssl_context, server_side=True),
                 timeout=TLS_HANDSHAKE_TIMEOUT
             )
+
+            # [Fix B01] Rebind reader/writer to the new TLS transport
+            if hasattr(protocol, '_stream_reader'):
+                client_reader = protocol._stream_reader
+            client_writer = asyncio.StreamWriter(new_transport, protocol, client_reader, loop)
 
             while not client_reader.at_eof() and not client_writer.is_closing():
                 try:
