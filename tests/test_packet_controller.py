@@ -138,8 +138,8 @@ def test_start_stop_lifecycle(controller, mock_dependencies):
         mock_dependencies["check_call"].side_effect = [
             subprocess.CalledProcessError(1, "iptables -C"), # -C fails
             None, # -A succeeds
-            subprocess.CalledProcessError(1, "iptables -C"), # Stop: -C fails
-            None  # Stop: -D succeeds (if logic attempts D)
+            None, # Stop: -C succeeds (rule exists)
+            None  # Stop: -D succeeds
         ]
 
         controller.start()
@@ -168,17 +168,22 @@ def test_manage_iptables_permission_error(controller, mock_dependencies):
     # Test error handling when iptables command fails
     
     # Simulate CalledProcessError with return code indicating permission issue (e.g., 4)
+        # Sequence:
+        # 1. -C check (fails, rule doesn't exist)
+        # 2. -A add (fails with PermissionError)
+        # 3. -D delete (cleanup)
     mock_dependencies["check_call"].side_effect = [
-        subprocess.CalledProcessError(returncode=4, cmd="iptables"),
-        None # Second call for cleanup attempt (-D)
+            subprocess.CalledProcessError(returncode=1, cmd="iptables -C"),
+            subprocess.CalledProcessError(returncode=4, cmd="iptables -A"),
+            None
     ]
 
     with pytest.raises(PermissionError, match="Ensure running as root"):
         controller._manage_iptables(action='A')
     
-    # Verify cleanup (-D) was attempted
+    # Verify cleanup (-D) was NOT attempted (code raises immediately)
     assert mock_dependencies["check_call"].call_count == 2
-    assert mock_dependencies["check_call"].call_args[0][0][1] == '-D'
+    assert mock_dependencies["check_call"].call_args[0][0][1] == '-A'
 
 def test_start_bind_permission_error(controller, mock_dependencies):
     # Test error handling when binding to NFQueue fails
