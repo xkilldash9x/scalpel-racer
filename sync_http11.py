@@ -1,5 +1,13 @@
 # FILE: ./sync_http11.py
-# sync_http11.py
+"""
+Implements the Synchronous HTTP/1.1 Staged Attack engine.
+
+This module provides a specialized attack engine (`HTTP11SyncEngine`) that uses Python
+threads and barriers to synchronize the sending of request payloads across multiple
+connections. It is designed to achieve higher precision than asyncio-based approaches
+by synchronizing threads immediately before the `socket.send` call.
+"""
+
 import socket
 import ssl
 import time
@@ -14,16 +22,51 @@ import io
 
 # Define placeholders for data structures (similar to low_level.py)
 class ScanResult:
-     def __init__(self, index: int, status_code: int, duration: float, body_hash: str = None, body_snippet: str = None, error: str = None):
+    """
+    Represents the result of a single race attempt (one probe).
+
+    This class encapsulates all relevant metrics and data obtained from sending
+    a single request as part of a race condition attack.
+
+    Attributes:
+        index (int): The sequence index of the request.
+        status_code (int): The HTTP status code received.
+        duration (float): The round-trip time of the request in seconds.
+        body_hash (str, optional): A hash of the response body.
+        body_snippet (str, optional): A snippet of the response body.
+        error (str, optional): Error message if the request failed.
+    """
+    def __init__(self, index: int, status_code: int, duration: float, body_hash: str = None, body_snippet: str = None, error: str = None):
         self.index = index; self.status_code = status_code; self.duration = duration
         self.body_hash = body_hash; self.body_snippet = body_snippet; self.error = error
 
 class CapturedRequest:
+    """
+    Represents a captured HTTP request.
+
+    This is a simplified local definition to support standalone usage or testing
+    without the full `structures` module dependency if necessary.
+
+    Attributes:
+        id (int): The request ID.
+        method (str): HTTP method.
+        url (str): Target URL.
+        headers (dict): HTTP headers.
+        body (bytes): Request body.
+        edited_body (bytes, optional): Modified body for attacks.
+    """
     # Add attributes expected by the engine
     def __init__(self, id=0, method="GET", url="", headers=None, body=b""):
         self.id = id; self.method = method; self.url = url
         self.headers = headers or {}; self.body = body; self.edited_body = None
+
     def get_attack_payload(self) -> bytes:
+        """
+        Retrieves the payload to be used for the attack.
+
+        Returns:
+            bytes: The edited body if present, otherwise the original body.
+        """
         return self.edited_body if self.edited_body is not None else self.body
     pass
 
@@ -39,10 +82,34 @@ except ImportError:
 
 class HTTP11SyncEngine:
     """
-    (C03) Implements high-precision Synchronous Staged Attacks over HTTP/1.1 using threads and barriers.
-    This engine aims for tighter synchronization than asyncio-based approaches by synchronizing right before the socket send call.
+    Implements high-precision Synchronous Staged Attacks over HTTP/1.1 using threads and barriers.
+
+    This engine is designed to send multiple requests concurrently with precise timing.
+    It splits the request payload at `{{SYNC}}` markers. Threads send the initial
+    part of the request and then wait at a `threading.Barrier` before sending the
+    final stage simultaneously.
+
+    Attributes:
+        request (CapturedRequest): The request template to be raced.
+        concurrency (int): The number of concurrent requests to send.
+        target_host (str): The target hostname.
+        target_port (int): The target port.
+        scheme (str): The URL scheme ('http' or 'https').
+        target_ip (str): The resolved IP address of the target.
+        stages (List[bytes]): The request payload split by synchronization markers.
+        total_payload_len (int): The total length of the payload (excluding markers).
+        barrier (threading.Barrier): Synchronization primitive for coordinating threads.
+        results (List[Optional[ScanResult]]): Storage for the results of each request thread.
     """
+
     def __init__(self, request: CapturedRequest, concurrency: int):
+        """
+        Initializes the HTTP11SyncEngine.
+
+        Args:
+            request (CapturedRequest): The request to be replayed.
+            concurrency (int): The number of concurrent threads/requests.
+        """
         self.request = request
         self.concurrency = concurrency
         
@@ -64,6 +131,12 @@ class HTTP11SyncEngine:
         self._prepare_payload()
 
     def _parse_target(self):
+        """
+        Parses the target URL to extract host, port, and scheme.
+
+        Raises:
+            ValueError: If the URL scheme is not 'http' or 'https'.
+        """
         parsed_url = urlparse(self.request.url)
         self.target_host = parsed_url.hostname
         self.scheme = parsed_url.scheme
@@ -76,6 +149,14 @@ class HTTP11SyncEngine:
             raise ValueError(f"Unsupported URL scheme: {self.scheme}")
 
     def _prepare_payload(self):
+        """
+        Prepares the payload stages and initializes the synchronization barrier.
+
+        Splits the request body by the `{{SYNC}}` marker.
+
+        Raises:
+            ValueError: If the payload does not contain at least one sync marker.
+        """
         payload = self.request.get_attack_payload()
         # The actual length sent over the wire excludes the markers
         self.total_payload_len = len(payload.replace(SYNC_MARKER, b""))
@@ -88,6 +169,15 @@ class HTTP11SyncEngine:
         self.barrier = threading.Barrier(self.concurrency)
 
     def run_attack(self) -> List[ScanResult]:
+        """
+        Executes the synchronized attack.
+
+        Resolves the target IP, launches the attack threads, waits for them to complete,
+        and returns the results.
+
+        Returns:
+            List[ScanResult]: A list of results, one for each concurrent request.
+        """
         print(f"[*] Connecting to {self.target_host}:{self.target_port}...")
         
         # 1. Resolve IP (Centralized resolution)
@@ -115,7 +205,18 @@ class HTTP11SyncEngine:
         return self.results
 
     def _connect(self) -> socket.socket:
-        """Establishes a persistent connection (TCP+SSL) for the attack thread."""
+        """
+        Establishes a persistent TCP (and optionally SSL) connection.
+
+        This method connects to the target IP and handles SSL wrapping if required.
+        It also sets `TCP_NODELAY` to disable Nagle's algorithm for lower latency.
+
+        Returns:
+            socket.socket: The connected socket object.
+
+        Raises:
+            ConnectionError: If connection or SSL handshake fails.
+        """
         try:
             # Connect using the resolved IP
             sock = socket.create_connection((self.target_ip, self.target_port), timeout=10)
@@ -148,7 +249,15 @@ class HTTP11SyncEngine:
         return sock
 
     def _serialize_headers(self) -> bytes:
-        """Serializes HTTP/1.1 headers for the request."""
+        """
+        Serializes HTTP/1.1 headers for the request.
+
+        Constructs the raw HTTP request headers, ensuring necessary headers like
+        `Host`, `Content-Length`, and `Connection: keep-alive` are present and correct.
+
+        Returns:
+            bytes: The raw, encoded HTTP headers ending with double CRLF.
+        """
         parsed_url = urlparse(self.request.url)
         path = parsed_url.path or '/'
         if parsed_url.query:
@@ -198,7 +307,16 @@ class HTTP11SyncEngine:
         return ("\r\n".join(request_lines) + "\r\n\r\n").encode('utf-8')
 
     def _attack_thread(self, index: int):
-        """The main logic for a single synchronized attack thread."""
+        """
+        The main logic for a single synchronized attack thread.
+
+        Connects to the server, sends headers and initial stages, waits at the
+        barrier, and then sends the final stage. It reads the response and stores
+        the result in the `results` list.
+
+        Args:
+            index (int): The index of this thread/request (0 to concurrency-1).
+        """
         sock = None
         response = None
         start_time = 0.0
