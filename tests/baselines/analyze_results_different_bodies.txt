@@ -1,0 +1,23 @@
+--- Analysis Summary ---
+
+[Response Signatures]
+  Count  Status Hash (SHA256)    Snippet (First 100 chars)
+  ------------------------------------------------------------------------------------------
+  1      200    a930708296f3049c body1
+  1      200    8312c64d5771c1a3 body2
+  ------------------------------------------------------------------------------------------
+
+  [!] WARNING: Multiple response signatures detected!
+      This strongly indicates a potential race condition or inconsistent state.
+
+[Timing Metrics]
+  Average: 105.00ms
+  Min/Max: 100.00ms / 110.00ms
+  Jitter (StdDev): 7.07ms
+
+[Timing Distribution (Histogram)]
+   100.00ms -  102.00ms | ######################################## (1)
+   102.00ms -  104.00ms |  (0)
+   104.00ms -  106.00ms |  (0)
+   106.00ms -  108.00ms |  (0)
+   108.00ms -  110.00ms | ######################################## (1)

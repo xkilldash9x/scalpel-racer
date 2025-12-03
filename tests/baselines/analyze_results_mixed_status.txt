@@ -1,0 +1,24 @@
+--- Analysis Summary ---
+
+[Response Signatures]
+  Count  Status Hash (SHA256)    Snippet (First 100 chars)
+  ------------------------------------------------------------------------------------------
+  1      200    a51199a18f94874e success
+  1      500    e1c9c0e004111791 error
+  ------------------------------------------------------------------------------------------
+
+  [!] WARNING: Multiple response signatures detected!
+      This strongly indicates a potential race condition or inconsistent state.
+      Observed different status code families (e.g., success vs error).
+
+[Timing Metrics]
+  Average: 75.00ms
+  Min/Max: 50.00ms / 100.00ms
+  Jitter (StdDev): 35.36ms
+
+[Timing Distribution (Histogram)]
+    50.00ms -   60.00ms | ######################################## (1)
+    60.00ms -   70.00ms |  (0)
+    70.00ms -   80.00ms |  (0)
+    80.00ms -   90.00ms |  (0)
+    90.00ms -  100.00ms | ######################################## (1)
