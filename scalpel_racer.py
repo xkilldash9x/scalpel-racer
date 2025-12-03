@@ -434,6 +434,39 @@ class CaptureServer:
         except Exception as e:
             print(f"[!] Unexpected error during TLS interception for {host}: {e}")
 
+    async def read_chunked_body(self, reader) -> bytes:
+        body_parts = []
+        while True:
+            # Read chunk size line
+            line = await asyncio.wait_for(reader.readline(), timeout=BODY_READ_TIMEOUT)
+            if not line: break
+
+            line_strip = line.strip()
+            if not line_strip: continue
+
+            try:
+                # Handle size and extensions (e.g. "1A; ext")
+                chunk_size_str = line_strip.split(b';')[0].strip()
+                chunk_size = int(chunk_size_str, 16)
+            except ValueError:
+                raise ValueError("Invalid chunk size")
+
+            if chunk_size == 0:
+                # Consume trailing headers (or just empty line)
+                while True:
+                     line = await asyncio.wait_for(reader.readline(), timeout=BODY_READ_TIMEOUT)
+                     if line == b'\r\n' or not line: break
+                break
+
+            # Read chunk data
+            chunk = await asyncio.wait_for(reader.readexactly(chunk_size), timeout=BODY_READ_TIMEOUT)
+            body_parts.append(chunk)
+
+            # Consume CRLF after chunk data
+            await asyncio.wait_for(reader.readexactly(2), timeout=BODY_READ_TIMEOUT)
+
+        return b"".join(body_parts)
+
     async def process_http_request(self, reader, writer, method, request_target, version, initial_line, scheme, explicit_host=None):
         normalized_headers: Dict[str, str] = {}
         original_headers_list: List[tuple[str, str]] = [] 
@@ -484,7 +517,21 @@ class CaptureServer:
              return
 
         body = b""
-        if content_length > 0:
+        is_chunked = False
+        if 'transfer-encoding' in normalized_headers and 'chunked' in normalized_headers['transfer-encoding'].lower():
+            is_chunked = True
+
+        if is_chunked:
+            try:
+                body = await self.read_chunked_body(reader)
+            except Exception as e:
+                print(f"[!] Error reading chunked body: {e}")
+                if not writer.is_closing():
+                    msg = b"Invalid Chunked Encoding"
+                    writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: " + str(len(msg)).encode() + b"\r\n\r\n" + msg)
+                    await writer.drain()
+                return
+        elif content_length > 0:
              try:
                  body = await asyncio.wait_for(reader.readexactly(content_length), timeout=BODY_READ_TIMEOUT)
              except asyncio.IncompleteReadError as e:
