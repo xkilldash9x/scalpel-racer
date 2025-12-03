@@ -1,4 +1,19 @@
 # FILE: ./scalpel_racer.py
+"""
+Scalpel Racer - Advanced Race Condition Testing Tool.
+
+This is the main entry point for the Scalpel Racer application. It orchestrates the
+entire workflow, from starting the proxy server to capture traffic, to managing the
+selection menu, and finally dispatching race condition attacks using various
+strategies (auto, spa, first-seq).
+
+It integrates with:
+- `proxy_core`: For capturing HTTP/HTTPS traffic.
+- `low_level`: For advanced HTTP/2 attacks (SPA, First-Seq).
+- `structures`: For shared data models.
+- `CAManager`: For on-the-fly certificate generation (HTTPS interception).
+"""
+
 import asyncio
 import httpx
 import time
@@ -15,7 +30,7 @@ import platform
 import socket
 import struct
 import threading
-from typing import List, AsyncIterator, Optional, Dict, Union
+from typing import List, AsyncIterator, Optional, Dict, Union, Tuple
 from urllib.parse import urljoin, urlparse, urlunparse
 from collections import defaultdict
 import numpy as np
@@ -90,13 +105,29 @@ except ImportError:
 
 
 class CAManager:
-    """Manages Root CA generation, loading, and signing of forged certificates for MiTM."""
+    """
+    Manages Root CA generation, loading, and signing of forged certificates for MiTM.
+
+    This class handles the creation and persistence of a local Certificate Authority (CA)
+    used to intercept HTTPS traffic. It generates host-specific certificates on the fly.
+
+    Attributes:
+        ca_key (rsa.RSAPrivateKey): The private key of the CA.
+        ca_cert (x509.Certificate): The public certificate of the CA.
+        cert_cache (Dict[str, ssl.SSLContext]): Cache of generated SSL contexts for hosts.
+    """
     def __init__(self):
         self.ca_key = None
         self.ca_cert = None
         self.cert_cache = {}
 
     def initialize(self):
+        """
+        Initializes the CA Manager.
+
+        Loads an existing CA from disk if available; otherwise, generates a new one.
+        If cryptography libraries are missing, this does nothing.
+        """
         if not CRYPTOGRAPHY_AVAILABLE:
             return
             
@@ -106,6 +137,11 @@ class CAManager:
             self.generate_ca()
 
     def load_ca(self):
+        """
+        Loads the CA certificate and private key from disk.
+
+        Regenerates the CA if loading fails.
+        """
         print(f"[*] Loading Root CA from {CA_CERT_FILE}")
         try:
             with open(CA_KEY_FILE, "rb") as f:
@@ -117,6 +153,12 @@ class CAManager:
             self.generate_ca()
 
     def generate_ca(self):
+        """
+        Generates a new Root CA certificate and private key.
+
+        The generated CA is valid for 5 years. The files `scalpel_ca.pem` and
+        `scalpel_ca.key` are written to the current directory.
+        """
         print(f"[*] Generating new Root CA. Install '{CA_CERT_FILE}' in your browser/OS trust store to intercept HTTPS.")
         self.ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
@@ -156,6 +198,18 @@ class CAManager:
             print(f"[!] Error saving CA files: {e}. TLS interception might fail.")
 
     def get_ssl_context(self, hostname: str) -> ssl.SSLContext:
+        """
+        Retrieves or generates an SSLContext for the specified hostname.
+
+        This context is used by the proxy to handshake with the client, masquerading
+        as the target host.
+
+        Args:
+            hostname (str): The hostname to impersonate.
+
+        Returns:
+            ssl.SSLContext: The SSL context loaded with the forged certificate.
+        """
         if hostname in self.cert_cache:
             return self.cert_cache[hostname]
 
@@ -199,6 +253,15 @@ class CAManager:
                 except OSError: pass
 
     def generate_host_cert(self, hostname: str):
+        """
+        Generates a certificate and private key for a specific hostname, signed by the CA.
+
+        Args:
+            hostname (str): The Common Name (CN) for the certificate.
+
+        Returns:
+            Tuple[x509.Certificate, rsa.RSAPrivateKey]: The certificate and private key.
+        """
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         if isinstance(hostname, bytes):
                 hostname = hostname.decode('utf-8', errors='ignore')
@@ -233,8 +296,31 @@ class CAManager:
 class CaptureServer:
     """
     A simple HTTP/HTTPS proxy server to capture traffic for analysis.
+
+    It supports HTTP Connect tunneling for HTTPS interception and regular HTTP proxying.
+    It can optionally override the target URL and filter requests by scope.
+
+    Attributes:
+        port (int): The port to listen on.
+        target_override (str): An optional base URL to rewrite captured requests to.
+        scope_pattern (re.Pattern): Regex pattern to filter requests.
+        request_log (List[CapturedRequest]): Log of captured requests.
+        server (asyncio.Server): The running asyncio server instance.
+        stop_event (asyncio.Event): Event used to signal the server to stop.
+        ready_event (asyncio.Event): Event signaling the server is bound and ready.
+        enable_tunneling (bool): Whether to tunnel non-captured/forwarded traffic.
+        proxy_client (httpx.AsyncClient): Client used for forwarding requests.
     """
     def __init__(self, port: int, target_override: str = None, scope_regex: str = None, enable_tunneling: bool = True):
+        """
+        Initializes the CaptureServer.
+
+        Args:
+            port (int): Listening port.
+            target_override (str, optional): Target URL override.
+            scope_regex (str, optional): Regex scope filter.
+            enable_tunneling (bool, optional): Enable tunneling/forwarding. Defaults to True.
+        """
         self.port = port
         
         # [Integration Fix B01] Ensure target_override always ends with a slash
@@ -252,6 +338,24 @@ class CaptureServer:
         self.proxy_client = None
 
     def construct_target_url(self, scheme: str, request_line_target: str, normalized_headers: Dict[str, str], explicit_host: Optional[str]) -> str:
+        """
+        Constructs the full target URL from the request data.
+
+        Handles absolute-form, authority-form, and origin-form request targets,
+        applying overrides if configured.
+
+        Args:
+            scheme (str): The request scheme (http/https).
+            request_line_target (str): The target string from the HTTP request line.
+            normalized_headers (Dict[str, str]): The request headers.
+            explicit_host (Optional[str]): Hostname from CONNECT request (for HTTPS).
+
+        Returns:
+            str: The fully qualified target URL.
+
+        Raises:
+            ValueError: If the target URL cannot be constructed or parsed.
+        """
         # [Integration Note] We keep v5.2's complex construction as it supports CONNECT better,
         # but the logic relies on target_override having the trailing slash (Fixed in __init__).
         try:
@@ -305,6 +409,12 @@ class CaptureServer:
          ))
 
     async def start(self):
+        """
+        Starts the proxy server.
+
+        Initializes the CA Manager (if available), binds the server socket, and
+        starts the main accept loop.
+        """
         if globals().get('CA_MANAGER'):
             try:
                 globals().get('CA_MANAGER').initialize()
@@ -338,6 +448,16 @@ class CaptureServer:
                 await self.proxy_client.aclose()
 
     async def handle_client(self, reader, writer):
+        """
+        Handles an incoming client connection.
+
+        Reads the initial request line, determines if it's a CONNECT request or
+        a standard HTTP request, and dispatches accordingly.
+
+        Args:
+            reader (asyncio.StreamReader): Client reader.
+            writer (asyncio.StreamWriter): Client writer.
+        """
         try:
             # Read the first line with timeout
             try:
@@ -402,6 +522,17 @@ class CaptureServer:
                     pass
 
     async def handle_connect(self, client_reader, client_writer, path):
+        """
+        Handles HTTP CONNECT requests for HTTPS interception.
+
+        Establishes a TLS tunnel with the client using a forged certificate
+        generated by the CAManager.
+
+        Args:
+            client_reader (asyncio.StreamReader): Client reader.
+            client_writer (asyncio.StreamWriter): Client writer.
+            path (str): The host:port target from the CONNECT request.
+        """
         try:
             host, port_str = path.split(':', 1)
         except ValueError:
@@ -466,6 +597,22 @@ class CaptureServer:
             print(f"[!] Unexpected error during TLS interception for {host}: {e}")
 
     async def process_http_request(self, reader, writer, method, request_target, version, initial_line, scheme, explicit_host=None):
+        """
+        Parses and processes an HTTP request (headers + body).
+
+        Determines if the request matches the scope, logs it if it does, and
+        optionally tunnels/forwards it to the upstream server.
+
+        Args:
+            reader (asyncio.StreamReader): The source reader.
+            writer (asyncio.StreamWriter): The source writer.
+            method (str): HTTP method.
+            request_target (str): HTTP request target (path/URL).
+            version (str): HTTP version.
+            initial_line (bytes): The raw initial request line.
+            scheme (str): The scheme (http/https).
+            explicit_host (str, optional): Host from CONNECT request.
+        """
         normalized_headers: Dict[str, str] = {}
         original_headers_list: List[tuple[str, str]] = [] 
         content_length = 0
@@ -582,6 +729,16 @@ class CaptureServer:
             writer.close()
 
     async def tunnel_request(self, url, method, headers, body, client_writer):
+        """
+        Forwards the request to the actual upstream server.
+
+        Args:
+            url (str): The upstream URL.
+            method (str): The HTTP method.
+            headers (Dict[str, str]): The HTTP headers.
+            body (bytes): The request body.
+            client_writer (asyncio.StreamWriter): The writer to send the response back to the client.
+        """
         if self.proxy_client is None:
             self.proxy_client = httpx.AsyncClient(verify=False, timeout=60.0, http2=True)
 
@@ -628,8 +785,19 @@ class CaptureServer:
 
 async def Last_Byte_Stream_Body(payload: bytes, barrier: asyncio.Barrier, warmup_ms: int) -> AsyncIterator[bytes]:
     """
-    [Integration Fix B04] Optimized handling for small payloads (<= 1 byte).
+    Generator that streams the request body, pausing before the last byte.
+
+    This implements the Last-Byte Sync strategy for httpx.
+
+    Args:
+        payload (bytes): The full request body.
+        barrier (asyncio.Barrier): The synchronization barrier.
+        warmup_ms (int): Delay in milliseconds before waiting on the barrier.
+
+    Yields:
+        bytes: Chunks of the payload.
     """
+    # [Integration Fix B04] Optimized handling for small payloads (<= 1 byte).
     if len(payload) <= 1:
         # Wait first, then send the entire payload (0 or 1 byte)
         if warmup_ms > 0:
@@ -655,6 +823,18 @@ async def Last_Byte_Stream_Body(payload: bytes, barrier: asyncio.Barrier, warmup
     yield payload[-1:]
 
 async def Staged_Stream_Body(payload: bytes, barriers: List[asyncio.Barrier]) -> AsyncIterator[bytes]:
+    """
+    Generator that streams the request body, pausing at {{SYNC}} markers.
+
+    This implements the Staged Sync strategy.
+
+    Args:
+        payload (bytes): The full request body (containing markers).
+        barriers (List[asyncio.Barrier]): A list of barriers, one for each marker.
+
+    Yields:
+        bytes: Chunks of the payload between markers.
+    """
     parts = payload.split(SYNC_MARKER)
     barrier_idx = 0
     
@@ -671,6 +851,21 @@ async def Staged_Stream_Body(payload: bytes, barriers: List[asyncio.Barrier]) ->
             yield part
 
 async def send_probe_advanced(client: httpx.AsyncClient, request: CapturedRequest, payload: bytes, barriers: List[asyncio.Barrier], warmup_ms: int, index: int, is_staged: bool) -> ScanResult:
+    """
+    Sends a single probe (request) as part of an attack.
+
+    Args:
+        client (httpx.AsyncClient): The HTTP client.
+        request (CapturedRequest): The request template.
+        payload (bytes): The payload to send.
+        barriers (List[asyncio.Barrier]): Synchronization barriers.
+        warmup_ms (int): Warmup delay.
+        index (int): The index of this probe.
+        is_staged (bool): Whether this is a staged attack.
+
+    Returns:
+        ScanResult: The result of the probe.
+    """
     start_time = time.perf_counter()
     body_hash = None
     body_snippet = None
@@ -718,6 +913,19 @@ async def send_probe_advanced(client: httpx.AsyncClient, request: CapturedReques
 # --- Main Attack Dispatcher ---
 
 async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warmup: int, strategy: str = "auto"):
+    """
+    Orchestrates the race condition attack.
+
+    Selects the appropriate engine (httpx vs. low-level H2) based on the strategy,
+    configures synchronization, executes the requests, and analyzes the results.
+
+    Args:
+        request (CapturedRequest): The request to race.
+        concurrency (int): Number of concurrent requests.
+        http2 (bool): Whether to force HTTP/2 (for 'auto' strategy).
+        warmup (int): Warmup delay in milliseconds.
+        strategy (str, optional): The attack strategy ('auto', 'spa', 'first-seq').
+    """
     
     attack_payload = request.get_attack_payload()
     sync_markers_count = attack_payload.count(SYNC_MARKER)
@@ -786,6 +994,15 @@ async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warm
     analyze_results(results)
 
 def analyze_results(results: List[ScanResult]):
+    """
+    Analyzes and prints the results of a race attack.
+
+    Groups responses by status code and body hash to identify discrepancies (response signatures).
+    Calculates timing statistics (avg, jitter) and displays a histogram.
+
+    Args:
+        results (List[ScanResult]): The list of results to analyze.
+    """
     successful = [r for r in results if r.error is None]
     
     print("\n--- Analysis Summary ---")
@@ -873,6 +1090,15 @@ def analyze_results(results: List[ScanResult]):
             print(f"  Probe {err.index}: {err.error} ({err.duration:.2f}ms)")
 
 def edit_request_body(request: CapturedRequest):
+    """
+    Interactive CLI for editing a captured request's body.
+
+    Allows the user to modify the body payload, which is useful for injecting
+    synchronization markers or changing parameters.
+
+    Args:
+        request (CapturedRequest): The request to edit.
+    """
     print(f"\nEditing Body for Request {request.id}")
     print("Instructions: Use {{SYNC}} to insert synchronization points for Staged Attacks.")
     print("Current Body Preview (first 500 bytes):")
@@ -919,6 +1145,12 @@ def edit_request_body(request: CapturedRequest):
     print(f"\n[*] Body updated. New length: {len(new_body)} bytes. Sync points: {new_body.count(SYNC_MARKER)}")
 
 def main():
+    """
+    Main entry point function.
+
+    Parses arguments, initializes components, runs the proxy loop, and manages
+    the interactive command menu.
+    """
     # [P3 FIX] Removed environment variable manipulation.
     
     if platform.system() == "Windows":
