@@ -1,3 +1,4 @@
+# FILE: ./low_level.py
 import socket
 import ssl
 import time
@@ -98,7 +99,7 @@ class HTTP2RaceEngine:
 
         self._parse_target()
 
-    # (_parse_target, connect, run_attack, _prepare_requests, _trigger_requests, _receive_loop, _handle_connection_closed, _finalize_results remain the same)
+    # (_parse_target, connect, run_attack, _prepare_requests, _trigger_requests, _handle_connection_closed, _finalize_results remain the same)
 
     def _parse_target(self):
         """
@@ -462,12 +463,14 @@ class HTTP2RaceEngine:
                     # Process the events
                     self._process_events(events)
                     
+                    # [E3 FIX] Move sendall inside the try block
                     # Send any data generated (e.g., ACKs, WINDOW_UPDATEs)
                     data_to_send = self.conn.data_to_send()
                     if data_to_send:
                         self.sock.sendall(data_to_send)
 
-            except (ssl.SSLError, socket.error) as e:
+            # [E2 FIX] Broaden exception handling to include OSError
+            except (ssl.SSLError, socket.error, OSError) as e:
                 # Handle socket level errors
                 self._handle_connection_closed(f"Connection error: {e}")
                 break
@@ -573,10 +576,8 @@ class HTTP2RaceEngine:
 
                     if body:
                         body_hash = hashlib.sha256(body).hexdigest()
-                        try:
-                            body_snippet = body[:100].decode('utf-8', errors='ignore').replace('\n', ' ').replace('\r', '')
-                        except Exception:
-                            body_snippet = repr(body[:100])
+                        # [P6 FIX] Remove unnecessary try/except block.
+                        body_snippet = body[:100].decode('utf-8', errors='ignore').replace('\n', ' ').replace('\r', '')
                     
                     # Handle timeouts (unfinished streams)
                     if not data["finished"] and status_code == 0 and not data["error"]:

@@ -1,3 +1,4 @@
+# FILE: ./sync_http11.py
 # sync_http11.py
 import socket
 import ssl
@@ -222,6 +223,7 @@ class HTTP11SyncEngine:
                 try:
                     # Use a timeout on the barrier to prevent infinite hangs
                     self.barrier.wait(timeout=10)
+                # [E1 FIX] Handle the case where another thread aborted the barrier
                 except threading.BrokenBarrierError:
                     raise ConnectionError("Synchronization barrier broken.")
                 
@@ -263,9 +265,19 @@ class HTTP11SyncEngine:
             # Capture errors during connection, sending, or receiving
             duration = (time.perf_counter() - start_time) * 1000 if start_time > 0 else 0.0
             error_msg = f"{type(e).__name__}: {e}"
-            self.results[index] = ScanResult(index, 0, duration, error=error_msg)
+            
+            # [E1 FIX] Only update result if not already set
+            if self.results[index] is None:
+                self.results[index] = ScanResult(index, 0, duration, error=error_msg)
 
         finally:
+            # [E1 FIX] Fail-fast mechanism: Ensure the barrier is aborted
+            try:
+                if self.barrier and not self.barrier.broken:
+                     self.barrier.abort()
+            except Exception:
+                 pass
+
             # Cleanup resources
             if response:
                 try:

@@ -1,3 +1,4 @@
+# FILE: ./packet_controller.py
 import os
 import sys
 import threading
@@ -69,7 +70,7 @@ class PacketController:
         """
         print(f"[*] PacketController: Starting interception for {self.target_ip}:{self.target_port} (Source Port: {self.source_port})")
         
-        # 1. Set up the iptables rule (B06: Now idempotent)
+        # 1. Set up the iptables rule (PC1: Now idempotent)
         self._manage_iptables(action='A')
 
         # 2. Initialize and bind NetfilterQueue
@@ -114,7 +115,7 @@ class PacketController:
             except Exception:
                 pass
         
-        # 2. Clean up iptables rule (B06: Now idempotent)
+        # 2. Clean up iptables rule (PC1: Now idempotent)
         self._manage_iptables(action='D')
         
         # 3. Ensure threads are finished
@@ -131,7 +132,7 @@ class PacketController:
 
     def _manage_iptables(self, action: str):
         """
-        Helper to add ('A') or delete ('D') the required iptables rule idempotently (B06).
+        Helper to add ('A') or delete ('D') the required iptables rule idempotently (PC1).
 		...
         """
         
@@ -151,7 +152,7 @@ class PacketController:
             '--queue-num', str(self.queue_num)
         ]
 
-        # B06 FIX: Idempotency Check using -C
+        # [PC1 FIX] Idempotency Check using -C
         check_rule = base_rule.copy()
         check_rule.insert(1, '-C') # Insert Check command
 
@@ -161,6 +162,7 @@ class PacketController:
             rule_exists = True
         except subprocess.CalledProcessError:
             rule_exists = False
+        # [PC2 FIX] Handle missing iptables binary
         except FileNotFoundError:
             raise RuntimeError("iptables command not found. Ensure it is installed and in PATH.")
 
@@ -178,6 +180,9 @@ class PacketController:
         try:
             # Execute the iptables command
             subprocess.check_call(action_rule, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        # [PC2 FIX] Handle missing iptables binary
+        except FileNotFoundError:
+             raise RuntimeError("iptables command not found during execution. Ensure it is installed and in PATH.")
         except subprocess.CalledProcessError as e:
             # Handle errors during iptables configuration
             if action == 'A':
