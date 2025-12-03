@@ -1,4 +1,21 @@
 # proxy_core.py
+"""
+Implements the HTTP/2 Native Proxy Handler using Sans-IO principles.
+
+This module provides the `NativeProxyHandler` class, which manages the lifecycle
+of HTTP/2 connections between a client (downstream) and a target server (upstream).
+It implements a full-duplex proxy with support for flow control, state machine
+synchronization, and traffic interception/capture, adhering to RFC 7540 and
+specific requirements for handling race condition testing.
+
+Key features:
+    - Sans-IO Architecture (using `h2`).
+    - Explicit state management for both upstream and downstream connections.
+    - Robust flow control handling (Deadlock prevention, Window Updates).
+    - Request capture and analysis.
+    - Graceful shutdown and resource cleanup.
+"""
+
 import asyncio
 import ssl
 import socket
@@ -31,6 +48,7 @@ try:
 except ImportError:
     # Placeholders for independent testing/development
     class CapturedRequest:
+        """Mock CapturedRequest for testing/independence."""
         def __init__(self, id, method, url, headers, body):
             self.id = id; self.method = method; self.url = url; self.headers = headers; self.body = body
         def __str__(self): return f"{self.method} {self.url}"
@@ -49,10 +67,27 @@ log = logging.getLogger("proxy_core")
 UPSTREAM_CONNECT_TIMEOUT = 5.0
 IDLE_TIMEOUT = 60.0
 GRACEFUL_SHUTDOWN_TIMEOUT = 30.0
-FLOW_CONTROL_TIMEOUT = 30.0 # Timeout for waiting on WINDOW_UPDATE
+FLOW_CONTROL_TIMEOUT = 30.0  # Timeout for waiting on WINDOW_UPDATE
+
 
 class StreamContext:
-    """Manages the state, synchronization, and capture data for a single proxied stream."""
+    """
+    Manages the state, synchronization, and capture data for a single proxied stream.
+
+    This class tracks the open/closed status of a stream on both upstream and
+    downstream sides, manages flow control events, and buffers request data for capture.
+
+    Attributes:
+        stream_id (int): The HTTP/2 stream identifier.
+        scheme (str): The URL scheme (http/https).
+        downstream_closed (bool): True if the downstream (client) has closed the stream.
+        upstream_closed (bool): True if the upstream (server) has closed the stream.
+        flow_control_event (asyncio.Event): Event used to pause/resume writing based on window availability.
+        request_headers_list (List[Tuple[str, str]]): Accumulator for request headers.
+        request_pseudo (Dict[str, str]): Accumulator for pseudo-headers (:method, :path, etc.).
+        request_body (bytearray): Accumulator for the request body payload.
+        capture_finalized (bool): Flag indicating if the request has been fully captured and processed.
+    """
     def __init__(self, stream_id: int, scheme: str):
         self.stream_id = stream_id
         self.scheme = scheme
@@ -63,7 +98,7 @@ class StreamContext:
         
         # Synchronization for flow control (PDF Requirement 3.4)
         self.flow_control_event = asyncio.Event()
-        self.flow_control_event.set() # Start open
+        self.flow_control_event.set()  # Start open
 
         # Capture data structures
         self.request_headers_list: List[Tuple[str, str]] = []
@@ -71,22 +106,56 @@ class StreamContext:
         self.request_body = bytearray()
         self.capture_finalized = False
 
+
 # (PDF Requirement 1: Sans-IO Architecture Implementation)
 class NativeProxyHandler:
     """
     Implements the core HTTP/2 proxy logic using Sans-IO principles (hyper-h2).
-    Manages the lifecycle of both downstream (client) and upstream (server) connections.
+
+    Manages the lifecycle of both downstream (client) and upstream (server) connections,
+    mediating events between them while handling interception and modification logic.
+
+    Attributes:
+        client_reader (asyncio.StreamReader): The reader for the client connection.
+        client_writer (asyncio.StreamWriter): The writer for the client connection.
+        explicit_host (str): The hostname requested in the CONNECT method.
+        capture_callback (Callable): Function to call with captured request data.
+        target_override (Optional[str]): Base URL to override the request target.
+        scope_pattern (Optional[Any]): Regex pattern to filter captured requests.
+        upstream_reader (Optional[asyncio.StreamReader]): The reader for the upstream connection.
+        upstream_writer (Optional[asyncio.StreamWriter]): The writer for the upstream connection.
+        upstream_host (str): The resolved upstream hostname.
+        upstream_port (int): The resolved upstream port.
+        downstream_conn (H2Connection): The H2 state machine for the client side.
+        upstream_conn (Optional[H2Connection]): The H2 state machine for the server side.
+        streams (Dict[int, StreamContext]): Active stream contexts keyed by stream ID.
+        closed (asyncio.Event): Event indicating connection closure.
+        tasks (List[asyncio.Task]): List of background tasks (e.g., read loops).
     """
+
     def __init__(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter, 
                  explicit_host: str, capture_callback: Callable, 
                  target_override: Optional[str], scope_pattern: Optional[Any]):
-        
+        """
+        Initializes the NativeProxyHandler.
+
+        Args:
+            client_reader (asyncio.StreamReader): Reader stream from the client.
+            client_writer (asyncio.StreamWriter): Writer stream to the client.
+            explicit_host (str): The host:port string from the HTTP CONNECT request.
+            capture_callback (Callable): Callback function `fn(CapturedRequest)` for saving requests.
+            target_override (Optional[str]): If set, rewrites the destination of captured requests.
+            scope_pattern (Optional[Any]): Compiled regex object for filtering URL scope.
+
+        Raises:
+            RuntimeError: If the `h2` library is not available.
+        """
         if not H2_AVAILABLE:
             raise RuntimeError("hyper-h2 is required for NativeProxyHandler.")
 
         self.client_reader = client_reader
         self.client_writer = client_writer
-        self.explicit_host = explicit_host # Host derived from CONNECT
+        self.explicit_host = explicit_host  # Host derived from CONNECT
         self.capture_callback = capture_callback
         self.target_override = target_override
         self.scope_pattern = scope_pattern
@@ -96,7 +165,7 @@ class NativeProxyHandler:
         self.upstream_writer: Optional[asyncio.StreamWriter] = None
         self.upstream_host: str = ""
         self.upstream_port: int = 443
-        self.upstream_scheme: str = "https" # H2 interception is always over TLS (h2)
+        self.upstream_scheme: str = "https"  # H2 interception is always over TLS (h2)
 
         # H2 State Machines (PDF Requirement 1.2)
         # Downstream (Proxy acts as Server)
@@ -114,7 +183,16 @@ class NativeProxyHandler:
         self.tasks = []
 
     async def run(self):
-        """Main execution loop for the proxy connection."""
+        """
+        Main execution loop for the proxy connection.
+
+        This method orchestrates the connection setup:
+        1. Resolves the upstream target.
+        2. Establishes the TLS connection to the upstream server.
+        3. Initializes H2 handshakes on both sides.
+        4. Spawns concurrent read loops for upstream and downstream data.
+        5. Handles cleanup upon completion or error.
+        """
         try:
             # 1. Determine Upstream Target
             if not self._resolve_target():
@@ -152,7 +230,12 @@ class NativeProxyHandler:
             await self.cleanup()
 
     def _resolve_target(self) -> bool:
-        """Resolves the upstream target based on the explicit host from CONNECT."""
+        """
+        Resolves the upstream target based on the explicit host from CONNECT.
+
+        Returns:
+            bool: True if resolution was successful, False otherwise.
+        """
         try:
             host, port_str = self.explicit_host.split(':', 1)
             port = int(port_str)
@@ -166,7 +249,15 @@ class NativeProxyHandler:
         return True
 
     async def connect_upstream(self):
-        """Establishes the TCP/TLS connection to the target server."""
+        """
+        Establishes the TCP/TLS connection to the target server.
+
+        Configures SSL context for H2 (ALPN) and connects. Verification is disabled
+        to support interception scenarios.
+
+        Raises:
+            ConnectionError: If connection fails or H2 is not negotiated.
+        """
         log.debug(f"Connecting upstream to {self.upstream_host}:{self.upstream_port}")
 
         # (PDF Requirement 5.1: Security Configuration)
@@ -204,7 +295,14 @@ class NativeProxyHandler:
     # --- Sans-IO Core Loops ---
 
     async def _read_loop_wrapper(self, reader: asyncio.StreamReader, conn: H2Connection, event_handler: Callable):
-        """Wrapper for the read loop to ensure exceptions are handled within the TaskGroup context."""
+        """
+        Wrapper for the read loop to ensure exceptions are handled within the TaskGroup context.
+
+        Args:
+            reader (asyncio.StreamReader): The stream to read from.
+            conn (H2Connection): The H2 connection state machine to feed data into.
+            event_handler (Callable): The function to process resulting events.
+        """
         try:
             await self.read_loop(reader, conn, event_handler)
         except (ConnectionResetError, ConnectionAbortedError, asyncio.IncompleteReadError):
@@ -218,7 +316,17 @@ class NativeProxyHandler:
             raise
 
     async def read_loop(self, reader: asyncio.StreamReader, conn: H2Connection, event_handler: Callable):
-        """Reads data from the network, feeds it to the H2 state machine, and processes events."""
+        """
+        Reads data from the network, feeds it to the H2 state machine, and processes events.
+
+        This loop runs continuously until the connection is closed or an error occurs.
+        It implements the Sans-IO pattern: Read Bytes -> Feed to H2 -> Process Events -> Write Bytes.
+
+        Args:
+            reader (asyncio.StreamReader): The source of raw bytes.
+            conn (H2Connection): The H2 state machine.
+            event_handler (Callable): Logic to handle specific H2 events.
+        """
         while not self.closed.is_set():
             # (PDF Requirement 7.2: Idle Timeout)
             try:
@@ -251,7 +359,15 @@ class NativeProxyHandler:
 
 
     async def flush(self, conn: H2Connection, writer: Optional[asyncio.StreamWriter]):
-        """Retrieves data from the H2 state machine and writes it to the network."""
+        """
+        Retrieves data from the H2 state machine and writes it to the network.
+
+        Also performs `writer.drain()` to respect backpressure.
+
+        Args:
+            conn (H2Connection): The state machine to check for pending data.
+            writer (Optional[asyncio.StreamWriter]): The destination writer.
+        """
         if self.closed.is_set() or writer is None or writer.is_closing():
             return
 
@@ -271,7 +387,12 @@ class NativeProxyHandler:
     # --- Event Handlers (Mediation Logic) ---
 
     async def handle_downstream_event(self, event):
-        """Processes events from the client (Downstream) and mediates them to the server (Upstream)."""
+        """
+        Processes events from the client (Downstream) and mediates them to the server (Upstream).
+
+        Args:
+            event: The H2 event object.
+        """
         # (PDF Requirement 1.3: State Machine Synchronization)
         if isinstance(event, RequestReceived):
             await self.handle_request_received(event)
@@ -290,7 +411,12 @@ class NativeProxyHandler:
             await self.handle_trailers_received(event)
 
     async def handle_upstream_event(self, event):
-        """Processes events from the server (Upstream) and mediates them to the client (Downstream)."""
+        """
+        Processes events from the server (Upstream) and mediates them to the client (Downstream).
+
+        Args:
+            event: The H2 event object.
+        """
         
         if isinstance(event, ResponseReceived):
              # Forward response headers downstream
@@ -315,7 +441,15 @@ class NativeProxyHandler:
     # --- Specific Event Logic & Capture Implementation ---
 
     async def handle_request_received(self, event: RequestReceived):
-        """Handles new incoming requests (streams) from the client."""
+        """
+        Handles new incoming requests (streams) from the client.
+
+        Initializes a new `StreamContext`, buffers headers for capture, and forwards
+        headers to the upstream server.
+
+        Args:
+            event (RequestReceived): The event containing request headers.
+        """
         stream_id = event.stream_id
 
         if stream_id in self.streams:
@@ -351,7 +485,14 @@ class NativeProxyHandler:
 
 
     async def handle_data_received(self, event: DataReceived):
-        """Handles data received from the client (request body)."""
+        """
+        Handles data received from the client (request body).
+
+        Buffers the data for capture and forwards it upstream.
+
+        Args:
+            event (DataReceived): The event containing payload data.
+        """
         stream_id = event.stream_id
         if stream_id in self.streams:
             # Buffer data for capture
@@ -362,7 +503,17 @@ class NativeProxyHandler:
 
     # (PDF Requirement 3: Flow Control Implementation - The Core Challenge)
     async def forward_data(self, destination_conn: H2Connection, event: DataReceived):
-        """Forwards data between connections, respecting flow control and implementing Drain-then-Ack."""
+        """
+        Forwards data between connections, respecting flow control and implementing Drain-then-Ack.
+
+        This method checks the available window on the destination. If sufficient, it sends
+        data, drains the writer, and then acknowledges the data to the source (to open its window).
+        If the window is insufficient, it pauses and waits for a WINDOW_UPDATE event.
+
+        Args:
+            destination_conn (H2Connection): The connection to send data to.
+            event (DataReceived): The data event to forward.
+        """
         stream_id = event.stream_id
         data_len = len(event.data)
         flow_controlled_len = event.flow_controlled_length
@@ -412,7 +563,12 @@ class NativeProxyHandler:
 
 
     async def handle_window_updated(self, event: WindowUpdated):
-        """Handles WINDOW_UPDATE frames, potentially unblocking stalled streams."""
+        """
+        Handles WINDOW_UPDATE frames, potentially unblocking stalled streams.
+
+        Args:
+            event (WindowUpdated): The flow control update event.
+        """
         stream_id = event.stream_id
 
         if stream_id == 0:
@@ -426,7 +582,12 @@ class NativeProxyHandler:
 
     # (PDF Requirement 6.3: gRPC Trailers)
     async def handle_trailers_received(self, event: TrailersReceived):
-        """Forwards trailers (received downstream)."""
+        """
+        Forwards trailers (received downstream).
+
+        Args:
+            event (TrailersReceived): The trailers event.
+        """
         stream_id = event.stream_id
         if stream_id in self.streams:
              # Forward as HEADERS frame upstream with END_STREAM set.
@@ -439,7 +600,15 @@ class NativeProxyHandler:
     # --- Connection Lifecycle Management ---
 
     async def handle_stream_ended(self, source_conn: H2Connection, event: StreamEnded):
-        """Handles stream closure (Half-Closed state)."""
+        """
+        Handles stream closure (Half-Closed state).
+
+        Updates stream state and cleans up if both sides are closed.
+
+        Args:
+            source_conn (H2Connection): The connection where the stream ended.
+            event (StreamEnded): The event.
+        """
         stream_id = event.stream_id
         if stream_id not in self.streams:
             return
@@ -470,7 +639,15 @@ class NativeProxyHandler:
                 del self.streams[stream_id]
 
     async def handle_stream_reset(self, source_conn: H2Connection, event: StreamReset):
-        """Handles stream resets (RST_STREAM)."""
+        """
+        Handles stream resets (RST_STREAM).
+
+        Propagates the reset to the peer and removes the stream context.
+
+        Args:
+            source_conn (H2Connection): The connection where the reset occurred.
+            event (StreamReset): The reset event.
+        """
         stream_id = event.stream_id
         if stream_id in self.streams:
             # Forward the reset to the other side
@@ -483,13 +660,26 @@ class NativeProxyHandler:
             del self.streams[stream_id]
 
     async def handle_connection_terminated(self, event: ConnectionTerminated):
-        """Handles connection termination (GOAWAY)."""
+        """
+        Handles connection termination (GOAWAY).
+
+        Args:
+            event (ConnectionTerminated): The GOAWAY event.
+        """
         log.info(f"Connection terminated by peer (GOAWAY): {event.error_code}")
         await self.graceful_shutdown(last_stream_id=event.last_stream_id)
 
     # (PDF Requirement 7.1: Graceful Shutdown - The GOAWAY Dance)
     async def graceful_shutdown(self, last_stream_id=None):
-        """Performs the graceful shutdown procedure."""
+        """
+        Performs the graceful shutdown procedure.
+
+        Sends a GOAWAY to stop new streams, waits for existing streams to drain,
+        and then closes the connection.
+
+        Args:
+            last_stream_id (int, optional): The last stream ID processed by the peer.
+        """
         if self.closed.is_set():
             return
 
@@ -520,12 +710,21 @@ class NativeProxyHandler:
         self.closed.set()
 
     async def wait_for_streams_to_drain(self):
-        """Waits until the streams dictionary is empty."""
+        """
+        Waits until the streams dictionary is empty.
+
+        This coroutine polls the stream count until it reaches zero.
+        """
         while self.streams:
             await asyncio.sleep(0.1)
 
     async def terminate(self, error_code: ErrorCodes):
-        """Immediately terminates the connection (for errors)."""
+        """
+        Immediately terminates the connection with an error code.
+
+        Args:
+            error_code (ErrorCodes): The H2 error code to send in the GOAWAY frame.
+        """
         if self.closed.is_set():
             return
 
@@ -543,7 +742,9 @@ class NativeProxyHandler:
             pass
 
     async def cleanup(self):
-        """Ensures all resources (sockets, tasks) are closed."""
+        """
+        Ensures all resources (sockets, tasks) are closed properly.
+        """
         self.closed.set()
 
         # Cancel any remaining background tasks (read loops)
@@ -569,7 +770,15 @@ class NativeProxyHandler:
     # --- Capture Logic Finalization ---
 
     def finalize_capture(self, context: StreamContext):
-        """Constructs the CapturedRequest object from the StreamContext."""
+        """
+        Constructs the CapturedRequest object from the StreamContext.
+
+        This is called when the request is fully received (downstream half-closed).
+        It filters headers, checks scope, and invokes the capture callback.
+
+        Args:
+            context (StreamContext): The context of the completed stream.
+        """
         if context.capture_finalized:
             return
         context.capture_finalized = True
@@ -618,7 +827,17 @@ class NativeProxyHandler:
         self.capture_callback(captured)
 
     def construct_target_url(self, scheme: str, path: str, authority: str) -> str:
-        """Constructs the final URL, applying target overrides."""
+        """
+        Constructs the final URL, applying target overrides.
+
+        Args:
+            scheme (str): The URL scheme.
+            path (str): The URL path.
+            authority (str): The host/authority.
+
+        Returns:
+            str: The full URL.
+        """
         # 1. Target Override (Highest Priority)
         if self.target_override:
             # Use urljoin to correctly combine the base path and the relative path
@@ -630,7 +849,27 @@ class NativeProxyHandler:
 
     # --- Helpers ---
     def get_writer(self, conn: H2Connection) -> Optional[asyncio.StreamWriter]:
+        """
+        Returns the asyncio StreamWriter corresponding to the given H2 connection.
+
+        Args:
+            conn (H2Connection): The connection.
+
+        Returns:
+            Optional[asyncio.StreamWriter]: The corresponding writer.
+        """
         return self.client_writer if conn == self.downstream_conn else self.upstream_writer
 
     def get_other_conn(self, conn: H2Connection) -> Optional[H2Connection]:
+        """
+        Returns the 'other' H2 connection in the proxy pair.
+
+        If given downstream, returns upstream, and vice-versa.
+
+        Args:
+            conn (H2Connection): The connection.
+
+        Returns:
+            Optional[H2Connection]: The peer connection.
+        """
         return self.upstream_conn if conn == self.downstream_conn else self.downstream_conn

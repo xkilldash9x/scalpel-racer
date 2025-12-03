@@ -1,4 +1,19 @@
 # FILE: ./low_level.py
+"""
+Implements the Low-Level HTTP/2 Race Engine.
+
+This module provides the `HTTP2RaceEngine` class, which uses raw sockets and the
+`h2` library (hyper-h2) to perform advanced race condition attacks, specifically
+Single Packet Attacks (SPA) and First Sequence Sync (First-Seq) attacks.
+
+It operates synchronously to ensure precise packet control, which is difficult to
+achieve with high-level asyncio libraries.
+
+Dependencies:
+    - h2
+    - packet_controller (optional, for 'first-seq')
+"""
+
 import socket
 import ssl
 import time
@@ -7,24 +22,27 @@ import select
 import hashlib
 import sys
 from urllib.parse import urlparse
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 
 # Define placeholders for data structures to allow parsing and type hinting.
 # We attempt to import the actual definitions from the main script (scalpel_racer.py).
 class ScanResult:
-     """
-     Placeholder class for ScanResult to allow type hinting.
-     Actual definition is imported from scalpel_racer.py.
-     """
-     def __init__(self, index: int, status_code: int, duration: float, body_hash: str = None, body_snippet: str = None, error: str = None):
+    """
+    Placeholder class for ScanResult to allow type hinting.
+    Actual definition is imported from structures.py if available.
+    """
+    def __init__(self, index: int, status_code: int, duration: float, body_hash: str = None, body_snippet: str = None, error: str = None):
         self.index = index; self.status_code = status_code; self.duration = duration
         self.body_hash = body_hash; self.body_snippet = body_snippet; self.error = error
 
 class CapturedRequest:
     """
     Placeholder class for CapturedRequest to allow type hinting.
-    Actual definition is imported from scalpel_racer.py.
+    Actual definition is imported from structures.py if available.
     """
+    def __init__(self, id, method, url, headers, body):
+        self.id = id; self.method = method; self.url = url; self.headers = headers; self.body = body
+
     def get_attack_payload(self) -> bytes:
         """
         Placeholder method for get_attack_payload.
@@ -69,6 +87,20 @@ class HTTP2RaceEngine:
     """
     Implements low-level HTTP/2 attacks (SPA and First-Sequence Sync) using raw sockets and the h2 library.
     This engine operates synchronously (blocking I/O managed via threads) as required for precise packet control.
+
+    Attributes:
+        request (CapturedRequest): The request to race.
+        concurrency (int): The number of concurrent requests to send.
+        strategy (str): The attack strategy ('spa' or 'first-seq').
+        warmup_ms (int): The warm-up delay in milliseconds before the trigger phase.
+        target_host (str): The target hostname.
+        target_port (int): The target port (default 443).
+        target_ip (str): The resolved target IP address.
+        conn (Optional[H2Connection]): The HTTP/2 connection state machine.
+        sock (Optional[ssl.SSLSocket]): The underlying SSL-wrapped socket.
+        streams (Dict[int, Dict]): Dictionary tracking the state of each stream.
+        lock (threading.Lock): Thread lock for synchronizing access to stream data.
+        all_streams_finished (threading.Event): Event set when all streams have completed or timed out.
     """
     def __init__(self, request: CapturedRequest, concurrency: int, strategy="spa", warmup_ms=100):
         """
@@ -98,8 +130,6 @@ class HTTP2RaceEngine:
         self.all_streams_finished = threading.Event()
 
         self._parse_target()
-
-    # (_parse_target, connect, run_attack, _prepare_requests, _trigger_requests, _handle_connection_closed, _finalize_results remain the same)
 
     def _parse_target(self):
         """
@@ -393,7 +423,12 @@ class HTTP2RaceEngine:
     def _construct_h2_headers(self, content_length: int) -> List[Tuple[str, str]]:
         """
         Creates the list of HTTP/2 headers, including pseudo-headers.
-		...
+
+        Args:
+            content_length (int): The value for the Content-Length header.
+
+        Returns:
+            List[Tuple[str, str]]: A list of header tuples required by `h2`.
         """
         parsed_url = urlparse(self.request.url)
         path = parsed_url.path or '/'
@@ -438,7 +473,10 @@ class HTTP2RaceEngine:
     def _receive_loop(self):
         """
         Background thread to read data from the socket and process H2 events.
-		...
+
+        Continuously reads raw bytes from the socket, feeds them to the H2 state
+        machine, and processes the resulting events. It exits when all streams
+        are finished or a connection error occurs.
         """
         while not self.all_streams_finished.is_set():
             try:
@@ -478,10 +516,14 @@ class HTTP2RaceEngine:
         # Ensure the event is set when the loop finishes
         self.all_streams_finished.set()
 
-    def _process_events(self, events):
+    def _process_events(self, events: List[Any]):
         """
         Handles H2 events (headers received, data received, stream end/reset).
-		...
+
+        Updates the internal state (`self.streams`) based on the events received.
+
+        Args:
+            events (List[Any]): The list of H2 events to process.
         """
         with self.lock:
             for event in events:
@@ -533,7 +575,11 @@ class HTTP2RaceEngine:
     def _handle_connection_closed(self, reason: str):
         """
         Marks all pending streams as finished with an error.
-		...
+
+        Called when the underlying TCP connection is closed unexpectedly.
+
+        Args:
+            reason (str): The error message explaining the closure.
         """
         with self.lock:
             for stream_data in self.streams.values():
@@ -545,7 +591,12 @@ class HTTP2RaceEngine:
     def _finalize_results(self) -> List[ScanResult]:
         """
         Converts internal stream data into ScanResult objects.
-		...
+
+        Calculates duration, status code, and body snippets for each stream
+        and returns a sorted list of results.
+
+        Returns:
+            List[ScanResult]: The finalized list of scan results.
         """
         final_results = []
         
