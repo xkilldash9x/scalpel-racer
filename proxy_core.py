@@ -30,7 +30,7 @@ try:
     from h2.config import H2Configuration
     from h2.events import (
         RequestReceived, DataReceived, StreamEnded, StreamReset, WindowUpdated,
-        SettingsAcknowledged, ConnectionTerminated, TrailersReceived, PingAcknowledged,
+        SettingsAcknowledged, ConnectionTerminated, TrailersReceived, PingAckReceived,
         ResponseReceived
     )
     from h2.errors import ErrorCodes
@@ -39,7 +39,7 @@ try:
 except ImportError:
     H2_AVAILABLE = False
     # Define placeholders for type hinting if h2 is not installed
-    H2Connection = object; H2Configuration = object; RequestReceived = object; DataReceived = object; StreamEnded = object; StreamReset = object; WindowUpdated = object; SettingsAcknowledged = object; ConnectionTerminated = object; TrailersReceived = object; PingAcknowledged = object; ErrorCodes = object; ResponseReceived = object; SettingCodes = object
+    H2Connection = object; H2Configuration = object; RequestReceived = object; DataReceived = object; StreamEnded = object; StreamReset = object; WindowUpdated = object; SettingsAcknowledged = object; ConnectionTerminated = object; TrailersReceived = object; PingAckReceived = object; ErrorCodes = object; ResponseReceived = object; SettingCodes = object
 
 # Import structures from the main application (if available)
 try:
