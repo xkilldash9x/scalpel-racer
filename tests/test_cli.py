@@ -1,3 +1,4 @@
+# FILE: ./tests/test_cli.py
 import pytest
 import sys
 import asyncio
@@ -11,7 +12,9 @@ def clean_run(coro):
     then returns None.
     """
     if coro:
-        coro.close()
+        # FIX: Ensure we only call close() if the object has the method (e.g. a coroutine)
+        if hasattr(coro, 'close'):
+             coro.close()
     return None
 
 def test_main_cli_quit_immediately(capsys):
@@ -22,20 +25,27 @@ def test_main_cli_quit_immediately(capsys):
         mock_exit.side_effect = SystemExit
 
         with patch("argparse.ArgumentParser.parse_args") as mock_args:
+            # FIX: Ensure all arguments accessed by main() are mocked
             mock_args.return_value = MagicMock(
                 listen=8080,
                 target="http://example.com",
                 scope=None,
                 concurrency=10,
                 warmup=100,
-                http2=False
+                http2=False,
+                strategy="auto" # Added strategy
             )
 
             # Mock CaptureServer start and request_log
-            with patch("scalpel_racer.CaptureServer") as MockServer:
+            # Mock CAManager as it's initialized in main
+            with patch("scalpel_racer.CaptureServer") as MockServer, \
+                 patch("scalpel_racer.CAManager"):
                 instance = MockServer.return_value
                 instance.start = AsyncMock()
                 instance.request_log = [] # Empty log
+                # FIX: Initialize attributes accessed in main()
+                instance.capture_count = 0
+                instance.proxy_client = None
 
                 # Mock asyncio.run to do nothing for start but clean up
                 with patch("asyncio.run", side_effect=clean_run):
@@ -50,6 +60,7 @@ def test_main_cli_quit_immediately(capsys):
 def test_main_cli_flow_success():
     with patch("argparse.ArgumentParser.parse_args") as mock_args, \
          patch("scalpel_racer.CaptureServer") as MockServer, \
+         patch("scalpel_racer.CAManager"), \
          patch("builtins.input", side_effect=["0", "\n", "q"]), \
          patch("scalpel_racer.run_scan") as mock_run_scan, \
          patch("asyncio.run", side_effect=clean_run) as mock_asyncio_run, \
@@ -57,19 +68,24 @@ def test_main_cli_flow_success():
 
         mock_exit.side_effect = SystemExit
 
+        # FIX: Ensure all arguments accessed by main() are mocked
         mock_args.return_value = MagicMock(
             listen=8080,
             target="http://example.com",
             scope=None,
             concurrency=10,
             warmup=100,
-            http2=False
+            http2=False,
+            strategy="auto" # Added strategy
         )
 
         server_instance = MockServer.return_value
         server_instance.request_log = [
             scalpel_racer.CapturedRequest(0, "GET", "http://example.com/foo", {}, b"")
         ]
+        # FIX: Initialize attributes accessed in main()
+        server_instance.capture_count = 1
+        server_instance.proxy_client = MagicMock() # Mock client so close logic runs
         
         # Ensure the mocked run_scan returns a mock coroutine object so clean_run has something to close
         mock_run_scan.return_value = AsyncMock()
@@ -87,25 +103,31 @@ def test_main_cli_flow_success():
 def test_main_cli_invalid_input(capsys):
     with patch("argparse.ArgumentParser.parse_args") as mock_args, \
          patch("scalpel_racer.CaptureServer") as MockServer, \
+         patch("scalpel_racer.CAManager"), \
          patch("builtins.input", side_effect=["invalid", "99", "q"]), \
          patch("asyncio.run", side_effect=clean_run) as mock_asyncio_run, \
          patch("sys.exit") as mock_exit:
 
         mock_exit.side_effect = SystemExit
 
+        # FIX: Ensure all arguments accessed by main() are mocked
         mock_args.return_value = MagicMock(
             listen=8080,
             target="http://example.com",
             scope=None,
             concurrency=10,
             warmup=100,
-            http2=False
+            http2=False,
+            strategy="auto" # Added strategy
         )
 
         server_instance = MockServer.return_value
         server_instance.request_log = [
             scalpel_racer.CapturedRequest(0, "GET", "http://example.com/foo", {}, b"")
         ]
+        # FIX: Initialize attributes accessed in main()
+        server_instance.capture_count = 1
+        server_instance.proxy_client = None
 
         with pytest.raises(SystemExit):
             scalpel_racer.main()
@@ -127,17 +149,20 @@ def test_main_keyboard_interrupt(capsys):
 
     with patch("argparse.ArgumentParser.parse_args") as mock_args, \
          patch("scalpel_racer.CaptureServer") as MockServer, \
+         patch("scalpel_racer.CAManager"), \
          patch("asyncio.run") as mock_asyncio_run, \
          patch("builtins.input", side_effect=["q"]), \
          patch("sys.exit") as mock_exit:
 
+        # FIX: Ensure all arguments accessed by main() are mocked
         mock_args.return_value = MagicMock(
             listen=8080,
             target="http://example.com",
             scope=None,
             concurrency=10,
             warmup=100,
-            http2=False
+            http2=False,
+            strategy="auto" # Added strategy
         )
 
         server_instance = MockServer.return_value
@@ -146,6 +171,9 @@ def test_main_keyboard_interrupt(capsys):
         req.method = "GET"
         req.url = "http://example.com"
         server_instance.request_log = [req] # Ensure log not empty so we don't exit early
+        # FIX: Initialize attributes accessed in main()
+        server_instance.capture_count = 1
+        server_instance.proxy_client = None
 
         # First call to asyncio.run (server.start) raises KeyboardInterrupt
         # Second call (if any) should just pass.
@@ -162,4 +190,4 @@ def test_main_keyboard_interrupt(capsys):
         captured = capsys.readouterr()
         assert "Captured Requests" in captured.out
     
-        mock_exit.assert_called_with(0)
+        mock_exit.assert_called_with(0)               

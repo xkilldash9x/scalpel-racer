@@ -1,3 +1,4 @@
+# FILE: ./tests/test_scalpel_racer.py
 import pytest
 import asyncio
 import httpx
@@ -59,6 +60,9 @@ async def test_last_byte_stream_body_empty():
     await barrier.wait()
     result = await task
     assert result == b""
+    
+    # [FIX] Explicitly close the generator
+    await gen.aclose()
 
 # --- Integration Tests for CaptureServer ---
 
@@ -71,13 +75,22 @@ async def server_manager(unused_tcp_port_factory):
         server = CaptureServer(port=port, target_override=target_override, scope_regex=scope_regex, enable_tunneling=enable_tunneling)
         servers.append(server)
         task = asyncio.create_task(server.start())
-        await asyncio.sleep(0.1) # Give it time to start
+
+        # [Defense in Depth] Use ready_event for robust synchronization
+        try:
+            await asyncio.wait_for(server.ready_event.wait(), timeout=1.0)
+        except asyncio.TimeoutError:
+            if not task.done():
+                 task.cancel()
+            # Provide detailed error information if the task completed with an exception
+            if task.done() and task.exception():
+                 print(f"Server task exception during startup: {task.exception()}")
+            pytest.fail(f"Server failed to start on port {port} (Timeout waiting for ready_event)")
         
-        if server.server is None and server.stop_event.is_set():
+        # Final check if server failed during start (e.g. bind error)
+        if server.server is None:
              if not task.done():
                  task.cancel()
-             if task.done() and task.exception():
-                 print(f"Server task exception: {task.exception()}")
              pytest.fail(f"Server failed to start on port {port}")
              
         return server, port

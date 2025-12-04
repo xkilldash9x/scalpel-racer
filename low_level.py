@@ -1,4 +1,3 @@
-# FILE: ./low_level.py
 """
 Implements the Low-Level HTTP/2 Race Engine.
 
@@ -177,6 +176,7 @@ class HTTP2RaceEngine:
             # Connect using the IP address
             sock = socket.create_connection((self.target_ip, self.target_port), timeout=10)
         except socket.error as e:
+            # Re-raise as ConnectionError for consistent handling in run_attack
             raise ConnectionError(f"Could not connect to {self.target_ip}:{self.target_port}: {e}")
 
         # Optimization: Disable Nagle's algorithm (TCP_NODELAY)
@@ -246,6 +246,7 @@ class HTTP2RaceEngine:
             return [ScanResult(i, 0, 0.0, error=str(e)) for i in range(self.concurrency)]
 
         packet_controller = None
+        
         # 2. Initialize PacketController (if required)
         if self.strategy == "first-seq":
             # Get the local source port of the established connection
@@ -253,6 +254,8 @@ class HTTP2RaceEngine:
                 source_port = self.sock.getsockname()[1]
             except OSError as e:
                 print(f"[!] Could not determine source port: {e}")
+                # Ensure cleanup before returning
+                self.sock.close()
                 return [ScanResult(i, 0, 0.0, error=f"Source port error: {e}") for i in range(self.concurrency)]
 
             packet_controller = PacketController(self.target_ip, self.target_port, source_port)
@@ -294,10 +297,12 @@ class HTTP2RaceEngine:
             print(f"[!] Error during attack execution: {type(e).__name__}: {e}")
             # Mark any pending streams with the error
             with self.lock:
-                for stream_data in self.streams.values():
-                    if not stream_data["finished"]:
-                        stream_data["finished"] = True
-                        stream_data["error"] = f"Attack interrupted: {e}"
+                # Ensure streams dictionary is initialized before accessing it
+                if self.streams:
+                    for stream_data in self.streams.values():
+                        if not stream_data.get("finished"):
+                            stream_data["finished"] = True
+                            stream_data["error"] = f"Attack interrupted: {e}"
         finally:
             # --- Cleanup ---
             # Stop the PacketController (removes iptables rules)
@@ -311,7 +316,7 @@ class HTTP2RaceEngine:
             if self.sock:
                 try:
                     # Send GOAWAY frame if the connection is still open
-                    if self.conn.state_machine.state != 'CLOSED':
+                    if self.conn and self.conn.state_machine.state != 'CLOSED':
                         self.conn.close_connection()
                         data_to_send = self.conn.data_to_send()
                         if data_to_send:
@@ -466,7 +471,7 @@ class HTTP2RaceEngine:
         
         # Add default User-Agent if not present
         if 'user-agent' not in header_keys:
-            headers.append(('user-agent', 'Scalpel-CLI/5.3-LowLevelH2')) # C03 Version Bump
+            headers.append(('user-agent', 'Scalpel-CLI/5.3-LowLevelH2'))
         
         return headers
 
@@ -505,7 +510,7 @@ class HTTP2RaceEngine:
                     # Send any data generated (e.g., ACKs, WINDOW_UPDATEs)
                     data_to_send = self.conn.data_to_send()
                     if data_to_send:
-                        self.sock.sendall(data_to_send)
+                         self.sock.sendall(data_to_send)
 
             # [E2 FIX] Broaden exception handling to include OSError
             except (ssl.SSLError, socket.error, OSError) as e:
@@ -519,9 +524,7 @@ class HTTP2RaceEngine:
     def _process_events(self, events: List[Any]):
         """
         Handles H2 events (headers received, data received, stream end/reset).
-
         Updates the internal state (`self.streams`) based on the events received.
-
         Args:
             events (List[Any]): The list of H2 events to process.
         """
@@ -540,13 +543,19 @@ class HTTP2RaceEngine:
                 if isinstance(event, ResponseReceived):
                     # Parse headers (H2 headers are typically bytes tuples)
                     for header, value in event.headers:
-                        try:
-                            # Decode headers, assuming UTF-8
-                            header_str = header.decode('utf-8')
-                            value_str = value.decode('utf-8')
-                            stream_data["headers"][header_str] = value_str
-                        except UnicodeDecodeError:
-                            pass
+                        # [FIX] Robust decoding: H2Configuration(header_encoding='utf-8') returns str keys/values.
+                        # However, to be safe against mixed behavior or future config changes, we check type.
+                        if isinstance(header, bytes):
+                            header_str = header.decode('utf-8', errors='ignore')
+                        else:
+                            header_str = header
+                        
+                        if isinstance(value, bytes):
+                            value_str = value.decode('utf-8', errors='ignore')
+                        else:
+                            value_str = value
+                            
+                        stream_data["headers"][header_str] = value_str
                 
                 elif isinstance(event, DataReceived):
                     # Append body data
@@ -581,6 +590,8 @@ class HTTP2RaceEngine:
         Args:
             reason (str): The error message explaining the closure.
         """
+        # Defense in Depth: Improve visibility of unexpected connection closures.
+        print(f"[!] Low-Level Engine: Connection closed unexpectedly. Reason: {reason}")
         with self.lock:
             for stream_data in self.streams.values():
                 if not stream_data["finished"]:
@@ -628,11 +639,12 @@ class HTTP2RaceEngine:
                     if body:
                         body_hash = hashlib.sha256(body).hexdigest()
                         # [P6 FIX] Remove unnecessary try/except block.
+                        # Decode using 'ignore' strategy for robustness against invalid sequences.
                         body_snippet = body[:100].decode('utf-8', errors='ignore').replace('\n', ' ').replace('\r', '')
                     
                     # Handle timeouts (unfinished streams)
                     if not data["finished"] and status_code == 0 and not data["error"]:
-                         result = ScanResult(index, 0, duration, error="Response timeout")
+                        result = ScanResult(index, 0, duration, error="Response timeout")
                     else:
                         result = ScanResult(index, status_code, duration, body_hash, body_snippet)
                 
