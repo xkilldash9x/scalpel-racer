@@ -37,6 +37,17 @@ class ScanResult:
         error (str, optional): Error message if the request failed.
     """
     def __init__(self, index: int, status_code: int, duration: float, body_hash: str = None, body_snippet: str = None, error: str = None):
+        """
+        Initializes a new instance of ScanResult.
+
+        Args:
+            index (int): Request index.
+            status_code (int): HTTP status code.
+            duration (float): Request duration.
+            body_hash (str, optional): SHA-256 hash of the body.
+            body_snippet (str, optional): First 100 chars of body.
+            error (str, optional): Error message.
+        """
         self.index = index; self.status_code = status_code; self.duration = duration
         self.body_hash = body_hash; self.body_snippet = body_snippet; self.error = error
 
@@ -57,6 +68,16 @@ class CapturedRequest:
     """
     # Add attributes expected by the engine
     def __init__(self, id=0, method="GET", url="", headers=None, body=b""):
+        """
+        Initializes a new instance of CapturedRequest.
+
+        Args:
+            id (int): Request ID.
+            method (str): HTTP Method.
+            url (str): Target URL.
+            headers (dict): Headers dictionary.
+            body (bytes): Request body.
+        """
         self.id = id; self.method = method; self.url = url
         self.headers = headers or {}; self.body = body; self.edited_body = None
 
@@ -68,7 +89,6 @@ class CapturedRequest:
             bytes: The edited body if present, otherwise the original body.
         """
         return self.edited_body if self.edited_body is not None else self.body
-    pass
 
 MAX_RESPONSE_BODY_READ = 1024 * 1024
 SYNC_MARKER = b"{{SYNC}}"

@@ -1,5 +1,25 @@
 # FILE: ./scalpel_racer.py
-# FILE: ./scalpel_racer.py
+"""
+Scalpel Racer - Advanced Race Condition Testing Tool.
+
+This is the main entry point for the Scalpel Racer application. It orchestrates
+the entire workflow, from setting up the intercepting proxy server and capturing
+traffic to managing the Certificate Authority (CA) and executing various race
+condition attack strategies (Auto, SPA, First-Seq).
+
+Key Components:
+    - CAManager: Handles dynamic generation of CA certificates for HTTPS interception.
+    - CaptureServer: An asyncio-based proxy server that intercepts and logs HTTP/HTTPS requests.
+    - run_scan: The high-level function that dispatches the attack to the appropriate engine.
+    - main: The CLI entry point handling argument parsing and the interactive UI.
+
+Dependencies:
+    - asyncio, httpx, h2, cryptography, numpy
+    - low_level (internal)
+    - packet_controller (internal)
+    - structures (internal)
+"""
+
 import asyncio
 import httpx
 import time
@@ -86,12 +106,26 @@ except ImportError:
 CA_MANAGER = None
 
 class CAManager:
+    """
+    Manages the Certificate Authority (CA) for HTTPS interception.
+
+    This class handles loading the existing CA certificate and key, generating a new
+    CA if one doesn't exist, and dynamically generating leaf certificates for
+    intercepted hostnames on the fly.
+    """
     def __init__(self):
+        """Initializes the CAManager."""
         self.ca_key = None
         self.ca_cert = None
         self.cert_cache = {}
 
     def initialize(self):
+        """
+        Initializes the CA Manager.
+
+        Checks for the existence of CA files. Loads them if present, otherwise
+        generates a new CA. Does nothing if cryptography library is unavailable.
+        """
         if not CRYPTOGRAPHY_AVAILABLE:
             return
             
@@ -101,6 +135,11 @@ class CAManager:
             self.generate_ca()
 
     def load_ca(self):
+        """
+        Loads the existing CA certificate and private key from disk.
+
+        If loading fails, it attempts to regenerate the CA.
+        """
         print(f"[*] Loading Root CA from {CA_CERT_FILE}")
         try:
             with open(CA_KEY_FILE, "rb") as f:
@@ -112,6 +151,11 @@ class CAManager:
             self.generate_ca()
 
     def generate_ca(self):
+        """
+        Generates a new self-signed Root CA certificate and private key.
+
+        The generated files are saved to `CA_CERT_FILE` and `CA_KEY_FILE`.
+        """
         print(f"[*] Generating new Root CA. Install '{CA_CERT_FILE}' in your browser/OS trust store to intercept HTTPS.")
         self.ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
@@ -151,6 +195,17 @@ class CAManager:
             print(f"[!] Error saving CA files: {e}. TLS interception might fail.")
 
     def get_ssl_context(self, hostname: str) -> ssl.SSLContext:
+        """
+        Creates an SSLContext for a specific hostname, signed by the CA.
+
+        Uses a cache to avoid regenerating certificates for the same host.
+
+        Args:
+            hostname (str): The hostname for which to generate the certificate.
+
+        Returns:
+            ssl.SSLContext: The SSL context configured with the generated cert.
+        """
         if hostname in self.cert_cache:
             return self.cert_cache[hostname]
 
@@ -195,6 +250,15 @@ class CAManager:
                 except OSError: pass
 
     def generate_host_cert(self, hostname: str):
+        """
+        Generates a leaf certificate for the given hostname.
+
+        Args:
+            hostname (str): The target hostname.
+
+        Returns:
+            Tuple: A tuple containing (certificate object, private key object).
+        """
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         if isinstance(hostname, bytes):
             hostname = hostname.decode('utf-8', errors='ignore')
@@ -227,7 +291,22 @@ class CAManager:
 
 
 class CaptureServer:
+    """
+    An asyncio-based proxy server for capturing HTTP and HTTPS traffic.
+
+    It listens for incoming connections, handles HTTP CONNECT for TLS tunnels,
+    intercepts requests (MITM), and logs them for later use in race attacks.
+    """
     def __init__(self, port: int, target_override: str = None, scope_regex: str = None, enable_tunneling: bool = True):
+        """
+        Initializes the CaptureServer.
+
+        Args:
+            port (int): The port to listen on.
+            target_override (str, optional): Base URL to override the target.
+            scope_regex (str, optional): Regex pattern to filter captured requests.
+            enable_tunneling (bool, optional): Whether to tunnel non-captured requests. Defaults to True.
+        """
         self.port = port
         self.target_override = target_override
         if self.target_override and not self.target_override.endswith('/'):
@@ -243,6 +322,23 @@ class CaptureServer:
         self.capture_count = 0 # P3: Counter for optimized logging
 
     def construct_target_url(self, scheme: str, request_line_target: str, normalized_headers: Dict[str, str], explicit_host: Optional[str]) -> str:
+        """
+        Constructs the full target URL from request components.
+
+        Handles target override logic and reconstruction from relative paths.
+
+        Args:
+            scheme (str): 'http' or 'https'.
+            request_line_target (str): The target string from the HTTP request line.
+            normalized_headers (Dict[str, str]): Lowercase HTTP headers.
+            explicit_host (Optional[str]): Hostname from CONNECT context (if applicable).
+
+        Returns:
+            str: The fully qualified URL.
+
+        Raises:
+            ValueError: If the target cannot be determined.
+        """
         try:
             parsed_target = urlparse(request_line_target)
         except ValueError:
@@ -291,6 +387,11 @@ class CaptureServer:
          ))
 
     async def start(self):
+        """
+        Starts the proxy server.
+
+        Initializes the CA Manager and begins listening for connections.
+        """
         if globals().get('CA_MANAGER'):
             try:
                 globals().get('CA_MANAGER').initialize()
@@ -324,6 +425,16 @@ class CaptureServer:
                 await self.proxy_client.aclose()
 
     async def handle_client(self, reader, writer):
+        """
+        Handles an incoming client connection.
+
+        Reads the initial request line, parses the method, and routes to either
+        `handle_connect` (for TLS tunnels) or `process_http_request`.
+
+        Args:
+            reader (asyncio.StreamReader): The client reader.
+            writer (asyncio.StreamWriter): The client writer.
+        """
         try:
             try:
                 # P2: Keep timeout on the initial line read
@@ -379,6 +490,20 @@ class CaptureServer:
                     pass
 
     async def handle_connect(self, client_reader, client_writer, path):
+        """
+        Handles the HTTP CONNECT method for establishing TLS tunnels.
+
+        Performs the MITM interception:
+        1. Responds with 200 Connection Established.
+        2. Upgrades the connection to TLS using a dynamically generated cert.
+        3. Wraps the transport in a new reader/writer pair.
+        4. Processes the inner encrypted HTTP requests.
+
+        Args:
+            client_reader: The client reader.
+            client_writer: The client writer.
+            path (str): The target host:port from the CONNECT request.
+        """
         try:
             # Robust parsing: allow fallback to default port 443 if missing
             if ':' in path:
@@ -501,6 +626,23 @@ class CaptureServer:
             # pass # Removed pass, implicit return None
 
     async def process_http_request(self, reader, writer, method, request_target, version, initial_line, scheme, explicit_host=None):
+        """
+        Parses and processes a standard HTTP request.
+
+        Reads headers and body, handles chunked transfer encoding, constructs the
+        target URL, and logs the captured request. If tunneling is enabled and the
+        request matches the scope, it tunnels the request upstream.
+
+        Args:
+            reader: Client reader.
+            writer: Client writer.
+            method (str): HTTP method.
+            request_target (str): Target URL/path.
+            version (str): HTTP version.
+            initial_line (bytes): Raw initial request line.
+            scheme (str): 'http' or 'https'.
+            explicit_host (str, optional): Explicit host context.
+        """
         normalized_headers: Dict[str, str] = {}
         original_headers_list: List[tuple[str, str]] = [] 
         content_length = 0
@@ -705,6 +847,16 @@ class CaptureServer:
             writer.close()
 
     async def tunnel_request(self, url, method, headers, body, client_writer):
+        """
+        Tunnels the intercepted request to the upstream server and relays the response.
+
+        Args:
+            url (str): The upstream URL.
+            method (str): HTTP method.
+            headers (Dict): Request headers.
+            body (bytes): Request body.
+            client_writer: Client writer to send the response to.
+        """
         if self.proxy_client is None:
             self.proxy_client = httpx.AsyncClient(verify=False, timeout=60.0, http2=True)
 
@@ -750,6 +902,19 @@ class CaptureServer:
             pass
 
 async def Last_Byte_Stream_Body(payload: bytes, barrier: asyncio.Barrier, warmup_ms: int) -> AsyncIterator[bytes]:
+    """
+    Async generator that streams the request body, pausing before the last byte.
+
+    Used for the 'Last-Byte Sync' strategy.
+
+    Args:
+        payload (bytes): The full request body.
+        barrier (asyncio.Barrier): The synchronization barrier.
+        warmup_ms (int): Warmup delay before the last byte.
+
+    Yields:
+        bytes: Chunks of the payload.
+    """
     if len(payload) <= 1:
         if warmup_ms > 0:
             await asyncio.sleep(warmup_ms / 1000.0)
@@ -773,6 +938,18 @@ async def Last_Byte_Stream_Body(payload: bytes, barrier: asyncio.Barrier, warmup
     yield payload[-1:]
 
 async def Staged_Stream_Body(payload: bytes, barriers: List[asyncio.Barrier]) -> AsyncIterator[bytes]:
+    """
+    Async generator that splits the payload by {{SYNC}} markers.
+
+    Used for the 'Staged' attack strategy.
+
+    Args:
+        payload (bytes): The request body containing sync markers.
+        barriers (List[asyncio.Barrier]): A list of barriers, one for each marker.
+
+    Yields:
+        bytes: Segments of the payload.
+    """
     parts = payload.split(SYNC_MARKER)
     barrier_idx = 0
     
@@ -789,6 +966,21 @@ async def Staged_Stream_Body(payload: bytes, barriers: List[asyncio.Barrier]) ->
             yield part
 
 async def send_probe_advanced(client: httpx.AsyncClient, request: CapturedRequest, payload: bytes, barriers: List[asyncio.Barrier], warmup_ms: int, index: int, is_staged: bool) -> ScanResult:
+    """
+    Sends a single probe request using httpx with the specified synchronization strategy.
+
+    Args:
+        client (httpx.AsyncClient): The HTTP client.
+        request (CapturedRequest): The request template.
+        payload (bytes): The attack payload.
+        barriers (List[asyncio.Barrier]): Synchronization barriers.
+        warmup_ms (int): Warmup time.
+        index (int): Probe index.
+        is_staged (bool): Whether to use Staged or Last-Byte Sync.
+
+    Returns:
+        ScanResult: The result of the probe.
+    """
     start_time = time.perf_counter()
     body_hash = None
     body_snippet = None
@@ -833,6 +1025,22 @@ async def send_probe_advanced(client: httpx.AsyncClient, request: CapturedReques
         return ScanResult(index, 0, duration, error=str(e))
 
 async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warmup: int, strategy: str = "auto"):
+    """
+    Orchestrates the race condition attack.
+
+    Selects the appropriate attack engine (httpx 'auto' or low-level 'spa'/'first-seq')
+    based on the configuration and executes the attack.
+
+    Args:
+        request (CapturedRequest): The request to race.
+        concurrency (int): Number of concurrent requests.
+        http2 (bool): Force HTTP/2 for 'auto' strategy.
+        warmup (int): Warmup delay in ms.
+        strategy (str): Attack strategy ('auto', 'spa', 'first-seq').
+
+    Returns:
+        List[ScanResult]: The results of the attack.
+    """
     attack_payload = request.get_attack_payload()
     sync_markers_count = attack_payload.count(SYNC_MARKER)
 
@@ -912,6 +1120,15 @@ async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warm
     return results
 
 def analyze_results(results: List[ScanResult]):
+    """
+    Analyzes and prints statistical data from the scan results.
+
+    Groups responses by status code and body hash, and calculates timing statistics
+    (average, jitter, distribution).
+
+    Args:
+        results (List[ScanResult]): The list of results to analyze.
+    """
     # (analyze_results implementation remains the same)
     if not results:
         print("\n--- Analysis Summary ---\n  (No results to analyze)")
@@ -995,6 +1212,14 @@ def analyze_results(results: List[ScanResult]):
             print(f"  Probe {err.index}: {err.error} ({err.duration:.2f}ms)")
 
 def edit_request_body(request: CapturedRequest):
+    """
+    Provides a CLI for editing the body of a captured request.
+
+    Useful for inserting `{{SYNC}}` markers for Staged attacks.
+
+    Args:
+        request (CapturedRequest): The request to edit.
+    """
     # (edit_request_body implementation remains the same)
     print(f"\nEditing Body for Request {request.id}")
     print("Instructions: Use {{SYNC}} to insert synchronization points for Staged Attacks.")
@@ -1042,6 +1267,12 @@ def edit_request_body(request: CapturedRequest):
     print(f"\n[*] Body updated. New length: {len(new_body)} bytes. Sync points: {new_body.count(SYNC_MARKER)}")
 
 def main():
+    """
+    Main entry point.
+
+    Handles CLI arguments, initializes the environment (CA, CaptureServer),
+    and runs the interactive request selection menu.
+    """
     if platform.system() == "Windows":
         try:
             if hasattr(asyncio, 'WindowsSelectorEventLoopPolicy'):
