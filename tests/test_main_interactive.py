@@ -1,3 +1,4 @@
+# FILE: ./tests/test_main_interactive.py
 import pytest
 from unittest.mock import MagicMock, patch, ANY
 import io
@@ -67,10 +68,13 @@ def test_main_cli_flow(mock_asyncio_run, MockCAManager, MockCaptureServer, mock_
     server_instance.request_log = [
         scalpel_racer.CapturedRequest(0, "GET", "http://test.com", {}, b"")
     ]
+    # FIX: Initialize attributes accessed in main()
+    server_instance.capture_count = 1
     # Simulate proxy_client being initialized so asyncio.run(client.aclose()) is called
     server_instance.proxy_client = MagicMock()
 
     # Mock CLI args
+    # Note: When patching sys.argv, main() will parse them. The default strategy='auto' is handled by argparse.
     with patch("sys.argv", ["scalpel_racer.py", "-l", "9090"]):
         # Mock inputs: select ID 0, press Enter after scan, then quit
         with patch("builtins.input", side_effect=["0", "\n", "q"]):
@@ -92,6 +96,8 @@ def test_main_no_capture(mock_asyncio_run, MockCAManager, MockCaptureServer):
     server_instance = MockCaptureServer.return_value
     server_instance.request_log = [] # Empty log
     server_instance.proxy_client = None
+    # FIX: Initialize attributes accessed in main()
+    server_instance.capture_count = 0
 
     with patch("sys.argv", ["scalpel_racer.py"]):
         with pytest.raises(SystemExit) as excinfo:

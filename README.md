@@ -4,36 +4,51 @@ Scalpel Racer is an advanced race condition testing tool designed to identify an
 
 ## Features
 
-*   **Concurrency**: Sends multiple requests simultaneously to trigger race conditions.
-*   **Attack Strategies**:
-    *   **Auto (httpx)**: Uses asynchronous HTTP requests (via `httpx`) with synchronization barriers. Supports both Last-Byte Sync and Staged attacks (using `{{SYNC}}` markers).
-    *   **SPA (Single Packet Attack)**: Uses low-level HTTP/2 frames to send request headers early and trigger all requests with a single TCP packet containing the last byte of data. This minimizes network jitter.
-    *   **First-Seq (First Sequence Sync)**: A highly advanced strategy that uses Linux `NetfilterQueue` and `iptables` to intercept and synchronize the very first TCP packet of the request burst, ensuring maximum parallelism at the network layer.
-*   **Traffic Capture**: Includes a built-in proxy server to capture requests directly from your browser, Burp Suite, or other tools.
-*   **Request Editing**: Modify captured requests (body, headers) before launching an attack. Supports inserting `{{SYNC}}` markers for staged attacks.
-*   **HTTPS Interception**: Supports HTTPS traffic capture via a dynamically generated Certificate Authority (CA).
-*   **Response Analysis**: Automatically groups responses by status code and body hash, calculates timing statistics (average, jitter), and generates histograms.
+* **Concurrency**: Sends multiple requests simultaneously to trigger race conditions.
+* **Attack Strategies**:
+    * **Auto (httpx)**: Uses asynchronous HTTP requests (via `httpx`) with synchronization barriers. Supports both Last-Byte Sync and Staged attacks (using `{{SYNC}}` markers).
+    * **SPA (Single Packet Attack)**: Uses low-level HTTP/2 frames to send request headers early and trigger all requests with a single TCP packet containing the last byte of data. This minimizes network jitter.
+    * **First-Seq (First Sequence Sync)**: A highly advanced strategy that uses Linux `NetfilterQueue` and `iptables` to intercept and synchronize the very first TCP packet of the request burst, ensuring maximum parallelism at the network layer.
+* **Traffic Capture**: Includes a built-in proxy server to capture requests directly from your browser, Burp Suite, or other tools.
+* **Request Editing**: Modify captured requests (body, headers) before launching an attack. Supports inserting `{{SYNC}}` markers for staged attacks.
+* **HTTPS Interception**: Supports HTTPS traffic capture via a dynamically generated Certificate Authority (CA).
+* **Response Analysis**: Automatically groups responses by status code and body hash, calculates timing statistics (average, jitter), and generates histograms.
 
 ## Requirements
 
-*   Python 3.7+
-*   **Core Dependencies**:
-    *   `httpx`: For standard HTTP requests and the 'auto' strategy.
-    *   `numpy`: For statistical analysis of timing data.
-    *   `cryptography`: For HTTPS interception (CA generation).
-*   **Advanced Dependencies** (Required for SPA and First-Seq):
-    *   `h2`: Required for HTTP/2 Single Packet Attacks and First-Seq.
-    *   `NetfilterQueue` & `scapy`: Required for the First-Seq strategy (Linux only, requires root).
+* Python 3.7+
+* **Core Dependencies**:
+    * `httpx`: For standard HTTP requests and the 'auto' strategy.
+    * `numpy`: For statistical analysis of timing data.
+    * `cryptography`: For HTTPS interception (CA generation).
+* **Advanced Dependencies** (Required for SPA and First-Seq):
+    * `h2`: Required for HTTP/2 Single Packet Attacks and First-Seq.
+    * `NetfilterQueue` & `scapy`: Required for the First-Seq strategy (Linux only, requires root).
 
 ### Installation
 
 1.  Clone the repository:
     ```bash
-    git clone https://github.com/yourusername/scalpel-racer.git
+    git clone [https://github.com/yourusername/scalpel-racer.git](https://github.com/yourusername/scalpel-racer.git)
     cd scalpel-racer
     ```
 
-2.  Install dependencies:
+2.  **Create and Activate Virtual Environment (Required):**
+    You must run Scalpel Racer within a virtual environment to ensure dependency isolation.
+
+    *Linux / MacOS:*
+    ```bash
+    python3 -m venv venv
+    source venv/bin/activate
+    ```
+
+    *Windows:*
+    ```bash
+    python -m venv venv
+    venv\Scripts\activate
+    ```
+
+3.  Install dependencies:
     ```bash
     pip install -r requirements.txt
     ```
@@ -52,11 +67,10 @@ Scalpel Racer is an advanced race condition testing tool designed to identify an
 
 ### 1. Basic Capture & Race
 
-Start the tool to capture traffic. By default, it listens on port 8080.
+Star                                                                                                                                                                                                                                                                                                                                                                                                                                     t the tool to capture traffic. By default, it listens on port 8080.
 
 ```bash
 python3 scalpel_racer.py -l 8080
-```
 
 Configure your browser or tool (e.g., Burp Suite, Postman) to use `localhost:8080` as an HTTP/HTTPS proxy.
 

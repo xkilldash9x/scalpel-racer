@@ -47,8 +47,7 @@ async def test_staged_stream_synchronization():
     assert await a_next(s1) == b"A"
     assert await a_next(s2) == b"A"
     
-    # Both should now be waiting at b1. 
-    # Use asyncio.gather to proceed concurrently when the barrier trips.
+    # Both should now be waiting at b1.
     results_s2 = await asyncio.gather(a_next(s1), a_next(s2))
     assert results_s2 == [b"B", b"B"]
     
@@ -56,6 +55,9 @@ async def test_staged_stream_synchronization():
     results_s3 = await asyncio.gather(a_next(s1), a_next(s2))
     assert results_s3 == [b"C", b"C"]
 
+    # [FIX] Explicitly close the generators to prevent RuntimeWarning
+    await s1.aclose()
+    await s2.aclose()
 # --- Tests for send_probe_advanced (Integration) ---
 
 @pytest.mark.asyncio
