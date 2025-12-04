@@ -240,6 +240,7 @@ class HTTP11SyncEngine:
         try:
             # Connect using the resolved IP
             sock = socket.create_connection((self.target_ip, self.target_port), timeout=10)
+        # [E1 FIX] Catch socket.error (which includes OSError on some platforms) and re-raise as ConnectionError
         except socket.error as e:
             raise ConnectionError(f"Connection failed: {e}")
 
@@ -363,6 +364,7 @@ class HTTP11SyncEngine:
                     self.barrier.wait(timeout=10)
                 # [E1 FIX] Handle the case where another thread aborted the barrier
                 except threading.BrokenBarrierError:
+                    # Raise an exception to be caught by the outer handler
                     raise ConnectionError("Synchronization barrier broken.")
                 
                 # Send immediately
@@ -399,18 +401,22 @@ class HTTP11SyncEngine:
 
             self.results[index] = ScanResult(index, status_code, duration, body_hash, body_snippet)
 
+        # [E1 FIX] Catch ConnectionError (raised by _connect or BrokenBarrierError) and generic Exceptions
         except Exception as e:
             # Capture errors during connection, sending, or receiving
             duration = (time.perf_counter() - start_time) * 1000 if start_time > 0 else 0.0
             error_msg = f"{type(e).__name__}: {e}"
             
-            # [E1 FIX] Only update result if not already set
+            # [E1 FIX] Only update result if not already set (prevents overriding success if error happens late)
             if self.results[index] is None:
                 self.results[index] = ScanResult(index, 0, duration, error=error_msg)
 
         finally:
-            # [E1 FIX] Fail-fast mechanism: Ensure the barrier is aborted
+            # [E1 FIX] Fail-fast mechanism: Ensure the barrier is aborted if an error occurred in this thread
+            # We check if the barrier exists and is still intact before attempting to abort.
             try:
+                # We rely on the fact that if any thread hits an exception, it should trigger the abort
+                # for others, even if the exception handling above already recorded the error.
                 if self.barrier and not self.barrier.broken:
                      self.barrier.abort()
             except Exception:

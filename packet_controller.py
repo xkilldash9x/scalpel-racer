@@ -209,7 +209,7 @@ class PacketController:
             '--queue-num', str(self.queue_num)
         ]
 
-        # [PC1 FIX] Idempotency Check using -C
+        # [PC1 FIX] Idempotency Check using -C. Use copy() to prevent modifying base_rule.
         check_rule = base_rule.copy()
         check_rule.insert(1, '-C')  # Insert Check command
 

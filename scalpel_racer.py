@@ -578,7 +578,7 @@ class CaptureServer:
             # END P1 FIX
 
             
-            # [FIX: CRITICAL] Capture the NEW transport returned by start_tls
+            # [FIX: CRITICAL B01] Capture the NEW transport returned by start_tls
             new_transport = await asyncio.wait_for(
                 loop.start_tls(transport, protocol, ssl_context, server_side=True),
                 timeout=TLS_HANDSHAKE_TIMEOUT
@@ -589,7 +589,7 @@ class CaptureServer:
             if hasattr(protocol, '_stream_reader') and protocol._stream_reader:
                 client_reader = protocol._stream_reader
 
-            # [FIX: CRITICAL] Create a NEW writer using the new SSL transport.
+            # [FIX: CRITICAL B01] Create a NEW writer using the new SSL transport.
             # Without this, we continue writing to the raw TCP socket (plaintext), causing ERR_SSL_PROTOCOL_ERROR.
             client_writer = asyncio.StreamWriter(new_transport, protocol, client_reader, loop)
 

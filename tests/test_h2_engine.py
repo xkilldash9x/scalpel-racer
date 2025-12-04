@@ -56,7 +56,7 @@ class CapturedRequest:
         return self.edited_body if self.edited_body is not None else self.body
 
 class ScanResult:
-     def __init__(self, index: int, status_code: int, duration: float, body_hash: str = None, body_snippet: str = None, error: str = None):
+    def __init__(self, index: int, status_code: int, duration: float, body_hash: str = None, body_snippet: str = None, error: str = None):
         self.index = index;
         self.status_code = status_code; self.duration = duration
         self.body_hash = body_hash; self.body_snippet = body_snippet;
@@ -429,8 +429,9 @@ def test_finalize_results(engine):
     assert r1.status_code == 0
     assert r1.error == "Response timeout"
 
-@patch('threading.Thread')
-def test_run_attack_first_seq_integration(MockThread, engine, mock_dependencies):
+@patch('low_level.PacketController') # Outer patch -> First argument
+@patch('threading.Thread')           # Inner patch -> Second argument
+def test_run_attack_first_seq_integration(MockThread, MockPC, engine, mock_dependencies):
     # Initialize engine with 'first-seq' strategy
     engine.strategy = "first-seq"
 
@@ -440,11 +441,14 @@ def test_run_attack_first_seq_integration(MockThread, engine, mock_dependencies)
     # Simulate the attack finishing quickly
     engine.all_streams_finished.set()
 
+    # The MockPC argument ensures that when run_attack instantiates PacketController,
+    # it gets our mock, not the real class that requires root.
     engine.run_attack()
 
     # Verify PacketController initialization (IP comes from DNS mock)
-    MockPacketController.assert_called_with("1.2.3.4", 443, 54321)
-    mock_pc_instance = MockPacketController.return_value
+    # We verify against the Mock passed into the function (MockPC)
+    MockPC.assert_called_with("1.2.3.4", 443, 54321)
+    mock_pc_instance = MockPC.return_value
 
     # Verify PacketController lifecycle
     mock_pc_instance.start.assert_called_once()
