@@ -475,6 +475,7 @@ class HTTP2RaceEngine:
         
         return headers
 
+    # [N2/E3 FIX] Consolidated and robust receive loop
     def _receive_loop(self):
         """
         Background thread to read data from the socket and process H2 events.
@@ -498,24 +499,26 @@ class HTTP2RaceEngine:
                     # Pass the received data to the H2 state machine
                     try:
                         events = self.conn.receive_data(data)
+                        # Process the events
+                        self._process_events(events)
                     except Exception as e:
-                        # Handle H2 protocol errors
+                        # Handle H2 protocol errors (from receive_data or _process_events)
                         self._handle_connection_closed(f"HTTP/2 Protocol Error: {e}")
                         break
                         
-                    # Process the events
-                    self._process_events(events)
-                    
-                    # [E3 FIX] Move sendall inside the try block
-                    # Send any data generated (e.g., ACKs, WINDOW_UPDATEs)
-                    data_to_send = self.conn.data_to_send()
-                    if data_to_send:
-                         self.sock.sendall(data_to_send)
+                # [N2 FIX] Move sendall outside 'if ready' to prevent flow control deadlocks.
+                # [E3 FIX] Keep inside the main try block for error handling.
+                # Send any data generated (e.g., ACKs, WINDOW_UPDATEs)
+                data_to_send = self.conn.data_to_send()
+                if data_to_send:
+                        self.sock.sendall(data_to_send)
 
             # [E2 FIX] Broaden exception handling to include OSError
             except (ssl.SSLError, socket.error, OSError) as e:
-                # Handle socket level errors
-                self._handle_connection_closed(f"Connection error: {e}")
+                # Handle socket level errors (including ConnectionResetError which is an OSError)
+                # Check if the error occurred while the attack was still active before logging closure
+                if not self.all_streams_finished.is_set():
+                   self._handle_connection_closed(f"Connection error: {e}")
                 break
         
         # Ensure the event is set when the loop finishes
