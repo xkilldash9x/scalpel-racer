@@ -29,7 +29,7 @@ Scalpel Racer is an advanced race condition testing tool designed to identify an
 
 1.  Clone the repository:
     ```bash
-    git clone [https://github.com/yourusername/scalpel-racer.git](https://github.com/yourusername/scalpel-racer.git)
+    git clone https://github.com/yourusername/scalpel-racer.git
     cd scalpel-racer
     ```
 
@@ -67,10 +67,11 @@ Scalpel Racer is an advanced race condition testing tool designed to identify an
 
 ### 1. Basic Capture & Race
 
-Star                                                                                                                                                                                                                                                                                                                                                                                                                                     t the tool to capture traffic. By default, it listens on port 8080.
+Start the tool to capture traffic. By default, it listens on port 8080.
 
 ```bash
 python3 scalpel_racer.py -l 8080
+```
 
 Configure your browser or tool (e.g., Burp Suite, Postman) to use `localhost:8080` as an HTTP/HTTPS proxy.
 
@@ -103,7 +104,7 @@ To capture HTTPS traffic without browser warnings or connection errors, you must
 usage: scalpel_racer.py [-h] [-l LISTEN] [-t TARGET] [-s SCOPE] [-c CONCURRENCY]
                         [-w WARMUP] [--strategy {auto,spa,first-seq}] [--http2]
 
-Scalpel Racer v5.2 - Advanced Race Condition Tester
+Scalpel Racer - Advanced Race Condition Tester
 
 optional arguments:
   -h, --help            show this help message and exit
@@ -149,6 +150,8 @@ This is the most potent strategy. It leverages `iptables` to route specific outg
 *   **`low_level.py`**: Contains the `HTTP2RaceEngine`. This class implements the raw socket management and HTTP/2 protocol logic required for the SPA and First-Seq strategies. It operates synchronously to ensure precise timing.
 *   **`sync_http11.py`**: Provides `HTTP11SyncEngine` for synchronous, thread-based HTTP/1.1 attacks (an alternative to the asyncio-based 'auto' strategy for specific use cases).
 *   **`packet_controller.py`**: Manages the Linux-specific packet interception logic using `NetfilterQueue` and `scapy`. It handles the `iptables` rules and the packet release timing for the First-Seq strategy.
+*   **`run_h2_lab.py`**: Launcher for a vulnerable HTTP/2 lab environment (requires `hypercorn`).
+*   **`verify_certs.py`**: Utility script to verify the consistency of the generated CA key and certificate.
 
 ## Troubleshooting
 

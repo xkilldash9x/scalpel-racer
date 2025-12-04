@@ -1,7 +1,31 @@
+"""
+Script to verify the consistency of the generated CA key and certificate.
+
+This utility loads `scalpel_ca.key` and `scalpel_ca.pem` from the current
+directory and checks if the public key embedded in the certificate matches
+the private key. This is useful for troubleshooting SSL/TLS interception issues.
+
+Dependencies:
+    - cryptography
+"""
+
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 
 def check_pair():
+    """
+    Checks if the local CA private key and certificate file form a valid pair.
+
+    This function attempts to load `scalpel_ca.key` (private key) and
+    `scalpel_ca.pem` (certificate). It then compares the modulus of the public
+    keys derived from both.
+
+    Outputs results to stdout.
+
+    Raises:
+        FileNotFoundError: If the key or cert files are missing (handled by print).
+        ValueError: If key/cert format is invalid (handled by print).
+    """
     print("[*] Loading scalpel_ca.key...")
     try:
         with open("scalpel_ca.key", "rb") as f:
