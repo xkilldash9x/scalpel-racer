@@ -243,11 +243,10 @@ class HTTP2RaceEngine:
                     pass
 
         # 4. Initialize H2 Connection State Machine
-        # [CRITICAL FIX] relaxed validation and raw byte handling
         config = H2Configuration(
             client_side=True, 
             header_encoding=None, 
-            validate_inbound_headers=False
+            validate_inbound_headers=True # RFC 9113 Compliance
         )
         self.conn = H2Connection(config=config)
         self.conn.initiate_connection()
@@ -509,9 +508,21 @@ class HTTP2RaceEngine:
         for k, v in self.request.headers.items():
             k_lower = k.lower()
             header_keys.add(k_lower)
+
+            # RFC 9113: Field names of zero length are malformed
+            if not k_lower:
+                continue
+            # RFC 9113: Prohibit CR, LF, NUL in values
+            if any(c in v for c in ('\r', '\n', '\0')):
+                continue
+
             # [CRITICAL FIX] Strictly filter Hop-by-Hop headers preventing ProtocolErrors
             if k_lower in HOP_BY_HOP_HEADERS:
+                # Exception: 'TE: trailers' is allowed in H2
+                if k_lower == 'te' and v.lower() == 'trailers':
+                    headers.append((k_lower, v))
                 continue
+
             headers.append((k_lower, v))
 
         # Ensure Content-Type if missing

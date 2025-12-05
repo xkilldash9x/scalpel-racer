@@ -125,20 +125,14 @@ class CAManager:
 
     def generate_ca(self):
         print(f"[*] Generating new Root CA. Install '{CA_CERT_FILE}' in your browser/OS trust store to intercept HTTPS.")
-        self.ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        self.ca_key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
 
         subject = issuer = x509.Name([
             x509.NameAttribute(NameOID.COMMON_NAME, u"Scalpel Racer Debugging CA"),
             x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"Scalpel Racer"),
         ])
         
-        try:
-            if hasattr(datetime, 'timezone') and hasattr(datetime.datetime, 'now'):
-                now = datetime.datetime.now(datetime.timezone.utc)
-            else:
-                now = datetime.datetime.utcnow()
-        except TypeError:
-            now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.timezone.utc)
 
         self.ca_cert = (
             x509.CertificateBuilder()
@@ -183,36 +177,28 @@ class CAManager:
         cert_pem = cert.public_bytes(Encoding.PEM)
         key_pem = key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption())
 
-        cert_file = None
-        key_file = None
+        import shutil
+        temp_dir = tempfile.mkdtemp()
         
         try:
-            cert_file = tempfile.NamedTemporaryFile(suffix=".pem", delete=False)
-            key_file = tempfile.NamedTemporaryFile(suffix=".key", delete=False)
+            cert_path = os.path.join(temp_dir, "cert.pem")
+            key_path = os.path.join(temp_dir, "key.key")
 
-            cert_file.write(cert_pem)
-            cert_file.close()
+            with open(cert_path, "wb") as f:
+                f.write(cert_pem)
+            with open(key_path, "wb") as f:
+                f.write(key_pem)
 
-            key_file.write(key_pem)
-            key_file.close()
-
-            context.load_cert_chain(certfile=cert_file.name, keyfile=key_file.name)
+            context.load_cert_chain(certfile=cert_path, keyfile=key_path)
             
             self.cert_cache[hostname] = context
             return context
         
         finally:
-            if cert_file:
-                if not cert_file.closed: cert_file.close()
-                try: os.remove(cert_file.name)
-                except OSError: pass
-            if key_file:
-                if not key_file.closed: key_file.close()
-                try: os.remove(key_file.name)
-                except OSError: pass
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def generate_host_cert(self, hostname: str):
-        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
         if isinstance(hostname, bytes):
             hostname = hostname.decode('utf-8', errors='ignore')
         try:
@@ -221,13 +207,7 @@ class CAManager:
         except ValueError:
             san = x509.SubjectAlternativeName([x509.DNSName(hostname)])
  
-        try:
-            if hasattr(datetime, 'timezone') and hasattr(datetime.datetime, 'now'):
-                now = datetime.datetime.now(datetime.timezone.utc)
-            else:
-                now = datetime.datetime.utcnow()
-        except TypeError:
-             now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.timezone.utc)
 
         cert = (
             x509.CertificateBuilder()
@@ -247,8 +227,9 @@ class CaptureServer:
     """
     An asyncio-based proxy server for capturing HTTP and HTTPS traffic.
     """
-    def __init__(self, port: int, target_override: str = None, scope_regex: str = None, enable_tunneling: bool = True):
+    def __init__(self, port: int, target_override: str = None, scope_regex: str = None, enable_tunneling: bool = True, bind_address: str = "127.0.0.1"):
         self.port = port
+        self.bind_address = bind_address
         self.target_override = target_override
         if self.target_override and not self.target_override.endswith('/'):
             self.target_override += '/'
@@ -333,9 +314,9 @@ class CaptureServer:
                 globals()['CA_MANAGER'] = None
 
         try:
-            self.server = await asyncio.start_server(self.handle_client, '0.0.0.0', self.port, backlog=128)
+            self.server = await asyncio.start_server(self.handle_client, self.bind_address, self.port, backlog=128)
         except OSError as e:
-            print(f"[!] Error: Could not bind to port {self.port}. {e}")
+            print(f"[!] Error: Could not bind to {self.bind_address}:{self.port}. {e}")
             if __name__ == "__main__":
                 sys.exit(1)
             self.stop_event.set()
@@ -343,7 +324,7 @@ class CaptureServer:
 
         self.ready_event.set()
 
-        print(f"[*] Proxy listening on 0.0.0.0:{self.port} (Console I/O Optimized)")
+        print(f"[*] Proxy listening on {self.bind_address}:{self.port} (Console I/O Optimized)")
         if self.target_override:
             print(f"[*] Target Override Base: {self.target_override}")
     
@@ -465,26 +446,50 @@ class CaptureServer:
                     return True
                 protocol.eof_received = types.MethodType(patched_eof_received, protocol)
             
-            # [FIX: CRITICAL B01] Capture the NEW transport returned by start_tls
-            try:
-                new_transport = await asyncio.wait_for(
-                    loop.start_tls(transport, protocol, ssl_context, server_side=True),
-                    timeout=TLS_HANDSHAKE_TIMEOUT
-                )
-            except RuntimeError as e:
-                # Catch "cannot reuse already awaited coroutine" or similar errors during TLS upgrade
-                print(f"[!] Critical Runtime Error during TLS handshake (start_tls): {e}")
-                return
-            except Exception as e:
-                print(f"[!] TLS handshake failed: {e}")
-                return
-            
-            # Refresh reader from protocol if available
-            if hasattr(protocol, '_stream_reader') and protocol._stream_reader:
-                client_reader = protocol._stream_reader
+            # [FIX: CRITICAL B01] Use StreamWriter.start_tls if available (Python 3.11+)
+            if hasattr(client_writer, 'start_tls'):
+                try:
+                    # Note: StreamWriter.start_tls signature does not include server_side in 3.11+
+                    # It relies on the ssl_context being configured for server side.
+                    await asyncio.wait_for(
+                        client_writer.start_tls(ssl_context),
+                        timeout=TLS_HANDSHAKE_TIMEOUT
+                    )
+                except TypeError:
+                     # Fallback if signature differs in some versions or mocked environments
+                     try:
+                        await asyncio.wait_for(
+                            client_writer.start_tls(ssl_context, server_side=True),
+                            timeout=TLS_HANDSHAKE_TIMEOUT
+                        )
+                     except Exception as ex:
+                         print(f"[!] TLS handshake failed (StreamWriter.start_tls fallback): {ex}")
+                         return
+                except Exception as e:
+                    print(f"[!] TLS handshake failed (StreamWriter.start_tls): {e}")
+                    return
+            else:
+                # Legacy fallback
+                # [FIX: CRITICAL B01] Capture the NEW transport returned by start_tls
+                try:
+                    new_transport = await asyncio.wait_for(
+                        loop.start_tls(transport, protocol, ssl_context, server_side=True),
+                        timeout=TLS_HANDSHAKE_TIMEOUT
+                    )
+                except RuntimeError as e:
+                    # Catch "cannot reuse already awaited coroutine" or similar errors during TLS upgrade
+                    print(f"[!] Critical Runtime Error during TLS handshake (start_tls): {e}")
+                    return
+                except Exception as e:
+                    print(f"[!] TLS handshake failed: {e}")
+                    return
 
-            # [FIX: CRITICAL B01] Create a NEW writer using the new SSL transport.
-            client_writer = asyncio.StreamWriter(new_transport, protocol, client_reader, loop)
+                # Refresh reader from protocol if available
+                if hasattr(protocol, '_stream_reader') and protocol._stream_reader:
+                    client_reader = protocol._stream_reader
+
+                # [FIX: CRITICAL B01] Create a NEW writer using the new SSL transport.
+                client_writer = asyncio.StreamWriter(new_transport, protocol, client_reader, loop)
 
             # -- ALPN DETECTION AND PROTOCOL SWITCHING --
             
@@ -1103,6 +1108,7 @@ def main():
                                      formatter_class=argparse.RawTextHelpFormatter)
 
     parser.add_argument("-l", "--listen", type=int, default=8080, help="Listening port (default: 8080)")
+    parser.add_argument("--bind", type=str, default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
     parser.add_argument("-t", "--target", type=str, help="Target Base URL for override (e.g. https://api.example.com/v1).")
     parser.add_argument("-s", "--scope", type=str, help="Regex scope filter.")
 
@@ -1132,7 +1138,7 @@ def main():
              print("[!] Warning: 'first-seq' strategy requires NetfilterQueue/Scapy. Ensure they are installed.")
 
 
-    capture_server = CaptureServer(args.listen, args.target, args.scope, enable_tunneling=True)
+    capture_server = CaptureServer(args.listen, args.target, args.scope, enable_tunneling=True, bind_address=args.bind)
 
     try:
         asyncio.run(capture_server.start())

@@ -70,6 +70,24 @@ async def test_b01_handle_connect_stream_rebinding(monkeypatch):
     # [DEADLOCK FIX] Mock wait_closed on the initial writer to prevent hanging on the mock transport
     initial_writer.wait_closed = AsyncMock()
     
+    # [FIX] Force legacy path to verify B01 rebinding logic explicitly
+    # We wrap the writer to hide start_tls, ensuring the legacy code path is exercised
+    class LegacyWriterProxy:
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+        def __getattr__(self, name):
+            if name == 'start_tls':
+                raise AttributeError
+            return getattr(self._wrapped, name)
+        @property
+        def _protocol(self):
+            return self._wrapped._protocol
+        @property
+        def transport(self):
+            return self._wrapped.transport
+
+    initial_writer_proxy = LegacyWriterProxy(initial_writer)
+
     initial_reader_arg = managed_reader
 
     # [FIX] Pre-fill the reader with all data to avoid timing issues in mock_wait_for
@@ -100,7 +118,7 @@ async def test_b01_handle_connect_stream_rebinding(monkeypatch):
         # Ensure get_extra_info returns correct protocol for ALPN detection if needed
         mock_internal_writer.get_extra_info.return_value = MagicMock(selected_alpn_protocol=lambda: None)
 
-        await server.handle_connect(initial_reader_arg, initial_writer, connect_target)
+        await server.handle_connect(initial_reader_arg, initial_writer_proxy, connect_target)
 
     # Assertions
     assert len(server.request_log) == 2, f"Request Log empty. Capture Count: {server.capture_count}"
