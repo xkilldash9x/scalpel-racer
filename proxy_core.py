@@ -258,7 +258,10 @@ class NativeProxyHandler:
             if hasattr(asyncio, 'TaskGroup'):
                 async with asyncio.TaskGroup() as tg:
                     for t in loop_tasks:
-                        self.tasks.append(tg.create_task(t))
+                        # [FIX] Do NOT append to self.tasks when using TaskGroup.
+                        # TaskGroup manages the lifecycle automatically, and appending here
+                        # causes race conditions in cleanup() where we try to cancel already-managed tasks.
+                        tg.create_task(t)
             else:
                 # Fallback for Python < 3.11
                 self.tasks = [asyncio.create_task(t) for t in loop_tasks]

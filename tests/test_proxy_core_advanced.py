@@ -67,6 +67,9 @@ def advanced_handler():
         
         handler.upstream_conn.remote_flow_control_window.return_value = 65535
 
+        # [FIX] Ensure stream_is_closed returns False by default to prevent Liveness Checks from failing tests
+        handler.upstream_conn.stream_is_closed.return_value = False
+
         handler.upstream_writer = MagicMock()
         handler.upstream_writer.drain = AsyncMock()
         handler.upstream_writer.is_closing.return_value = False
