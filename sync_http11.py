@@ -1,3 +1,4 @@
+# sync_http11.py
 # FILE: ./sync_http11.py
 """
 Implements the Synchronous HTTP/1.1 Staged Attack engine.
@@ -24,70 +25,21 @@ import io
 class ScanResult:
     """
     Represents the result of a single race attempt (one probe).
-
-    This class encapsulates all relevant metrics and data obtained from sending
-    a single request as part of a race condition attack.
-
-    Attributes:
-        index (int): The sequence index of the request.
-        status_code (int): The HTTP status code received.
-        duration (float): The round-trip time of the request in seconds.
-        body_hash (str, optional): A hash of the response body.
-        body_snippet (str, optional): A snippet of the response body.
-        error (str, optional): Error message if the request failed.
     """
     def __init__(self, index: int, status_code: int, duration: float, body_hash: str = None, body_snippet: str = None, error: str = None):
-        """
-        Initializes a new instance of ScanResult.
-
-        Args:
-            index (int): Request index.
-            status_code (int): HTTP status code.
-            duration (float): Request duration.
-            body_hash (str, optional): SHA-256 hash of the body.
-            body_snippet (str, optional): First 100 chars of body.
-            error (str, optional): Error message.
-        """
         self.index = index; self.status_code = status_code; self.duration = duration
         self.body_hash = body_hash; self.body_snippet = body_snippet; self.error = error
 
 class CapturedRequest:
     """
     Represents a captured HTTP request.
-
-    This is a simplified local definition to support standalone usage or testing
-    without the full `structures` module dependency if necessary.
-
-    Attributes:
-        id (int): The request ID.
-        method (str): HTTP method.
-        url (str): Target URL.
-        headers (dict): HTTP headers.
-        body (bytes): Request body.
-        edited_body (bytes, optional): Modified body for attacks.
     """
     # Add attributes expected by the engine
     def __init__(self, id=0, method="GET", url="", headers=None, body=b""):
-        """
-        Initializes a new instance of CapturedRequest.
-
-        Args:
-            id (int): Request ID.
-            method (str): HTTP Method.
-            url (str): Target URL.
-            headers (dict): Headers dictionary.
-            body (bytes): Request body.
-        """
         self.id = id; self.method = method; self.url = url
         self.headers = headers or {}; self.body = body; self.edited_body = None
 
     def get_attack_payload(self) -> bytes:
-        """
-        Retrieves the payload to be used for the attack.
-
-        Returns:
-            bytes: The edited body if present, otherwise the original body.
-        """
         return self.edited_body if self.edited_body is not None else self.body
 
 MAX_RESPONSE_BODY_READ = 1024 * 1024
@@ -100,35 +52,19 @@ except ImportError:
     # This is expected if running independently or during tests
     pass
 
+# Configuration Constants
+CONNECTION_TIMEOUT = 10.0
+RESPONSE_TIMEOUT = 10.0
+BARRIER_TIMEOUT = 15.0 # Timeout for synchronization barrier
+
 class HTTP11SyncEngine:
     """
     Implements high-precision Synchronous Staged Attacks over HTTP/1.1 using threads and barriers.
-
-    This engine is designed to send multiple requests concurrently with precise timing.
-    It splits the request payload at `{{SYNC}}` markers. Threads send the initial
-    part of the request and then wait at a `threading.Barrier` before sending the
-    final stage simultaneously.
-
-    Attributes:
-        request (CapturedRequest): The request template to be raced.
-        concurrency (int): The number of concurrent requests to send.
-        target_host (str): The target hostname.
-        target_port (int): The target port.
-        scheme (str): The URL scheme ('http' or 'https').
-        target_ip (str): The resolved IP address of the target.
-        stages (List[bytes]): The request payload split by synchronization markers.
-        total_payload_len (int): The total length of the payload (excluding markers).
-        barrier (threading.Barrier): Synchronization primitive for coordinating threads.
-        results (List[Optional[ScanResult]]): Storage for the results of each request thread.
     """
 
     def __init__(self, request: CapturedRequest, concurrency: int):
         """
         Initializes the HTTP11SyncEngine.
-
-        Args:
-            request (CapturedRequest): The request to be replayed.
-            concurrency (int): The number of concurrent threads/requests.
         """
         self.request = request
         self.concurrency = concurrency
@@ -153,9 +89,6 @@ class HTTP11SyncEngine:
     def _parse_target(self):
         """
         Parses the target URL to extract host, port, and scheme.
-
-        Raises:
-            ValueError: If the URL scheme is not 'http' or 'https'.
         """
         parsed_url = urlparse(self.request.url)
         self.target_host = parsed_url.hostname
@@ -171,11 +104,6 @@ class HTTP11SyncEngine:
     def _prepare_payload(self):
         """
         Prepares the payload stages and initializes the synchronization barrier.
-
-        Splits the request body by the `{{SYNC}}` marker.
-
-        Raises:
-            ValueError: If the payload does not contain at least one sync marker.
         """
         payload = self.request.get_attack_payload()
         # The actual length sent over the wire excludes the markers
@@ -191,12 +119,6 @@ class HTTP11SyncEngine:
     def run_attack(self) -> List[ScanResult]:
         """
         Executes the synchronized attack.
-
-        Resolves the target IP, launches the attack threads, waits for them to complete,
-        and returns the results.
-
-        Returns:
-            List[ScanResult]: A list of results, one for each concurrent request.
         """
         print(f"[*] Connecting to {self.target_host}:{self.target_port}...")
         
@@ -219,32 +141,28 @@ class HTTP11SyncEngine:
         # 3. Wait for completion
         for t in threads:
             # Use a timeout for joining threads to prevent infinite hangs
-            t.join(timeout=15)
+            t.join(timeout=RESPONSE_TIMEOUT + BARRIER_TIMEOUT + 5)
 
-        # 4. Finalize results (handled by the main thread in run_scan dispatcher)
+        # 4. Finalize results
+        # Ensure None results are converted to errors if applicable
+        for i in range(self.concurrency):
+             if self.results[i] is None:
+                  self.results[i] = ScanResult(i, 0, 0.0, error="Thread execution timeout or hang.")
+
         return self.results
 
     def _connect(self) -> socket.socket:
         """
         Establishes a persistent TCP (and optionally SSL) connection.
-
-        This method connects to the target IP and handles SSL wrapping if required.
-        It also sets `TCP_NODELAY` to disable Nagle's algorithm for lower latency.
-
-        Returns:
-            socket.socket: The connected socket object.
-
-        Raises:
-            ConnectionError: If connection or SSL handshake fails.
         """
         try:
             # Connect using the resolved IP
-            sock = socket.create_connection((self.target_ip, self.target_port), timeout=10)
-        # [E1 FIX] Catch socket.error (which includes OSError on some platforms) and re-raise as ConnectionError
+            sock = socket.create_connection((self.target_ip, self.target_port), timeout=CONNECTION_TIMEOUT)
+        # [E1 FIX] Catch socket.error and re-raise as ConnectionError
         except socket.error as e:
-            raise ConnectionError(f"Connection failed: {e}")
+            raise ConnectionError(f"Connection failed: {type(e).__name__}: {e}")
 
-        # Optimization: Disable Nagle's algorithm (TCP_NODELAY) for immediate sending
+        # Optimization: Disable Nagle's algorithm (TCP_NODELAY)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         
         if self.scheme == 'https':
@@ -253,7 +171,7 @@ class HTTP11SyncEngine:
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
             
-            # Force HTTP/1.1 via ALPN if supported, preventing H2 negotiation
+            # Force HTTP/1.1 via ALPN if supported
             try:
                 context.set_alpn_protocols(["http/1.1"])
             except NotImplementedError:
@@ -272,12 +190,6 @@ class HTTP11SyncEngine:
     def _serialize_headers(self) -> bytes:
         """
         Serializes HTTP/1.1 headers for the request.
-
-        Constructs the raw HTTP request headers, ensuring necessary headers like
-        `Host`, `Content-Length`, and `Connection: keep-alive` are present and correct.
-
-        Returns:
-            bytes: The raw, encoded HTTP headers ending with double CRLF.
         """
         parsed_url = urlparse(self.request.url)
         path = parsed_url.path or '/'
@@ -315,7 +227,7 @@ class HTTP11SyncEngine:
         
         # Add default User-Agent if not present
         if 'user-agent' not in header_keys_lower:
-            headers["User-Agent"] = "Scalpel-CLI/5.3-SyncHTTP11"
+            headers["User-Agent"] = "Scalpel-CLI/5.4-SyncHTTP11"
 
         # Ensure Connection: keep-alive for persistence
         headers["Connection"] = "keep-alive"
@@ -329,14 +241,7 @@ class HTTP11SyncEngine:
 
     def _attack_thread(self, index: int):
         """
-        The main logic for a single synchronized attack thread.
-
-        Connects to the server, sends headers and initial stages, waits at the
-        barrier, and then sends the final stage. It reads the response and stores
-        the result in the `results` list.
-
-        Args:
-            index (int): The index of this thread/request (0 to concurrency-1).
+        The main logic for a single synchronized attack thread. Implements fail-fast mechanism.
         """
         sock = None
         response = None
@@ -360,22 +265,21 @@ class HTTP11SyncEngine:
             for stage_index in range(1, len(self.stages)):
                 # Wait for all threads to reach this point
                 try:
-                    # Use a timeout on the barrier to prevent infinite hangs
-                    self.barrier.wait(timeout=10)
-                # [E1 FIX] Handle the case where another thread aborted the barrier
+                    # Use a timeout on the barrier
+                    self.barrier.wait(timeout=BARRIER_TIMEOUT)
+                # [E1/B14 FIX] Handle the case where another thread aborted the barrier
                 except threading.BrokenBarrierError:
-                    # Raise an exception to be caught by the outer handler
-                    raise ConnectionError("Synchronization barrier broken.")
+                    # Raise an exception to be caught by the outer handler.
+                    raise ConnectionError("Synchronization barrier broken (fail-fast).")
                 
                 # Send immediately
                 sock.sendall(self.stages[stage_index])
             
             # 5. Receive response
             # Set timeout for response reading
-            sock.settimeout(10.0)
+            sock.settimeout(RESPONSE_TIMEOUT)
 
-            # Use http.client.HTTPResponse to parse the incoming data from the socket.
-            # This handles both Content-Length and Chunked Transfer-Encoding robustly.
+            # Use http.client.HTTPResponse to parse the incoming data robustly.
             response = HTTPResponse(sock, method=self.request.method)
             response.begin() # Parses status line and headers
 
@@ -394,30 +298,26 @@ class HTTP11SyncEngine:
             body_snippet = None
             if body:
                 body_hash = hashlib.sha256(body).hexdigest()
-                try:
-                    body_snippet = body[:100].decode('utf-8', errors='ignore').replace('\n', ' ').replace('\r', '')
-                except Exception:
-                    body_snippet = repr(body[:100])
+                # [B05 FIX] Removed unnecessary try/except block. 'ignore' strategy is robust.
+                body_snippet = body[:100].decode('utf-8', errors='ignore').replace('\n', ' ').replace('\r', '')
 
             self.results[index] = ScanResult(index, status_code, duration, body_hash, body_snippet)
 
-        # [E1 FIX] Catch ConnectionError (raised by _connect or BrokenBarrierError) and generic Exceptions
+        # [E1 FIX] Catch ConnectionError and generic Exceptions
         except Exception as e:
             # Capture errors during connection, sending, or receiving
             duration = (time.perf_counter() - start_time) * 1000 if start_time > 0 else 0.0
             error_msg = f"{type(e).__name__}: {e}"
             
-            # [E1 FIX] Only update result if not already set (prevents overriding success if error happens late)
+            # [E1 FIX] Only update result if not already set
             if self.results[index] is None:
                 self.results[index] = ScanResult(index, 0, duration, error=error_msg)
 
         finally:
-            # [E1 FIX] Fail-fast mechanism: Ensure the barrier is aborted if an error occurred in this thread
-            # We check if the barrier exists and is still intact before attempting to abort.
+            # [E1/B14 FIX] Fail-fast mechanism: Ensure the barrier is aborted if an error occurred in this thread
             try:
-                # We rely on the fact that if any thread hits an exception, it should trigger the abort
-                # for others, even if the exception handling above already recorded the error.
-                if self.barrier and not self.barrier.broken:
+                # If this thread recorded an error and the barrier is still intact, abort it for others.
+                if self.results[index] and self.results[index].error and self.barrier and not self.barrier.broken:
                      self.barrier.abort()
             except Exception:
                  pass
