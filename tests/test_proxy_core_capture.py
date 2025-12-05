@@ -26,15 +26,18 @@ def capture_handler():
 def test_finalize_capture_standard(capture_handler):
     # Setup context with request data
     ctx = StreamContext(1, "https")
-    ctx.request_pseudo = {
-        ':method': 'POST', 
-        ':path': '/api/login', 
-        ':authority': 'original.com'
+    # [FIX] Use captured_headers structure
+    ctx.captured_headers = {
+        "pseudo": {
+            ':method': 'POST', 
+            ':path': '/api/login', 
+            ':authority': 'original.com'
+        },
+        "headers": {
+            'content-type': 'application/json',
+            'user-agent': 'test-agent'
+        }
     }
-    ctx.request_headers_list = [
-        ('content-type', 'application/json'),
-        ('user-agent', 'test-agent')
-    ]
     ctx.request_body = b'{"user": "admin"}'
     ctx.downstream_closed = True # Required to finalize
 
@@ -54,10 +57,13 @@ def test_finalize_capture_with_override(capture_handler):
     capture_handler.target_override = "http://localhost:8080/v1/"
     
     ctx = StreamContext(1, "https")
-    ctx.request_pseudo = {
-        ':method': 'GET', 
-        ':path': '/users?id=1', 
-        ':authority': 'original.com'
+    ctx.captured_headers = {
+        "pseudo": {
+            ':method': 'GET', 
+            ':path': '/users?id=1', 
+            ':authority': 'original.com'
+        },
+        "headers": {}
     }
     
     capture_handler.finalize_capture(ctx)
@@ -72,14 +78,20 @@ def test_finalize_capture_scope_filtering(capture_handler):
     
     # 1. Blocked Request
     ctx_blocked = StreamContext(1, "https")
-    ctx_blocked.request_pseudo = {':method': 'GET', ':path': '/', ':authority': 'blocked.com'}
+    ctx_blocked.captured_headers = {
+        "pseudo": {':method': 'GET', ':path': '/', ':authority': 'blocked.com'},
+        "headers": {}
+    }
     
     capture_handler.finalize_capture(ctx_blocked)
     capture_handler.capture_callback.assert_not_called()
     
     # 2. Allowed Request
     ctx_allowed = StreamContext(3, "https")
-    ctx_allowed.request_pseudo = {':method': 'GET', ':path': '/', ':authority': 'allowed.com'}
+    ctx_allowed.captured_headers = {
+        "pseudo": {':method': 'GET', ':path': '/', ':authority': 'allowed.com'},
+        "headers": {}
+    }
     
     capture_handler.finalize_capture(ctx_allowed)
     capture_handler.capture_callback.assert_called_once()
@@ -87,12 +99,14 @@ def test_finalize_capture_scope_filtering(capture_handler):
 def test_finalize_capture_header_filtering(capture_handler):
     # HOP_BY_HOP headers should be removed
     ctx = StreamContext(1, "https")
-    ctx.request_pseudo = {':method': 'GET', ':path': '/', ':authority': 'test.com'}
-    ctx.request_headers_list = [
-        ('connection', 'keep-alive'), # Should be removed
-        ('upgrade', 'h2c'),           # Should be removed
-        ('x-custom', 'keep-me')       # Should be kept
-    ]
+    ctx.captured_headers = {
+        "pseudo": {':method': 'GET', ':path': '/', ':authority': 'test.com'},
+        "headers": {
+            'connection': 'keep-alive', # Should be removed
+            'upgrade': 'h2c',           # Should be removed
+            'x-custom': 'keep-me'       # Should be kept
+        }
+    }
     
     capture_handler.finalize_capture(ctx)
     
@@ -103,9 +117,14 @@ def test_finalize_capture_header_filtering(capture_handler):
 
 def test_finalize_capture_fallback_authority(capture_handler):
     # Test fallback to Host header if :authority is missing
+    # [FIX] Clear explicit_host so it doesn't take precedence over the 'host' header in the fallback logic.
+    capture_handler.explicit_host = None
+    
     ctx = StreamContext(1, "https")
-    ctx.request_pseudo = {':method': 'GET', ':path': '/'} # No :authority
-    ctx.request_headers_list = [('host', 'fallback.com')]
+    ctx.captured_headers = {
+        "pseudo": {':method': 'GET', ':path': '/'}, # No :authority
+        "headers": {'host': 'fallback.com'}
+    }
     
     capture_handler.finalize_capture(ctx)
     
@@ -117,8 +136,10 @@ def test_finalize_capture_fallback_explicit_host(capture_handler):
     capture_handler.explicit_host = "connect-target.com"
     
     ctx = StreamContext(1, "https")
-    ctx.request_pseudo = {':method': 'GET', ':path': '/'} 
-    ctx.request_headers_list = [] # No Host header
+    ctx.captured_headers = {
+        "pseudo": {':method': 'GET', ':path': '/'}, 
+        "headers": {} # No Host header
+    }
     
     capture_handler.finalize_capture(ctx)
     

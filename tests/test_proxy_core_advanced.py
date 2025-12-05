@@ -1,3 +1,4 @@
+# tests/test_proxy_core_advanced.py
 import pytest
 import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch, call
@@ -54,11 +55,18 @@ def advanced_handler():
         handler.downstream_conn.data_to_send.return_value = b""
         # Default large windows to prevent accidental blocking in non-flow tests
         handler.downstream_conn.local_flow_control_window.return_value = 65535
+        # [FIX] Set outbound window as INT, not MagicMock, to support min() comparison
+        handler.downstream_conn.outbound_flow_control_window = 65535
         
         # Setup Upstream Mock
         handler.upstream_conn = MagicMock()
         handler.upstream_conn.data_to_send.return_value = b""
         handler.upstream_conn.local_flow_control_window.return_value = 65535
+        # [FIX] Set outbound window as INT, not MagicMock, to support min() comparison
+        handler.upstream_conn.outbound_flow_control_window = 65535
+        
+        handler.upstream_conn.remote_flow_control_window.return_value = 65535
+
         handler.upstream_writer = MagicMock()
         handler.upstream_writer.drain = AsyncMock()
         handler.upstream_writer.is_closing.return_value = False
@@ -79,7 +87,8 @@ async def test_forward_data_insufficient_window_then_update(advanced_handler):
     advanced_handler.streams[stream_id] = ctx
     
     # Mock destination (Upstream) to report 0 window
-    advanced_handler.upstream_conn.local_flow_control_window.side_effect = lambda sid: 0
+    # Note: remote_flow_control_window is a method
+    advanced_handler.upstream_conn.remote_flow_control_window.side_effect = lambda sid: 0
     
     # Event data (payload > window)
     event = MagicMock()
@@ -90,7 +99,7 @@ async def test_forward_data_insufficient_window_then_update(advanced_handler):
 
     # 2. Action: Call forward_data (should block)
     # We run this in a task so we can simulate the update concurrently
-    task = asyncio.create_task(advanced_handler.forward_data(advanced_handler.upstream_conn, event))
+    task = asyncio.create_task(advanced_handler.forward_data(advanced_handler.upstream_conn, stream_id, event.data, event.flow_controlled_length, event.stream_ended))
     
     # Allow task to hit the wait point
     await asyncio.sleep(0.01)
@@ -107,10 +116,11 @@ async def test_forward_data_insufficient_window_then_update(advanced_handler):
 
     # 3. Simulate WINDOW_UPDATE on Stream 1
     # Open the window in the mock
-    advanced_handler.upstream_conn.local_flow_control_window.side_effect = lambda sid: 100
+    advanced_handler.upstream_conn.remote_flow_control_window.side_effect = lambda sid: 100
     
     update_event = MagicMock()
     update_event.stream_id = stream_id
+    
     await advanced_handler.handle_window_updated(update_event)
 
     # 4. Result: Task should complete and send data
@@ -131,15 +141,21 @@ async def test_forward_data_global_window_update(advanced_handler):
     advanced_handler.streams[stream_id] = ctx
     
     # Block via Connection Window (Stream window might be fine, but Connection is 0)
-    advanced_handler.upstream_conn.local_flow_control_window.side_effect = \
-        lambda sid: 0 if sid == 0 else 100
+    # Note: outbound_flow_control_window is a property. We mock the check inside forward_data
+    # by modifying the attribute directly or relying on how forward_data accesses it.
+    # In forward_data: conn_window = destination_conn.outbound_flow_control_window
+    
+    # To simulate blocking via connection window, we set the property to 0
+    advanced_handler.upstream_conn.outbound_flow_control_window = 0
+    advanced_handler.upstream_conn.remote_flow_control_window.return_value = 100
 
     event = MagicMock()
     event.stream_id = stream_id
     event.data = b"123"
     event.flow_controlled_length = 3
+    event.stream_ended = False
     
-    task = asyncio.create_task(advanced_handler.forward_data(advanced_handler.upstream_conn, event))
+    task = asyncio.create_task(advanced_handler.forward_data(advanced_handler.upstream_conn, stream_id, event.data, event.flow_controlled_length, event.stream_ended))
     
     await asyncio.sleep(0.01)
     
@@ -149,7 +165,8 @@ async def test_forward_data_global_window_update(advanced_handler):
     assert not task.done()
 
     # Unblock via Stream 0 Update
-    advanced_handler.upstream_conn.local_flow_control_window.side_effect = lambda sid: 100
+    # Set the property back to 100
+    advanced_handler.upstream_conn.outbound_flow_control_window = 100
     
     update_event = MagicMock()
     update_event.stream_id = 0 # Global
@@ -169,17 +186,18 @@ async def test_forward_data_timeout(advanced_handler):
     advanced_handler.streams[stream_id] = ctx
     
     # Permanently blocked
-    advanced_handler.upstream_conn.local_flow_control_window.return_value = 0
+    advanced_handler.upstream_conn.remote_flow_control_window.return_value = 0
     
     event = MagicMock()
     event.stream_id = stream_id
     event.data = b"payload"
     event.flow_controlled_length = 7
+    event.stream_ended = False
     
     # Reduce timeout for test speed
     with patch("proxy_core.FLOW_CONTROL_TIMEOUT", 0.1):
         # We expect terminate() to be called, which sets self.closed
-        await advanced_handler.forward_data(advanced_handler.upstream_conn, event)
+        await advanced_handler.forward_data(advanced_handler.upstream_conn, stream_id, event.data, event.flow_controlled_length, event.stream_ended)
 
     assert advanced_handler.closed.is_set()
     # Verify connection close called with FLOW_CONTROL_ERROR
@@ -198,6 +216,9 @@ async def test_handle_stream_reset_forwarding(advanced_handler):
     event = MagicMock()
     event.stream_id = 3
     event.error_code = ErrorCodes.CANCEL
+    
+    # [FIX] Ensure upstream connection reports stream as NOT closed, allowing reset to be sent
+    advanced_handler.upstream_conn.stream_is_closed.return_value = False
     
     # Receive RST on Downstream -> Forward to Upstream
     await advanced_handler.handle_stream_reset(advanced_handler.downstream_conn, event)

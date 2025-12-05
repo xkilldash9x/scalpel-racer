@@ -23,7 +23,7 @@ def setup_linux_environment():
         import importlib
         
         if 'packet_controller' in sys.modules:
-            if not isinstance(sys.modules['packet_controller'], type(sys)):
+             if not isinstance(sys.modules['packet_controller'], type(sys)):
                  del sys.modules['packet_controller']
         
         import packet_controller
@@ -78,33 +78,42 @@ def create_mock_packet(deps, seq, payload_len):
     return mock_pkt
 
 def test_init_unavailable():
-    with patch("sys.platform", "darwin"):
-        import importlib
-        
-        if 'packet_controller' in sys.modules:
-             if not isinstance(sys.modules['packet_controller'], type(sys)):
-                 del sys.modules['packet_controller']
+    # [FIX] Force unload of packet_controller to ensure clean import
+    if 'packet_controller' in sys.modules:
+        del sys.modules['packet_controller']
+    
+    # [FIX] Simulate an environment where 'unittest' is NOT present to bypass the test-guard
+    # and force the real ImportError logic to trigger.
+    with patch.dict(sys.modules):
+        if 'unittest' in sys.modules:
+            del sys.modules['unittest']
 
-        import packet_controller as pc_darwin
-        importlib.reload(pc_darwin)
-   
-        assert pc_darwin.NFQUEUE_AVAILABLE is False
-        with pytest.raises(ImportError, match="NetfilterQueue is not available"):
-            pc_darwin.PacketController("1.2.3.4", 443, 12345)
+        with patch("sys.platform", "darwin"):
+            import packet_controller as pc_darwin
+            import importlib
+            importlib.reload(pc_darwin)
+    
+            assert pc_darwin.NFQUEUE_AVAILABLE is False
+            
+            with pytest.raises(ImportError, match="NetfilterQueue is not available"):
+                pc_darwin.PacketController("1.2.3.4", 443, 12345)
+            
+    # Clean up so subsequent tests reload correctly
+    if 'packet_controller' in sys.modules:
+        del sys.modules['packet_controller']
 
 def test_start_stop_lifecycle(controller, mock_dependencies):
     with patch("threading.Thread.start") as mock_thread_start, \
          patch("threading.Thread.join") as mock_thread_join, \
          patch("threading.Thread.is_alive", return_value=True):
         
-        # [FIXED] Updated side effects to allow stop() to call -D
         # Start: -C (fails), -A (succeeds)
-        # Stop: -C (SUCCEEDS, so rule exists), -D (succeeds)
+        # Stop: -C (SUCCEEDS), -D (succeeds)
         mock_dependencies["check_call"].side_effect = [
             subprocess.CalledProcessError(1, "iptables -C"), 
             None, 
-            None, # Stop -C check succeeds
-            None  # Stop -D succeeds
+            None, 
+            None 
         ]
 
         controller.start()
@@ -124,17 +133,16 @@ def test_start_stop_lifecycle(controller, mock_dependencies):
         assert args_del[0][0][1] == '-D'
 
 def test_manage_iptables_permission_error(controller, mock_dependencies):
-    # [FIXED] Updated side effects to account for -C check before -A
+    # -C check fails (expected), -A fails with permission error
     mock_dependencies["check_call"].side_effect = [
-        subprocess.CalledProcessError(1, "iptables -C"), # -C check fails (expected)
-        subprocess.CalledProcessError(returncode=4, cmd="iptables"), # -A fails with permission error
+        subprocess.CalledProcessError(1, "iptables -C"), 
+        subprocess.CalledProcessError(returncode=4, cmd="iptables"), 
         None 
     ]
 
     with pytest.raises(PermissionError, match="Ensure running as root"):
         controller._manage_iptables(action='A')
     
-    # [FIX] Expect 2 calls (Check, Add). Cleanup (-D) is NOT called on permission error.
     assert mock_dependencies["check_call"].call_count == 2 
 
 def test_queue_callback_reordering_sequence(controller, mock_dependencies):

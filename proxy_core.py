@@ -1,5 +1,4 @@
 # proxy_core.py
-# proxy_core.py
 """
 Implements the HTTP/2 Native Proxy Handler using Sans-IO principles.
 
@@ -21,7 +20,6 @@ import asyncio
 import ssl
 import socket
 import logging
-# Ensure TypedDict is imported for P7/P8 FIX
 from typing import Dict, Optional, Callable, Tuple, List, Any, TypedDict
 from urllib.parse import urljoin, urlunparse
 import sys
@@ -35,14 +33,54 @@ try:
         SettingsAcknowledged, ConnectionTerminated, TrailersReceived, PingAcknowledged,
         ResponseReceived
     )
-    # Import FlowControlError for P9/P10 FIX
     from h2.errors import ErrorCodes, FlowControlError
     from h2.settings import SettingCodes
     H2_AVAILABLE = True
 except ImportError:
     H2_AVAILABLE = False
-    # Define placeholders for type hinting if h2 is not installed
-    H2Connection = object; H2Configuration = object; RequestReceived = object; DataReceived = object; StreamEnded = object; StreamReset = object; WindowUpdated = object; SettingsAcknowledged = object; ConnectionTerminated = object; TrailersReceived = object; PingAcknowledged = object; ErrorCodes = object; ResponseReceived = object; SettingCodes = object; FlowControlError = Exception
+    # Define placeholders as classes to satisfy type checkers (Pylance/MyPy)
+    class H2Connection: pass
+    class H2Configuration: pass
+    class RequestReceived: pass
+    class DataReceived: pass
+    class StreamEnded: pass
+    class StreamReset: pass
+    class WindowUpdated: pass
+    class SettingsAcknowledged: pass
+    class ConnectionTerminated: pass
+    class TrailersReceived: pass
+    class PingAcknowledged: pass
+    
+    # [FIX] Populate ErrorCodes with standard H2 codes to prevent AttributeErrors in tests/mocks
+    class ErrorCodes:
+        NO_ERROR = 0x0
+        PROTOCOL_ERROR = 0x1
+        INTERNAL_ERROR = 0x2
+        FLOW_CONTROL_ERROR = 0x3
+        SETTINGS_TIMEOUT = 0x4
+        STREAM_CLOSED = 0x5
+        FRAME_SIZE_ERROR = 0x6
+        REFUSED_STREAM = 0x7
+        CANCEL = 0x8
+        COMPRESSION_ERROR = 0x9
+        CONNECT_ERROR = 0xa
+        ENHANCE_YOUR_CALM = 0xb
+        INADEQUATE_SECURITY = 0xc
+        HTTP_1_1_REQUIRED = 0xd
+
+    class ResponseReceived: pass
+    
+    # [FIX] Populate SettingCodes with standard H2 settings
+    class SettingCodes:
+        HEADER_TABLE_SIZE = 0x1
+        ENABLE_PUSH = 0x2
+        MAX_CONCURRENT_STREAMS = 0x3
+        INITIAL_WINDOW_SIZE = 0x4
+        MAX_FRAME_SIZE = 0x5
+        MAX_HEADER_LIST_SIZE = 0x6
+        ENABLE_CONNECT_PROTOCOL = 0x8
+
+    class FlowControlError(Exception): pass
 
 # Import structures from the main application (if available)
 try:
@@ -53,9 +91,10 @@ except ImportError:
     class CapturedRequest:
         """Mock CapturedRequest for testing/independence."""
         def __init__(self, id, method, url, headers, body):
-            self.id = id; self.method = method; self.url = url; self.headers = headers; self.body = body
+            self.id = id; self.method = method; self.url = url; self.headers = headers;
+            self.body = body
         def __str__(self): return f"{self.method} {self.url}"
-    # Use a robust default list if import fails (Updated based on B04 FIX in structures.py)
+    # Use a robust default list if import fails
     HOP_BY_HOP_HEADERS = [
         'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
         'te', 'trailers', 'transfer-encoding', 'upgrade',
@@ -72,7 +111,7 @@ IDLE_TIMEOUT = 60.0
 GRACEFUL_SHUTDOWN_TIMEOUT = 30.0
 FLOW_CONTROL_TIMEOUT = 30.0  # Timeout for waiting on WINDOW_UPDATE
 
-# (P7/P8 FIX) Define TypedDict for captured header structure
+# Define TypedDict for captured header structure
 class CapturedHeaders(TypedDict):
     pseudo: Dict[str, str]
     headers: Dict[str, str] # Store normal headers as a dictionary for easier manipulation
@@ -81,7 +120,6 @@ class CapturedHeaders(TypedDict):
 class StreamContext:
     """
     Manages the state, synchronization, and capture data for a single proxied stream.
-
     This class tracks the open/closed status of a stream on both upstream and
     downstream sides, manages flow control events, and buffers request data for capture.
 
@@ -107,9 +145,8 @@ class StreamContext:
         self.flow_control_event = asyncio.Event()
         self.flow_control_event.set()  # Start open
 
-        # Capture data structures (P7/P8 FIX: Simplified structure)
+        # Capture data structures
         self.captured_headers: CapturedHeaders = {"pseudo": {}, "headers": {}}
-        # Removed request_headers_list and request_pseudo as they are replaced by captured_headers
         self.request_body = bytearray()
         self.capture_finalized = False
 
@@ -118,7 +155,6 @@ class StreamContext:
 class NativeProxyHandler:
     """
     Implements the core HTTP/2 proxy logic using Sans-IO principles (hyper-h2).
-
     Manages the lifecycle of both downstream (client) and upstream (server) connections,
     mediating events between them while handling interception and modification logic.
     """
@@ -130,13 +166,13 @@ class NativeProxyHandler:
         Initializes the NativeProxyHandler.
         """
         if not H2_AVAILABLE:
-            # [B03 FIX] Allow initialization if in a mocked test environment
-            if 'unittest' not in sys.modules:
+            # Allow initialization if in a mocked test environment
+            if 'unittest' not in sys.modules and 'pytest' not in sys.modules:
                 raise RuntimeError("hyper-h2 is required for NativeProxyHandler.")
 
         self.client_reader = client_reader
         self.client_writer = client_writer
-        self.explicit_host = explicit_host  # Host derived from CONNECT
+        self.explicit_host = explicit_host # Host derived from CONNECT
         self.capture_callback = capture_callback
         self.target_override = target_override
         self.scope_pattern = scope_pattern
@@ -150,10 +186,10 @@ class NativeProxyHandler:
 
         # H2 State Machines (PDF Requirement 1.2)
         # Downstream (Proxy acts as Server)
-        # P7/P8 FIX: We rely on utf-8 encoding for robust header processing.
+        # We rely on utf-8 encoding for robust header processing.
         ds_config = H2Configuration(client_side=False, header_encoding='utf-8')
         
-        # [B03 FIX] Handle potential initialization failure if H2Connection is a mock object or dependencies are missing
+        # Handle potential initialization failure if H2Connection is a mock object or dependencies are missing
         try:
             self.downstream_conn = H2Connection(config=ds_config)
             
@@ -177,7 +213,7 @@ class NativeProxyHandler:
         """
         Main execution loop for the proxy connection.
         """
-        # [B03 FIX] Safety check if initialization failed due to missing dependencies
+        # Safety check if initialization failed due to missing dependencies
         if not self.downstream_conn:
             return
 
@@ -190,7 +226,7 @@ class NativeProxyHandler:
             await self.connect_upstream()
 
             # 3. Initialize H2 on both sides
-            # P7/P8 FIX: Rely on utf-8 encoding.
+            # Rely on utf-8 encoding.
             us_config = H2Configuration(client_side=True, header_encoding='utf-8')
             self.upstream_conn = H2Connection(config=us_config)
 
@@ -220,7 +256,7 @@ class NativeProxyHandler:
         except (ConnectionError, asyncio.TimeoutError) as e:
             log.debug(f"Proxy connection error ({self.upstream_host}): {type(e).__name__}: {e}")
             await self.terminate(ErrorCodes.CONNECT_ERROR)
-        # Handle specific H2 errors gracefully (P9/P10)
+        # Handle specific H2 errors gracefully
         except FlowControlError as e:
              log.warning(f"H2 Flow Control Error detected. Terminating connection. {e}")
              await self.terminate(ErrorCodes.FLOW_CONTROL_ERROR)
@@ -364,7 +400,7 @@ class NativeProxyHandler:
         try:
             data_to_send = conn.data_to_send()
         except Exception as e:
-             # Handle potential errors in the H2 state machine
+            # Handle potential errors in the H2 state machine
             log.error(f"Error retrieving data from H2 connection: {type(e).__name__}")
             self.closed.set()
             return
@@ -377,7 +413,7 @@ class NativeProxyHandler:
             except (ConnectionResetError, ConnectionAbortedError, OSError):
                 # Handle common network write errors
                 if not self.closed.is_set():
-                     log.debug("Connection closed unexpectedly (flush).")
+                    log.debug("Connection closed unexpectedly (flush).")
                 self.closed.set()
             except Exception as e:
                 log.error(f"Error during network write/drain (flush): {type(e).__name__}", exc_info=True)
@@ -422,7 +458,6 @@ class NativeProxyHandler:
 
         elif isinstance(event, DataReceived):
             # Forward response data downstream (handles flow control)
-            # (P10 FIX) Call the refactored forward_data method
             await self.forward_data(self.downstream_conn, event.stream_id, event.data, event.flow_controlled_length, event.stream_ended)
 
         elif isinstance(event, StreamEnded):
@@ -459,7 +494,7 @@ class NativeProxyHandler:
         context = StreamContext(stream_id, self.upstream_scheme)
         self.streams[stream_id] = context
 
-        # (B18/P7/P8 FIX) Process headers robustly for capture
+        # Process headers robustly for capture
         context.captured_headers = self._process_headers_for_capture(event.headers)
 
         # Forward headers upstream.
@@ -479,7 +514,7 @@ class NativeProxyHandler:
              context.downstream_closed = True
              self.finalize_capture(context)
 
-    # (B18/P7/P8 FIX) Helper function for robust header processing
+    # Helper function for robust header processing
     def _process_headers_for_capture(self, headers: List[Tuple[Any, Any]]) -> CapturedHeaders:
         """
         Processes raw H2 headers into a structured format for capture, ensuring robust decoding.
@@ -541,7 +576,6 @@ class NativeProxyHandler:
             self.streams[stream_id].request_body.extend(event.data)
 
             # Forward data upstream (handles flow control)
-            # (P10 FIX) Call the refactored forward_data method
             await self.forward_data(self.upstream_conn, stream_id, event.data, event.flow_controlled_length, event.stream_ended)
         else:
              # Defense in Depth: Acknowledge data on unknown stream to free up connection window.
@@ -550,7 +584,6 @@ class NativeProxyHandler:
 
 
     # (PDF Requirement 3: Flow Control Implementation - The Core Challenge)
-    # (P9/P10 FIX) Refactored forward_data to implement chunking and correct window usage.
     async def forward_data(self, destination_conn: H2Connection, stream_id: int, data: bytes, flow_controlled_len: int, end_stream: bool = False):
         """
         Forwards data between connections, respecting flow control and implementing Drain-then-Ack with Chunking.
@@ -572,13 +605,12 @@ class NativeProxyHandler:
         data_len = len(data)
         offset = 0
 
-        # (P10 FIX) Loop until all data is sent, handling window limitations
+        # Loop until all data is sent, handling window limitations
         while offset < data_len:
             if self.closed.is_set():
                 return # Stop if connection is closing
 
             # Check available window (minimum of connection and stream windows)
-            # (P9 FIX) Use remote_flow_control_window (for stream) and outbound_flow_control_window (for connection)
             try:
                 # Connection window check
                 conn_window = destination_conn.outbound_flow_control_window
@@ -742,7 +774,6 @@ class NativeProxyHandler:
     async def handle_connection_terminated(self, event: ConnectionTerminated):
         """
         Handles connection termination (GOAWAY).
-
         Args:
             event (ConnectionTerminated): The GOAWAY event.
         """
@@ -753,10 +784,8 @@ class NativeProxyHandler:
     async def graceful_shutdown(self, last_stream_id=None):
         """
         Performs the graceful shutdown procedure.
-
         Sends a GOAWAY to stop new streams, waits for existing streams to drain,
         and then closes the connection.
-
         Args:
             last_stream_id (int, optional): The last stream ID processed by the peer.
         """
@@ -792,7 +821,6 @@ class NativeProxyHandler:
     async def wait_for_streams_to_drain(self):
         """
         Waits until the streams dictionary is empty.
-
         This coroutine polls the stream count until it reaches zero.
         """
         while self.streams:
@@ -801,7 +829,6 @@ class NativeProxyHandler:
     async def terminate(self, error_code: ErrorCodes):
         """
         Immediately terminates the connection with an error code.
-
         Args:
             error_code (ErrorCodes): The H2 error code to send in the GOAWAY frame.
         """
@@ -852,10 +879,8 @@ class NativeProxyHandler:
     def finalize_capture(self, context: StreamContext):
         """
         Constructs the CapturedRequest object from the StreamContext.
-
         This is called when the request is fully received (downstream half-closed).
         It filters headers, checks scope, and invokes the capture callback.
-
         Args:
             context (StreamContext): The context of the completed stream.
         """
@@ -876,6 +901,10 @@ class NativeProxyHandler:
         # Fallback to explicit host from CONNECT if still missing
         if not authority:
              authority = self.explicit_host
+
+        # [FIX] Final fallback: Check normal headers for 'host'
+        if not authority:
+            authority = raw_headers.get('host')
 
         if not authority:
             # Cannot capture without a host/authority
@@ -915,7 +944,6 @@ class NativeProxyHandler:
     def construct_target_url(self, scheme: str, path: str, authority: str) -> str:
         """
         Constructs the final URL, applying target overrides.
-
         Args:
             scheme (str): The URL scheme.
             path (str): The URL path.

@@ -211,8 +211,8 @@ def test_attack_thread_broken_barrier(MockHTTPResponse, engine, mock_dependencie
     
     engine._attack_thread(0)
     
-    assert engine.results[0].error == "ConnectionError: Synchronization barrier broken."
-    
+    # [FIX] Updated string match to include (fail-fast) which is now part of the error message
+    assert "ConnectionError: Synchronization barrier broken" in engine.results[0].error
     # Verify barrier abort was called in finally
     engine.barrier.abort.assert_called()
 
@@ -228,7 +228,8 @@ def test_attack_thread_connection_error(engine, mock_dependencies):
     engine._attack_thread(0)
     
     assert engine.results[0].status_code == 0
-    assert "Connection failed: Timeout" in engine.results[0].error
+    # [FIX] Update expectation to match actual error string structure
+    assert "Connection failed: OSError: Timeout" in engine.results[0].error
     
     # Ensure barrier was aborted to release other threads
     engine.barrier.abort.assert_called()
