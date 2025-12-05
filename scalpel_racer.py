@@ -1,10 +1,9 @@
 # scalpel_racer.py
-# FILE: ./scalpel_racer.py
 """
 Scalpel Racer - Advanced Race Condition Testing Tool.
 
-This is the main entry point for the Scalpel Racer application. It orchestrates
-the entire workflow, from setting up the intercepting proxy server and capturing
+This is the main entry point for the Scalpel Racer application.
+It orchestrates the entire workflow, from setting up the intercepting proxy server and capturing
 traffic to managing the Certificate Authority (CA) and executing various race
 condition attack strategies (Auto, SPA, First-Seq).
 
@@ -13,12 +12,6 @@ Key Components:
     - CaptureServer: An asyncio-based proxy server that intercepts and logs HTTP/HTTPS requests.
     - run_scan: The high-level function that dispatches the attack to the appropriate engine.
     - main: The CLI entry point handling argument parsing and the interactive UI.
-
-Dependencies:
-    - asyncio, httpx, h2, cryptography, numpy
-    - low_level (internal)
-    - packet_controller (internal)
-    - structures (internal)
 """
 
 import asyncio
@@ -37,7 +30,7 @@ import platform
 import socket
 import struct
 import threading
-import types # P1 FIX: Import types module for protocol patching
+import types  # Required for P1 FIX (eof_received patching)
 from typing import List, AsyncIterator, Optional, Dict, Union, Tuple
 from urllib.parse import urljoin, urlparse, urlunparse
 from collections import defaultdict
@@ -48,9 +41,14 @@ from structures import (
     CapturedRequest, 
     MAX_RESPONSE_BODY_READ,
     SYNC_MARKER,
-    # [B04 FIX] Import HOP_BY_HOP_HEADERS directly, removing the confusing alias.
     HOP_BY_HOP_HEADERS
 )
+
+# Attempt to import the NativeProxyHandler for H2 interception support
+try:
+    from proxy_core import NativeProxyHandler
+except ImportError:
+    NativeProxyHandler = None
 
 DEFAULT_CONCURRENCY = 15
 DEFAULT_TIMEOUT = 10.0
@@ -59,14 +57,10 @@ CA_CERT_FILE = "scalpel_ca.pem"
 CA_KEY_FILE = "scalpel_ca.key"
 
 INITIAL_LINE_TIMEOUT = 5.0
-# P2: Increased timeouts slightly as we now wrap entire header/body reads in a single timeout
 HEADERS_TIMEOUT = 10.0
 BODY_READ_TIMEOUT = 15.0
 TUNNEL_IDLE_TIMEOUT = 30.0
 TLS_HANDSHAKE_TIMEOUT = 10.0
-
-# [B04 FIX] Removed the redundant local definition of HOP_BY_HOP_HEADERS.
-# We now rely entirely on the definition imported from structures.py.
 
 try:
     from low_level import HTTP2RaceEngine
@@ -76,7 +70,6 @@ except ImportError:
     H2_AVAILABLE = False
 
 try:
-    # Import NFQUEUE_AVAILABLE for checks in main()
     from packet_controller import NFQUEUE_AVAILABLE
 except ImportError:
     NFQUEUE_AVAILABLE = False
@@ -105,38 +98,21 @@ CA_MANAGER = None
 class CAManager:
     """
     Manages the Certificate Authority (CA) for HTTPS interception.
-
-    This class handles loading the existing CA certificate and key, generating a new
-    CA if one doesn't exist, and dynamically generating leaf certificates for
-    intercepted hostnames on the fly.
     """
     def __init__(self):
-        """Initializes the CAManager."""
         self.ca_key = None
         self.ca_cert = None
         self.cert_cache = {}
 
     def initialize(self):
-        """
-        Initializes the CA Manager.
-
-        Checks for the existence of CA files. Loads them if present, otherwise
-        generates a new CA. Does nothing if cryptography library is unavailable.
-        """
         if not CRYPTOGRAPHY_AVAILABLE:
             return
-            
         if os.path.exists(CA_CERT_FILE) and os.path.exists(CA_KEY_FILE):
             self.load_ca()
         else:
             self.generate_ca()
 
     def load_ca(self):
-        """
-        Loads the existing CA certificate and private key from disk.
-
-        If loading fails, it attempts to regenerate the CA.
-        """
         print(f"[*] Loading Root CA from {CA_CERT_FILE}")
         try:
             with open(CA_KEY_FILE, "rb") as f:
@@ -148,11 +124,6 @@ class CAManager:
             self.generate_ca()
 
     def generate_ca(self):
-        """
-        Generates a new self-signed Root CA certificate and private key.
-
-        The generated files are saved to `CA_CERT_FILE` and `CA_KEY_FILE`.
-        """
         print(f"[*] Generating new Root CA. Install '{CA_CERT_FILE}' in your browser/OS trust store to intercept HTTPS.")
         self.ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
@@ -192,17 +163,6 @@ class CAManager:
             print(f"[!] Error saving CA files: {e}. TLS interception might fail.")
 
     def get_ssl_context(self, hostname: str) -> ssl.SSLContext:
-        """
-        Creates an SSLContext for a specific hostname, signed by the CA.
-
-        Uses a cache to avoid regenerating certificates for the same host.
-
-        Args:
-            hostname (str): The hostname for which to generate the certificate.
-
-        Returns:
-            ssl.SSLContext: The SSL context configured with the generated cert.
-        """
         if hostname in self.cert_cache:
             return self.cert_cache[hostname]
 
@@ -215,7 +175,7 @@ class CAManager:
             context.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
 
         try:
-            # Support both H2 and HTTP/1.1 for maximum compatibility
+            # Support both H2 and HTTP/1.1 via ALPN
             context.set_alpn_protocols(["h2", "http/1.1"])
         except NotImplementedError:
             pass 
@@ -223,57 +183,35 @@ class CAManager:
         cert_pem = cert.public_bytes(Encoding.PEM)
         key_pem = key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption())
 
-        # [B20 FIX] Robust temporary file handling to prevent resource leaks.
         cert_file = None
         key_file = None
         
         try:
-            # Create temporary files first (delete=False as SSLContext needs the path)
             cert_file = tempfile.NamedTemporaryFile(suffix=".pem", delete=False)
             key_file = tempfile.NamedTemporaryFile(suffix=".key", delete=False)
 
-            # Write data
             cert_file.write(cert_pem)
-            cert_file.close() # Close to ensure data is flushed before load_cert_chain
+            cert_file.close()
 
             key_file.write(key_pem)
             key_file.close()
 
-            # Load cert chain
             context.load_cert_chain(certfile=cert_file.name, keyfile=key_file.name)
             
-            # Cache and return the context
             self.cert_cache[hostname] = context
             return context
         
-        # Ensure temporary files are always cleaned up
         finally:
             if cert_file:
-                if not cert_file.closed:
-                    cert_file.close()
-                try:
-                    os.remove(cert_file.name)
-                except OSError:
-                    pass
-        
+                if not cert_file.closed: cert_file.close()
+                try: os.remove(cert_file.name)
+                except OSError: pass
             if key_file:
-                if not key_file.closed:
-                    key_file.close()
-                try:
-                    os.remove(key_file.name)
-                except OSError:
-                    pass
+                if not key_file.closed: key_file.close()
+                try: os.remove(key_file.name)
+                except OSError: pass
 
     def generate_host_cert(self, hostname: str):
-        """
-        Generates a leaf certificate for the given hostname.
-
-        Args:
-            hostname (str): The target hostname.
-
-        Returns:
-            Tuple: A tuple containing (certificate object, private key object).
-        """
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         if isinstance(hostname, bytes):
             hostname = hostname.decode('utf-8', errors='ignore')
@@ -308,20 +246,8 @@ class CAManager:
 class CaptureServer:
     """
     An asyncio-based proxy server for capturing HTTP and HTTPS traffic.
-
-    It listens for incoming connections, handles HTTP CONNECT for TLS tunnels,
-    intercepts requests (MITM), and logs them for later use in race attacks.
     """
     def __init__(self, port: int, target_override: str = None, scope_regex: str = None, enable_tunneling: bool = True):
-        """
-        Initializes the CaptureServer.
-
-        Args:
-            port (int): The port to listen on.
-            target_override (str, optional): Base URL to override the target.
-            scope_regex (str, optional): Regex pattern to filter captured requests.
-            enable_tunneling (bool, optional): Whether to tunnel non-captured requests. Defaults to True.
-        """
         self.port = port
         self.target_override = target_override
         if self.target_override and not self.target_override.endswith('/'):
@@ -334,26 +260,9 @@ class CaptureServer:
         self.ready_event = asyncio.Event()
         self.enable_tunneling = enable_tunneling
         self.proxy_client = None
-        self.capture_count = 0 # P3: Counter for optimized logging
+        self.capture_count = 0 
 
     def construct_target_url(self, scheme: str, request_line_target: str, normalized_headers: Dict[str, str], explicit_host: Optional[str]) -> str:
-        """
-        Constructs the full target URL from request components.
-
-        Handles target override logic and reconstruction from relative paths.
-
-        Args:
-            scheme (str): 'http' or 'https'.
-            request_line_target (str): The target string from the HTTP request line.
-            normalized_headers (Dict[str, str]): Lowercase HTTP headers.
-            explicit_host (Optional[str]): Hostname from CONNECT context (if applicable).
-
-        Returns:
-            str: The fully qualified URL.
-
-        Raises:
-            ValueError: If the target cannot be determined.
-        """
         try:
             parsed_target = urlparse(request_line_target)
         except ValueError:
@@ -377,7 +286,6 @@ class CaptureServer:
         if target_scheme and target_host:
             return request_line_target
 
-        # [PATCH] Re-enabled validation
         if request_line_target != "*" and not request_line_target.startswith("/"):
             raise ValueError(f"Invalid request target format: {request_line_target}")
 
@@ -397,15 +305,25 @@ class CaptureServer:
             final_host,
             target_path,
             parsed_target.params,
-            target_query,
+            parsed_target.query,
             ''
          ))
+
+    def _ingest_captured_request(self, captured: CapturedRequest):
+        """
+        Callback used by NativeProxyHandler (H2) and internal HTTP/1.1 logic 
+        to add a captured request to the log.
+        """
+        captured.id = len(self.request_log)
+        self.request_log.append(captured)
+        
+        self.capture_count += 1
+        if self.capture_count % 50 == 0:
+             print(f"[*] Captured {self.capture_count} requests...", end='\r', flush=True)
 
     async def start(self):
         """
         Starts the proxy server.
-
-        Initializes the CA Manager and begins listening for connections.
         """
         if globals().get('CA_MANAGER'):
             try:
@@ -415,7 +333,6 @@ class CaptureServer:
                 globals()['CA_MANAGER'] = None
 
         try:
-            # Defense in Depth: Use the backlog parameter to define the queue size for pending connections.
             self.server = await asyncio.start_server(self.handle_client, '0.0.0.0', self.port, backlog=128)
         except OSError as e:
             print(f"[!] Error: Could not bind to port {self.port}. {e}")
@@ -426,11 +343,10 @@ class CaptureServer:
 
         self.ready_event.set()
 
-        # P3: Update message to reflect optimization
         print(f"[*] Proxy listening on 0.0.0.0:{self.port} (Console I/O Optimized)")
         if self.target_override:
             print(f"[*] Target Override Base: {self.target_override}")
-        
+    
         async with self.server:
             await self.stop_event.wait()
             if self.server:
@@ -442,17 +358,9 @@ class CaptureServer:
     async def handle_client(self, reader, writer):
         """
         Handles an incoming client connection.
-
-        Reads the initial request line, parses the method, and routes to either
-        `handle_connect` (for TLS tunnels) or `process_http_request`.
-
-        Args:
-            reader (asyncio.StreamReader): The client reader.
-            writer (asyncio.StreamWriter): The client writer.
         """
         try:
             try:
-                # P2: Keep timeout on the initial line read
                 line = await asyncio.wait_for(reader.readline(), timeout=INITIAL_LINE_TIMEOUT)
             except (asyncio.TimeoutError, ConnectionResetError, asyncio.IncompleteReadError):
                 return 
@@ -471,7 +379,6 @@ class CaptureServer:
                 path = parts_strict[1]
                 while True:
                     try:
-                        # P2: Keep timeout on draining CONNECT headers
                         drain_line = await asyncio.wait_for(reader.readline(), timeout=HEADERS_TIMEOUT)
                     except (asyncio.TimeoutError, ConnectionResetError, asyncio.IncompleteReadError):
                         return 
@@ -493,8 +400,6 @@ class CaptureServer:
         except (ConnectionResetError, asyncio.IncompleteReadError):
             pass 
         except Exception as e:
-            # FIX: Re-enabled logging for observability (Defense in Depth) and to fix test_coverage_gaps.py
-            # While P3 optimization minimized I/O, silencing unexpected exceptions hinders debugging.
             print(f"[!] Error handling request: {e}")
         finally:
             if writer and not writer.is_closing():
@@ -507,23 +412,12 @@ class CaptureServer:
     async def handle_connect(self, client_reader, client_writer, path):
         """
         Handles the HTTP CONNECT method for establishing TLS tunnels.
-
-        Performs the MITM interception:
-        1. Responds with 200 Connection Established.
-        2. Upgrades the connection to TLS using a dynamically generated cert.
-        3. Wraps the transport in a new reader/writer pair.
-        4. Processes the inner encrypted HTTP requests.
-
-        Args:
-            client_reader: The client reader.
-            client_writer: The client writer.
-            path (str): The target host:port from the CONNECT request.
+        Performs MITM interception and routes based on ALPN (H2 vs HTTP/1.1).
         """
         try:
             # Robust parsing: allow fallback to default port 443 if missing
             if ':' in path:
                 host, port_str = path.split(':', 1)
-                # Basic validation that port_str is numerical if present
                 if port_str and not port_str.isdigit():
                      raise ValueError("Invalid port format")
             else:
@@ -544,8 +438,6 @@ class CaptureServer:
         try:
             ssl_context = globals().get('CA_MANAGER').get_ssl_context(host)
         except Exception as e:
-            # P3: Minimize console I/O
-            # print(f"[!] Failed to generate certificate for {host}: {e}")
             client_writer.write(b"HTTP/1.1 500 Internal Server Error\r\n\r\nCertificate generation failed")
             await client_writer.drain()
             return
@@ -554,44 +446,24 @@ class CaptureServer:
         await client_writer.drain()
 
         try:
-            # [B01 Fix] Robustly get transport and protocol (Defense in Depth)
-            # Use official API get_extra_info for transport.
+            # [FIX: CRITICAL B01] Robustly get transport and protocol
             transport = client_writer.get_extra_info('transport')
-            
-            # Retrieving the protocol reliably across asyncio implementations (like uvloop) 
-            # often requires accessing the internal _protocol attribute of the StreamWriter, 
-            # as the transport object itself might not consistently expose get_protocol() or might be wrapped.
             protocol = None
             if hasattr(client_writer, '_protocol'):
                 protocol = client_writer._protocol
-            # Fallback for standard asyncio if _protocol isn't accessible but transport is
             elif transport and hasattr(transport, 'get_protocol'):
                  protocol = transport.get_protocol()
-
-            # If standard APIs fail, attempt to access internal transport attribute as a last resort.
             if transport is None:
                 transport = getattr(client_writer, '_transport', None)
 
             if transport is None or protocol is None:
-                # Cannot proceed if essential components are missing (e.g., writer closed or internals changed)
-                # P3: Minimize console I/O
-                # print("[!] Error: Cannot retrieve transport/protocol for TLS upgrade.")
                 return
 
-            # P1 FIX: Patch protocol.eof_received to suppress "RuntimeWarning: protocol.eof_received()".
-            # The default asyncio protocol implementation (StreamReaderProtocol) returns None or False on EOF,
-            # keeping the transport open. SSL requires returning True to allow closure during the handshake/shutdown process.
+            # [FIX: CRITICAL B01] Patch protocol.eof_received if missing in current loop
             if hasattr(protocol, 'eof_received'):
-                # Define the replacement method
                 def patched_eof_received(self):
-                    # Return True to indicate that the EOF is "handled" and the transport can be closed.
                     return True
-
-                # Bind the patch to the specific protocol instance using types.MethodType.
-                # This ensures 'self' is correctly passed when the method is called.
                 protocol.eof_received = types.MethodType(patched_eof_received, protocol)
-            # END P1 FIX
-
             
             # [FIX: CRITICAL B01] Capture the NEW transport returned by start_tls
             new_transport = await asyncio.wait_for(
@@ -599,15 +471,40 @@ class CaptureServer:
                 timeout=TLS_HANDSHAKE_TIMEOUT
             )
             
-            # [B01 Fix] Refresh reader from protocol if available
-            # After start_tls, the protocol manages the decrypted stream reader.
+            # Refresh reader from protocol if available
             if hasattr(protocol, '_stream_reader') and protocol._stream_reader:
                 client_reader = protocol._stream_reader
 
             # [FIX: CRITICAL B01] Create a NEW writer using the new SSL transport.
-            # Without this, we continue writing to the raw TCP socket (plaintext), causing ERR_SSL_PROTOCOL_ERROR.
             client_writer = asyncio.StreamWriter(new_transport, protocol, client_reader, loop)
 
+            # -- ALPN DETECTION AND PROTOCOL SWITCHING --
+            
+            # Retrieve the negotiated protocol from the SSL object
+            ssl_obj = client_writer.get_extra_info('ssl_object')
+            negotiated_protocol = ssl_obj.selected_alpn_protocol() if ssl_obj else None
+
+            if negotiated_protocol == "h2":
+                if NativeProxyHandler:
+                    # [H2 PATH] Hand off to the Sans-IO Proxy Core
+                    h2_handler = NativeProxyHandler(
+                        client_reader=client_reader,
+                        client_writer=client_writer,
+                        explicit_host=path,
+                        capture_callback=self._ingest_captured_request,
+                        target_override=self.target_override,
+                        scope_pattern=self.scope_pattern,
+                        enable_tunneling=self.enable_tunneling  # [FIX] Pass the flag
+                    )
+                    await h2_handler.run()
+                    return # Exit handle_connect, H2 handler manages the rest
+                else:
+                    print("[!] Negotiated 'h2' but proxy_core.NativeProxyHandler is missing. Closing.")
+                    client_writer.close()
+                    return
+
+            # -- HTTP/1.1 PATH (Legacy Loop) --
+            
             while not client_reader.at_eof() and not client_writer.is_closing():
                 try:
                     # P2: The wait_for here is necessary for the IDLE timeout of the tunnel itself.
@@ -617,7 +514,8 @@ class CaptureServer:
                 except (ConnectionResetError, asyncio.IncompleteReadError):
                     break
 
-                if not line: break
+                if not line: 
+                    break
 
                 decoded_line = line.decode(errors='ignore').strip()
                 parts_strict = decoded_line.split(maxsplit=2)
@@ -632,31 +530,21 @@ class CaptureServer:
                 await self.process_http_request(client_reader, client_writer, method, request_target_in_tunnel, version, initial_line=line, scheme="https", explicit_host=path)
 
         except (ssl.SSLError, ConnectionResetError, asyncio.IncompleteReadError, asyncio.TimeoutError):
-            # Handle handshake failures or connection drops gracefully
             pass
         except Exception as e:
-            # P3: Minimize console I/O. However, silencing unexpected errors hinders debugging.
-            # Defense in Depth: Ensure observability for unexpected TLS issues.
             print(f"[!] Unexpected error during TLS interception for {host}: {e}")
-            # pass # Removed pass, implicit return None
+        finally:
+            # Ensure writer is closed (NativeProxyHandler handles this internally, but good for H1 fallback)
+            if client_writer and not client_writer.is_closing():
+                 client_writer.close()
+                 try:
+                     await client_writer.wait_closed()
+                 except Exception:
+                     pass
 
     async def process_http_request(self, reader, writer, method, request_target, version, initial_line, scheme, explicit_host=None):
         """
         Parses and processes a standard HTTP request.
-
-        Reads headers and body, handles chunked transfer encoding, constructs the
-        target URL, and logs the captured request. If tunneling is enabled and the
-        request matches the scope, it tunnels the request upstream.
-
-        Args:
-            reader: Client reader.
-            writer: Client writer.
-            method (str): HTTP method.
-            request_target (str): Target URL/path.
-            version (str): HTTP version.
-            initial_line (bytes): Raw initial request line.
-            scheme (str): 'http' or 'https'.
-            explicit_host (str, optional): Explicit host context.
         """
         normalized_headers: Dict[str, str] = {}
         original_headers_list: List[tuple[str, str]] = [] 
@@ -667,7 +555,6 @@ class CaptureServer:
         if version.upper() in ["HTTP/1.0", "HTTP/0.9"]:
             initial_connection_close = True
 
-        # P2 Optimization: Define inner function to read headers without per-line wait_for
         async def read_headers():
             normalized = {}
             original_list = []
@@ -676,13 +563,12 @@ class CaptureServer:
             is_chunked = False
 
             while True:
-                # Efficient readline relying on StreamReader buffer
                 line = await reader.readline()
-                # Handle \r\n or just \n termination
                 if line == b'\r\n' or line == b'\n' or not line: break
 
                 try:
                     line_str = line.decode(errors='ignore').strip()
+                
                     if ':' in line_str:
                         key, value = line_str.split(':', 1)
                         original_key = key.strip()
@@ -710,68 +596,54 @@ class CaptureServer:
         
             return normalized, original_list, content_len, conn_close, is_chunked
 
-        # P2 Optimization: Define inner function for efficient chunked reading
         async def read_chunked_body():
             chunked_body = bytearray()
             try:
                 while True:
-                    # Read chunk size line (efficiently)
                     size_line = await reader.readline()
                     if not size_line:
-                        raise asyncio.IncompleteReadError(bytes(chunked_body), None) # Unexpected EOF
+                        raise asyncio.IncompleteReadError(bytes(chunked_body), None) 
 
-                    # Parse chunk size (RFC 7230 Section 4.1)
-                    parts = size_line.split(b';') # handle chunk extension
+                    parts = size_line.split(b';') 
                     try:
                         chunk_size_hex = parts[0].strip()
                         if not chunk_size_hex:
-                            # Handle rare case of empty line before chunks if implementation allows
                             continue
                         chunk_size = int(chunk_size_hex, 16)
                     except ValueError:
                         raise ValueError("Malformed chunk size")
 
                     if chunk_size == 0:
-                        # Last chunk. Consume trailers (if any) until empty line.
                         while True:
                             line = await reader.readline()
                             if not line:
-                                 raise asyncio.IncompleteReadError(bytes(chunked_body), None)
+                                  raise asyncio.IncompleteReadError(bytes(chunked_body), None)
                             if line.strip() == b'':
                                 break
                         break
 
-                    # Read chunk data (efficiently)
                     chunk = await reader.readexactly(chunk_size)
                     chunked_body.extend(chunk)
 
-                    # Consume CRLF after chunk
                     crlf = await reader.readline()
                     if not crlf:
                         raise asyncio.IncompleteReadError(bytes(chunked_body), None)
 
                 return bytes(chunked_body)
-             # Catch IncompleteReadError from readexactly or readline EOF
             except asyncio.IncompleteReadError as e:
-                 # If readexactly fails (e.partial), we re-raise with the full body read so far
-                 # Ensure e.partial is handled correctly if it exists
                  partial_data = e.partial if hasattr(e, 'partial') and e.partial else b''
-                 # Handle expected attribute for compatibility
                  expected = e.expected if hasattr(e, 'expected') else None
                  raise asyncio.IncompleteReadError(bytes(chunked_body) + partial_data, expected)
 
         try:
-            # P2: Apply timeout to the entire header reading process
             normalized_headers, original_headers_list, content_length, connection_close, transfer_encoding_chunked = await asyncio.wait_for(read_headers(), timeout=HEADERS_TIMEOUT)
         except (asyncio.IncompleteReadError, ConnectionResetError, asyncio.TimeoutError):
              return
 
         body = b""
         if transfer_encoding_chunked:
-            # P2 Optimization: Use helper function wrapped in a single wait_for
             try:
                 body = await asyncio.wait_for(read_chunked_body(), timeout=BODY_READ_TIMEOUT)
-
             except asyncio.TimeoutError:
                  if not writer.is_closing():
                      msg = b"Timeout reading chunked request body."
@@ -780,10 +652,8 @@ class CaptureServer:
                  return
             except (ConnectionResetError, OSError):
                  return
-            # Handle parsing errors (ValueError) or incomplete reads (IncompleteReadError)
             except (ValueError, asyncio.IncompleteReadError) as e:
                  if not writer.is_closing():
-                    # Return 400 Bad Request for malformed chunking or incomplete data
                     msg = b"Error processing request body."
                     writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: " + str(len(msg)).encode() + b"\r\n\r\n" + msg)
                     await writer.drain()
@@ -791,31 +661,27 @@ class CaptureServer:
 
         elif content_length > 0:
              try:
-                  # P2: Apply timeout to the entire body read operation
                   body = await asyncio.wait_for(reader.readexactly(content_length), timeout=BODY_READ_TIMEOUT)
              except asyncio.IncompleteReadError as e:
-                 if not writer.is_closing():
-                     # Handle expected and partial attributes for compatibility
-                     expected = e.expected if hasattr(e, 'expected') else content_length
-                     partial_len = len(e.partial) if hasattr(e, 'partial') else 0
-                     msg = f"Incomplete body read. Expected {expected}, got {partial_len}.".encode()
-                     writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: " + str(len(msg)).encode() + b"\r\n\r\n" + msg)
-                     await writer.drain()
-                 return
+                  if not writer.is_closing():
+                      expected = e.expected if hasattr(e, 'expected') else content_length
+                      partial_len = len(e.partial) if hasattr(e, 'partial') else 0
+                      msg = f"Incomplete body read. Expected {expected}, got {partial_len}.".encode()
+                      writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: " + str(len(msg)).encode() + b"\r\n\r\n" + msg)
+                      await writer.drain()
+                  return
              except asyncio.TimeoutError:
-                 if not writer.is_closing():
-                     msg = b"Timeout reading request body."
-                     writer.write(b"HTTP/1.1 408 Request Timeout\r\nContent-Length: " + str(len(msg)).encode() + b"\r\n\r\n" + msg)
-                     await writer.drain()
-                 return
+                  if not writer.is_closing():
+                      msg = b"Timeout reading request body."
+                      writer.write(b"HTTP/1.1 408 Request Timeout\r\nContent-Length: " + str(len(msg)).encode() + b"\r\n\r\n" + msg)
+                      await writer.drain()
+                  return
              except ConnectionResetError:
-                 return
+                  return
 
         try:
             final_url = self.construct_target_url(scheme, request_target, normalized_headers, explicit_host)
         except ValueError as e:
-            # P3: Minimize console I/O
-            # print(f"[!] URL Construction Error: {e}")
             if not writer.is_closing():
                 msg = str(e).encode('utf-8')
                 try:
@@ -838,23 +704,14 @@ class CaptureServer:
                 writer.close()
             return
 
-        req_id = len(self.request_log)
-        
         # [B04 FIX] Uses the consolidated HOP_BY_HOP_HEADERS imported from structures.
         safe_headers = {k: v for k, v in original_headers_dict.items()
                         if k.lower() not in HOP_BY_HOP_HEADERS}
 
-        captured = CapturedRequest(req_id, method, final_url, safe_headers, body)
-        self.request_log.append(captured)
-
-        # P3 Optimization: Silence verbose per-request logging (Console I/O blocking).
-        # Use a counter update instead for feedback without significant blocking.
-        # print(f"[+] Captured ({scheme.upper()}) {captured}")
-        self.capture_count += 1
-        if self.capture_count % 50 == 0:
-             # Use carriage return to update the same line
-             print(f"[*] Captured {self.capture_count} requests...", end='\r', flush=True)
-
+        captured = CapturedRequest(0, method, final_url, safe_headers, body)
+        
+        # Unified ingestion method
+        self._ingest_captured_request(captured)
 
         if self.enable_tunneling:
             await self.tunnel_request(final_url, method, original_headers_dict, body, writer)
@@ -870,18 +727,10 @@ class CaptureServer:
     async def tunnel_request(self, url, method, headers, body, client_writer):
         """
         Tunnels the intercepted request to the upstream server and relays the response.
-
-        Args:
-            url (str): The upstream URL.
-            method (str): HTTP method.
-            headers (Dict): Request headers.
-            body (bytes): Request body.
-            client_writer: Client writer to send the response to.
         """
         if self.proxy_client is None:
             self.proxy_client = httpx.AsyncClient(verify=False, timeout=60.0, http2=True)
 
-        # [B04 FIX] Uses the consolidated HOP_BY_HOP_HEADERS imported from structures.
         forward_headers = {k: v for k, v in headers.items()
                            if k.lower() not in HOP_BY_HOP_HEADERS}
 
@@ -909,8 +758,6 @@ class CaptureServer:
                     await client_writer.drain()
 
         except httpx.RequestError as e:
-            # P3: Minimize console I/O
-            # print(f"[!] Upstream request failed: {e} (URL: {url})")
             if not client_writer.is_closing():
                 try:
                     msg = b"Upstream request failed"
@@ -919,23 +766,11 @@ class CaptureServer:
                 except Exception:
                      pass
         except Exception as e:
-            # P3: Minimize console I/O
-            # print(f"[!] Error during tunneling: {e}")
             pass
 
 async def Last_Byte_Stream_Body(payload: bytes, barrier: asyncio.Barrier, warmup_ms: int) -> AsyncIterator[bytes]:
     """
     Async generator that streams the request body, pausing before the last byte.
-
-    Used for the 'Last-Byte Sync' strategy.
-
-    Args:
-        payload (bytes): The full request body.
-        barrier (asyncio.Barrier): The synchronization barrier.
-        warmup_ms (int): Warmup delay before the last byte.
-
-    Yields:
-        bytes: Chunks of the payload.
     """
     if len(payload) <= 1:
         if warmup_ms > 0:
@@ -962,15 +797,6 @@ async def Last_Byte_Stream_Body(payload: bytes, barrier: asyncio.Barrier, warmup
 async def Staged_Stream_Body(payload: bytes, barriers: List[asyncio.Barrier]) -> AsyncIterator[bytes]:
     """
     Async generator that splits the payload by {{SYNC}} markers.
-
-    Used for the 'Staged' attack strategy.
-
-    Args:
-        payload (bytes): The request body containing sync markers.
-        barriers (List[asyncio.Barrier]): A list of barriers, one for each marker.
-
-    Yields:
-        bytes: Segments of the payload.
     """
     parts = payload.split(SYNC_MARKER)
     barrier_idx = 0
@@ -990,18 +816,7 @@ async def Staged_Stream_Body(payload: bytes, barriers: List[asyncio.Barrier]) ->
 async def send_probe_advanced(client: httpx.AsyncClient, request: CapturedRequest, payload: bytes, barriers: List[asyncio.Barrier], warmup_ms: int, index: int, is_staged: bool) -> ScanResult:
     """
     Sends a single probe request using httpx with the specified synchronization strategy.
-
-    Args:
-        client (httpx.AsyncClient): The HTTP client.
-        request (CapturedRequest): The request template.
-        payload (bytes): The attack payload.
-        barriers (List[asyncio.Barrier]): Synchronization barriers.
-        warmup_ms (int): Warmup time.
-        index (int): Probe index.
-        is_staged (bool): Whether to use Staged or Last-Byte Sync.
-
-    Returns:
-        ScanResult: The result of the probe.
+    [FIX] Explicitly recalculates Content-Length to ensure valid headers during edits/streaming.
     """
     start_time = time.perf_counter()
     body_hash = None
@@ -1009,12 +824,16 @@ async def send_probe_advanced(client: httpx.AsyncClient, request: CapturedReques
 
     try:
         req_headers = request.headers.copy()
-        req_headers["User-Agent"] = "Scalpel-CLI/5.4-Optimized" # Version Bump
+        req_headers["User-Agent"] = "Scalpel-CLI/5.4-Optimized"
         req_headers["X-Scalpel-Probe"] = f"{index}_{int(time.time())}"
+
+        # [FIX] Recalculate Content-Length for correct handling of edited bodies/sync markers
+        actual_length = len(payload)
+        req_headers["Content-Length"] = str(actual_length)
 
         has_content_type = any(k.lower() == 'content-type' for k in req_headers.keys())
         
-        if not has_content_type and request.method in ["POST", "PUT", "PATCH"] and len(payload) > 0:
+        if not has_content_type and request.method in ["POST", "PUT", "PATCH"] and actual_length > 0:
              req_headers["Content-Type"] = "application/x-www-form-urlencoded"
 
         content_stream = None
@@ -1049,19 +868,6 @@ async def send_probe_advanced(client: httpx.AsyncClient, request: CapturedReques
 async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warmup: int, strategy: str = "auto"):
     """
     Orchestrates the race condition attack.
-
-    Selects the appropriate attack engine (httpx 'auto' or low-level 'spa'/'first-seq')
-    based on the configuration and executes the attack.
-
-    Args:
-        request (CapturedRequest): The request to race.
-        concurrency (int): Number of concurrent requests.
-        http2 (bool): Force HTTP/2 for 'auto' strategy.
-        warmup (int): Warmup delay in ms.
-        strategy (str): Attack strategy ('auto', 'spa', 'first-seq').
-
-    Returns:
-        List[ScanResult]: The results of the attack.
     """
     attack_payload = request.get_attack_payload()
     sync_markers_count = attack_payload.count(SYNC_MARKER)
@@ -1085,9 +891,7 @@ async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warm
         print(f"[*] Payload: {len(attack_payload)} bytes | Concurrency: {concurrency} | Strategy: {strategy} | Warmup: {warmup}ms")
 
         def synchronous_h2_attack():
-            # HTTP2RaceEngine must be imported here if it wasn't globally available
             # Re-import HTTP2RaceEngine locally if the global one is the placeholder (None)
-            # This handles the case where the import succeeded but the variable was None.
             if HTTP2RaceEngine is None:
                 try:
                      from low_level import HTTP2RaceEngine as ImportedH2Engine
@@ -1096,7 +900,6 @@ async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warm
             else:
                 ImportedH2Engine = HTTP2RaceEngine
 
-            
             engine = ImportedH2Engine(request, concurrency, strategy, warmup)
             try:
                 return engine.run_attack()
@@ -1108,7 +911,6 @@ async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warm
 
         if isinstance(result_or_error, Exception):
             print(f"[!] Attack failed: {result_or_error}")
-            # We return the exception object if the caller needs to inspect it (e.g., tests)
             return result_or_error
         
         analyze_results(result_or_error)
@@ -1144,21 +946,14 @@ async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warm
 def analyze_results(results: List[ScanResult]):
     """
     Analyzes and prints statistical data from the scan results.
-
-    Groups responses by status code and body hash, and calculates timing statistics
-    (average, jitter, distribution).
-
-    Args:
-        results (List[ScanResult]): The list of results to analyze.
     """
-    # (analyze_results implementation remains the same)
     if not results:
-        print("\n--- Analysis Summary ---\n  (No results to analyze)")
+        print("\n-- Analysis Summary --\n  (No results to analyze)")
         return
         
     successful = [r for r in results if r.error is None]
     
-    print("\n--- Analysis Summary ---")
+    print("\n-- Analysis Summary --")
 
     signatures = defaultdict(list)
     for r in successful:
@@ -1203,7 +998,7 @@ def analyze_results(results: List[ScanResult]):
             max_t = max(timings)
             
             if len(timings) > 1:
-                 std_dev = (sum((t - avg) ** 2 for t in timings) / (len(timings)-1)) ** 0.5
+                std_dev = (sum((t - avg) ** 2 for t in timings) / (len(timings)-1)) ** 0.5
             else:
                  std_dev = 0.0
             
@@ -1236,13 +1031,7 @@ def analyze_results(results: List[ScanResult]):
 def edit_request_body(request: CapturedRequest):
     """
     Provides a CLI for editing the body of a captured request.
-
-    Useful for inserting `{{SYNC}}` markers for Staged attacks.
-
-    Args:
-        request (CapturedRequest): The request to edit.
     """
-    # (edit_request_body implementation remains the same)
     print(f"\nEditing Body for Request {request.id}")
     print("Instructions: Use {{SYNC}} to insert synchronization points for Staged Attacks.")
     print("Current Body Preview (first 500 bytes):")
@@ -1272,7 +1061,7 @@ def edit_request_body(request: CapturedRequest):
     
     if not new_body_str.strip() and current_body:
          try:
-            if input("Body is empty. Confirm? (y/N): ").lower() != 'y':
+             if input("Body is empty. Confirm? (y/N): ").lower() != 'y':
                 print("[*] Body unchanged.")
                 return
          except (EOFError, KeyboardInterrupt):
@@ -1291,9 +1080,6 @@ def edit_request_body(request: CapturedRequest):
 def main():
     """
     Main entry point.
-
-    Handles CLI arguments, initializes the environment (CA, CaptureServer),
-    and runs the interactive request selection menu.
     """
     if platform.system() == "Windows":
         try:
@@ -1303,12 +1089,10 @@ def main():
             print(f"[!] Could not set Windows event loop policy: {e}")
 
     if CRYPTOGRAPHY_AVAILABLE:
-        # Initialize global CA_MANAGER
         globals()['CA_MANAGER'] = CAManager()
 
-    # P3: Update version string to reflect optimization
     parser = argparse.ArgumentParser(description="Scalpel Racer v5.4 (Robustified) - Advanced Race Condition Tester",
-                                     formatter_class=argparse.RawTextHelpFormatter) # Use RawTextHelpFormatter for better help alignment
+                                     formatter_class=argparse.RawTextHelpFormatter)
 
     parser.add_argument("-l", "--listen", type=int, default=8080, help="Listening port (default: 8080)")
     parser.add_argument("-t", "--target", type=str, help="Target Base URL for override (e.g. https://api.example.com/v1).")
@@ -1335,7 +1119,7 @@ def main():
         
         if not is_linux or not is_root:
             print("[!] Warning: 'first-seq' strategy requires Linux and Root privileges.")
-        # Add check for NFQUEUE availability
+        
         if not NFQUEUE_AVAILABLE:
              print("[!] Warning: 'first-seq' strategy requires NetfilterQueue/Scapy. Ensure they are installed.")
 
@@ -1345,9 +1129,6 @@ def main():
     try:
         asyncio.run(capture_server.start())
     except KeyboardInterrupt:
-        # [FIX] Ensure output is flushed immediately (flush=True) and written to stderr.
-        # Writing to stderr can improve reliability in environments with heavy stdout buffering
-        # or complex test runners (capsys/pytest). (Defense in Depth for Observability)
         print("\n[*] Capture stopped. Proceeding to selection menu.", file=sys.stderr, flush=True)
         capture_server.stop_event.set()
     except SystemExit:
@@ -1355,22 +1136,17 @@ def main():
     except Exception as e:
         print(f"\n[!] Capture server stopped unexpectedly: {e}")
 
-    # Ensure cleanup of the proxy client's connection pool
     if capture_server.proxy_client:
         try:
-            # We need a running loop to close the client if the main loop exited abnormally
             asyncio.run(capture_server.proxy_client.aclose())
         except RuntimeError:
-            # Handle cases where the loop is already closed or stopping
             pass
         except Exception as e:
              print(f"[!] Error closing proxy client: {e}")
 
     log = capture_server.request_log
 
-    # P3: Ensure final count is displayed after capture stops
     if capture_server.capture_count > 0:
-        # Clear the updating line (ljust) and print the final count
         print(f"[*] Total requests captured: {capture_server.capture_count}".ljust(40))
 
     if not log:
@@ -1378,17 +1154,17 @@ def main():
         sys.exit(0)
 
     def display_menu():
-        print("\n\n--- Captured Requests ---")
+        print("\n\n-- Captured Requests --")
         print(f"{'ID':<5} {'Method':<7} {'URL (Size) [Status]'} ")
         print("-" * 100)
         
-        # Improve usability by showing only the most recent requests if the log is large
         display_log = log[-50:]
         if len(log) > 50:
             print(f"  ... (Showing last 50 of {len(log)} requests) ...")
 
         for req in display_log:
             print(f"{str(req)}")
+    
         print("-" * 100)
         print("Commands: [ID] to race | 'e [ID]' to edit body | 'q' to quit")
 
@@ -1432,7 +1208,6 @@ def main():
                     input("\nPress Enter to return to the menu...")
                 except (EOFError, KeyboardInterrupt):
                     sys.exit(0)
-                
             else:
                 print("Invalid ID.")
         except ValueError:

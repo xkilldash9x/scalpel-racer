@@ -1,5 +1,4 @@
 # packet_controller.py
-# FILE: ./packet_controller.py
 """
 Implements the PacketController for the 'First Sequence Sync' strategy.
 
@@ -138,7 +137,7 @@ class PacketController:
             if "Permission denied" in str(e):
                 raise PermissionError("Failed to bind NetfilterQueue. Root privileges required.")
             raise RuntimeError(f"Failed to bind NetfilterQueue (Queue Num {self.queue_num}): {e}")
-        # [B02 FIX] Handle potential exceptions during initialization if dependencies are mocked incorrectly
+        # Handle potential exceptions during initialization if dependencies are mocked incorrectly
         except Exception as e:
              self._manage_iptables(action='D')
              raise RuntimeError(f"Failed to initialize NetfilterQueue: {e}")
@@ -184,10 +183,8 @@ class PacketController:
         self.first_packet_held.set()
         self.subsequent_packets_released.set()
 
-        # [B02 FIX] Remove redundant is_alive() check before join.
         if self.listener_thread:
             self.listener_thread.join(timeout=1)
-            # [B02 FIX] Check if thread is still alive after timeout and warn (Defense in Depth).
             if self.listener_thread.is_alive():
                 print("[!] Warning: PacketController listener thread did not terminate cleanly (zombie thread).")
         
@@ -230,7 +227,7 @@ class PacketController:
             '--queue-num', str(self.queue_num)
         ]
 
-        # [PC1 FIX] Idempotency Check using -C. Use copy() to prevent modifying base_rule.
+        # Idempotency Check using -C. Use copy() to prevent modifying base_rule.
         check_rule = base_rule.copy()
         check_rule.insert(1, '-C')  # Insert Check command
 
@@ -240,7 +237,6 @@ class PacketController:
             rule_exists = True
         except subprocess.CalledProcessError:
             rule_exists = False
-        # [PC2 FIX] Handle missing iptables binary
         except FileNotFoundError:
             raise RuntimeError("iptables command not found. Ensure it is installed and in PATH.")
 
@@ -258,14 +254,11 @@ class PacketController:
         try:
             # Execute the iptables command
             subprocess.check_call(action_rule, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-        # [PC2 FIX] Handle missing iptables binary
         except FileNotFoundError:
             raise RuntimeError("iptables command not found during execution. Ensure it is installed and in PATH.")
         except subprocess.CalledProcessError as e:
             # Handle errors during iptables configuration
             if action == 'A':
-                # B06: Removed recursive cleanup attempt. stop() handles final cleanup.
-
                 # Check common error codes related to permissions
                 if e.returncode in [1, 4]:
                     raise PermissionError("Failed to configure iptables. Ensure running as root and iptables is installed/functional.")
@@ -335,7 +328,6 @@ class PacketController:
 
                 elif seq == self.expected_next_seq:
                     # This is the expected subsequent packet. Release immediately.
-                    # print(f"[*] Releasing subsequent packet (Seq: {seq})") # Optional: verbose logging
                     pkt.accept()
                     self.expected_next_seq = seq + payload_len
 
@@ -346,14 +338,12 @@ class PacketController:
 
                 else:
                     # Handle unexpected sequence numbers (e.g., retransmissions)
-                    # print(f"[*] Accepting unexpected sequence packet (Seq: {seq}, Expected: {self.expected_next_seq})") # Optional: verbose logging
                     pkt.accept()
                     return
 
         except Exception as e:
             # Safety catch: Accept the packet if processing fails
             print(f"[!] Error processing packet: {e}")
-            # [B02 FIX] Check if pkt object has accept method before calling (Defense in Depth for mocked environments)
             if hasattr(pkt, 'accept'):
                 pkt.accept()
 
@@ -383,7 +373,7 @@ class PacketController:
 
         # 4. Release the first packet
         with self.lock:
-            # B03 FIX: Check if active and info exists before releasing, ensuring queue is likely still bound.
+            # Check if active and info exists before releasing, ensuring queue is likely still bound.
             if self.first_packet_info and self.active:
                 seq, pkt = self.first_packet_info
                 try:

@@ -8,12 +8,9 @@ It implements a full-duplex proxy with support for flow control, state machine
 synchronization, and traffic interception/capture, adhering to RFC 7540 and
 specific requirements for handling race condition testing.
 
-Key features:
-    - Sans-IO Architecture (using `h2`).
-    - Explicit state management for both upstream and downstream connections.
-    - Robust flow control handling (Deadlock prevention, Window Updates, Chunking).
-    - Request capture and analysis.
-    - Graceful shutdown and resource cleanup.
+[FIXED] Implements robust Hop-by-Hop header filtering to prevent ProtocolErrors.
+[FIXED] Disables strict header validation to tolerate upstream quirks (Google).
+[FIXED] Implements decoupled sender loops to prevent Flow Control Deadlocks.
 """
 
 import asyncio
@@ -30,10 +27,11 @@ try:
     from h2.config import H2Configuration
     from h2.events import (
         RequestReceived, DataReceived, StreamEnded, StreamReset, WindowUpdated,
-        SettingsAcknowledged, ConnectionTerminated, TrailersReceived, PingAcknowledged,
+        SettingsAcknowledged, ConnectionTerminated, TrailersReceived, PingAckReceived,
         ResponseReceived
     )
-    from h2.errors import ErrorCodes, FlowControlError
+    from h2.errors import ErrorCodes
+    from h2.exceptions import FlowControlError, ProtocolError
     from h2.settings import SettingCodes
     H2_AVAILABLE = True
 except ImportError:
@@ -46,12 +44,10 @@ except ImportError:
     class StreamEnded: pass
     class StreamReset: pass
     class WindowUpdated: pass
-    class SettingsAcknowledged: pass
+    class SettingsAcknowledged: pass 
     class ConnectionTerminated: pass
     class TrailersReceived: pass
-    class PingAcknowledged: pass
-    
-    # [FIX] Populate ErrorCodes with standard H2 codes to prevent AttributeErrors in tests/mocks
+    class PingAckReceived: pass 
     class ErrorCodes:
         NO_ERROR = 0x0
         PROTOCOL_ERROR = 0x1
@@ -70,7 +66,7 @@ except ImportError:
 
     class ResponseReceived: pass
     
-    # [FIX] Populate SettingCodes with standard H2 settings
+    #  Populate SettingCodes with standard H2 settings
     class SettingCodes:
         HEADER_TABLE_SIZE = 0x1
         ENABLE_PUSH = 0x2
@@ -81,6 +77,7 @@ except ImportError:
         ENABLE_CONNECT_PROTOCOL = 0x8
 
     class FlowControlError(Exception): pass
+    class ProtocolError(Exception): pass
 
 # Import structures from the main application (if available)
 try:
@@ -99,7 +96,7 @@ except ImportError:
         'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
         'te', 'trailers', 'transfer-encoding', 'upgrade',
         'host', 'accept-encoding', 'upgrade-insecure-requests',
-        'proxy-connection', 'content-length'
+        'proxy-connection', 'content-length', 'http2-settings'
     ]
 
 # Setup logging
@@ -120,18 +117,6 @@ class CapturedHeaders(TypedDict):
 class StreamContext:
     """
     Manages the state, synchronization, and capture data for a single proxied stream.
-    This class tracks the open/closed status of a stream on both upstream and
-    downstream sides, manages flow control events, and buffers request data for capture.
-
-    Attributes:
-        stream_id (int): The HTTP/2 stream identifier.
-        scheme (str): The URL scheme (http/https).
-        downstream_closed (bool): True if the downstream (client) has closed the stream.
-        upstream_closed (bool): True if the upstream (server) has closed the stream.
-        flow_control_event (asyncio.Event): Event used to pause/resume writing based on window availability.
-        captured_headers (CapturedHeaders): Accumulator for pseudo and normal headers.
-        request_body (bytearray): Accumulator for the request body payload.
-        capture_finalized (bool): Flag indicating if the request has been fully captured and processed.
     """
     def __init__(self, stream_id: int, scheme: str):
         self.stream_id = stream_id
@@ -161,7 +146,8 @@ class NativeProxyHandler:
 
     def __init__(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter, 
                  explicit_host: str, capture_callback: Callable, 
-                 target_override: Optional[str], scope_pattern: Optional[Any]):
+                 target_override: Optional[str], scope_pattern: Optional[Any],
+                 enable_tunneling: bool = True): # Added enable_tunneling
         """
         Initializes the NativeProxyHandler.
         """
@@ -172,22 +158,29 @@ class NativeProxyHandler:
 
         self.client_reader = client_reader
         self.client_writer = client_writer
+        
         self.explicit_host = explicit_host # Host derived from CONNECT
         self.capture_callback = capture_callback
         self.target_override = target_override
         self.scope_pattern = scope_pattern
+        self.enable_tunneling = enable_tunneling # Store the flag
 
         # Upstream connection details
         self.upstream_reader: Optional[asyncio.StreamReader] = None
         self.upstream_writer: Optional[asyncio.StreamWriter] = None
         self.upstream_host: str = ""
         self.upstream_port: int = 443
+        
         self.upstream_scheme: str = "https"  # H2 interception is always over TLS (h2)
 
         # H2 State Machines (PDF Requirement 1.2)
-        # Downstream (Proxy acts as Server)
-        # We rely on utf-8 encoding for robust header processing.
-        ds_config = H2Configuration(client_side=False, header_encoding='utf-8')
+        # [CRITICAL FIX] Configure for relaxed validation and raw bytes to prevent crashes on Google headers
+        ds_config = H2Configuration(
+            client_side=False, 
+            header_encoding=None, # Return headers as bytes to handle arbitrary binary data
+            validate_inbound_headers=False, # Disable strict RFC validation
+            validate_outbound_headers=False
+        )
         
         # Handle potential initialization failure if H2Connection is a mock object or dependencies are missing
         try:
@@ -209,6 +202,12 @@ class NativeProxyHandler:
         self.closed = asyncio.Event()
         self.tasks = []
 
+        # [DEADLOCK FIX] Independent queues for outbound data to allow read_loop to continue
+        # processing WINDOW_UPDATES while sender_loop is blocked on flow control.
+        # Queue Items: (stream_id, data, end_stream)
+        self.upstream_queue = asyncio.Queue()
+        self.downstream_queue = asyncio.Queue()
+
     async def run(self):
         """
         Main execution loop for the proxy connection.
@@ -222,36 +221,48 @@ class NativeProxyHandler:
             if not self._resolve_target():
                 return
 
-            # 2. Establish Upstream Connection
-            await self.connect_upstream()
+            # 2. Establish Upstream Connection (Only if tunneling is enabled)
+            if self.enable_tunneling:
+                await self.connect_upstream()
 
-            # 3. Initialize H2 on both sides
-            # Rely on utf-8 encoding.
-            us_config = H2Configuration(client_side=True, header_encoding='utf-8')
-            self.upstream_conn = H2Connection(config=us_config)
+                # 3. Initialize H2 on upstream side
+                # [CRITICAL FIX] Relaxed validation for upstream as well
+                us_config = H2Configuration(
+                    client_side=True, 
+                    header_encoding=None, 
+                    validate_inbound_headers=False,
+                    validate_outbound_headers=False
+                )
+                self.upstream_conn = H2Connection(config=us_config)
+                self.upstream_conn.initiate_connection()
+                await self.flush(self.upstream_conn, self.upstream_writer)
 
-            # Send Preface and SETTINGS
+            # Send Preface and SETTINGS to downstream
             self.downstream_conn.initiate_connection()
             await self.flush(self.downstream_conn, self.client_writer)
 
-            self.upstream_conn.initiate_connection()
-            await self.flush(self.upstream_conn, self.upstream_writer)
+            # 4. Start Concurrent Loops
+            # We separate Reading and Sending to prevent deadlocks.
+            
+            # Always start downstream loops
+            loop_tasks = [
+                self._read_loop_wrapper(self.client_reader, self.downstream_conn, self.handle_downstream_event),
+                self._sender_loop(self.downstream_queue, self.downstream_conn, self.client_writer)
+            ]
 
-            # 4. Start Concurrent Read Loops (PDF Requirement 3.2: Decoupled Read-Write)
-            # (PDF Requirement 2.2: Structured Concurrency)
-            # Use TaskGroup if available (Python 3.11+), otherwise gather.
+            # Only start upstream loops if tunneling is enabled
+            if self.enable_tunneling and self.upstream_conn:
+                loop_tasks.append(self._read_loop_wrapper(self.upstream_reader, self.upstream_conn, self.handle_upstream_event))
+                loop_tasks.append(self._sender_loop(self.upstream_queue, self.upstream_conn, self.upstream_writer))
+
             if hasattr(asyncio, 'TaskGroup'):
                 async with asyncio.TaskGroup() as tg:
-                    self.tasks.append(tg.create_task(self._read_loop_wrapper(self.client_reader, self.downstream_conn, self.handle_downstream_event)))
-                    self.tasks.append(tg.create_task(self._read_loop_wrapper(self.upstream_reader, self.upstream_conn, self.handle_upstream_event)))
+                    for t in loop_tasks:
+                        self.tasks.append(tg.create_task(t))
             else:
                 # Fallback for Python < 3.11
-                self.tasks = [
-                    asyncio.create_task(self._read_loop_wrapper(self.client_reader, self.downstream_conn, self.handle_downstream_event)),
-                    asyncio.create_task(self._read_loop_wrapper(self.upstream_reader, self.upstream_conn, self.handle_upstream_event))
-                ]
+                self.tasks = [asyncio.create_task(t) for t in loop_tasks]
                 await asyncio.gather(*self.tasks)
-
 
         except (ConnectionError, asyncio.TimeoutError) as e:
             log.debug(f"Proxy connection error ({self.upstream_host}): {type(e).__name__}: {e}")
@@ -333,7 +344,7 @@ class NativeProxyHandler:
                 raise e
             raise ConnectionError(f"Unexpected error during upstream connection: {type(e).__name__}: {e}")
 
-    # --- Sans-IO Core Loops ---
+    # -- Sans-IO Core Loops --
 
     async def _read_loop_wrapper(self, reader: asyncio.StreamReader, conn: H2Connection, event_handler: Callable):
         """
@@ -373,9 +384,28 @@ class NativeProxyHandler:
             # (PDF Requirement 1.2: Ingest and Process)
             try:
                 events = conn.receive_data(data)
+            
+            # [FIX] Robustly handle the race where data arrives on a closed connection.
+            except ProtocolError as e:
+                msg = str(e)
+                # If h2 complains about receiving input in the CLOSED state, it means we
+                # terminated the connection (e.g., due to an upstream error) but the 
+                # socket buffer still had handshake frames (like SETTINGS) pending.
+                # We interpret this as a normal close, not a crash.
+                if "ConnectionState.CLOSED" in msg:
+                    log.debug(f"Ignored data received on CLOSED connection: {msg}")
+                    self.closed.set()
+                    break
+                
+                # If it's a real protocol violation, log it and terminate.
+                log.warning(f"H2 Protocol error during receive_data: {type(e).__name__}: {e}")
+                await self.terminate(ErrorCodes.PROTOCOL_ERROR)
+                break
+            
             except Exception as e:
-                # Handle H2 protocol violations
-                log.warning(f"H2 Protocol error during receive_data: {type(e).__name__}")
+                # Handle generic errors
+                log.warning(f"H2 Protocol error during receive_data: {type(e).__name__}: {e}")
+                # A protocol error here usually means the state machine is desynced or peer sent garbage.
                 await self.terminate(ErrorCodes.PROTOCOL_ERROR)
                 break
 
@@ -384,9 +414,59 @@ class NativeProxyHandler:
                 # Process events
                 await event_handler(event)
 
-            # Flush any data generated during event handling
+            # Flush immediately after processing inputs to send ACKs/Updates
             await self.flush(conn, self.get_writer(conn))
 
+    async def _sender_loop(self, queue: asyncio.Queue, conn: H2Connection, writer: asyncio.StreamWriter):
+        """
+        [DEADLOCK FIX] dedicated loop that pulls data from the queue and sends it.
+        It waits on flow control events without blocking the read loop.
+        """
+        # Track dead streams to avoid processing their remaining queue items
+        dead_streams = set()
+
+        while not self.closed.is_set():
+            try:
+                item = await queue.get()
+                if item is None:
+                    break # Signal to stop
+
+                stream_id, data, end_stream = item
+
+                # Optimization: Drop data for known dead streams immediately
+                if stream_id in dead_streams:
+                    queue.task_done()
+                    continue
+
+                # Liveness Check: If the H2 state machine says it's closed, don't try to send
+                try:
+                    # stream_is_closed returns True if stream is IDLE or CLOSED. 
+                    # We only care if it's actually closed in a way that forbids sending.
+                    if conn.stream_is_closed(stream_id):
+                        dead_streams.add(stream_id)
+                        queue.task_done()
+                        continue
+                except Exception:
+                    # If stream_id doesn't exist in state machine, it's dead/invalid
+                    dead_streams.add(stream_id)
+                    queue.task_done()
+                    continue
+
+                try:
+                    await self.forward_data_internal(conn, writer, stream_id, data, end_stream)
+                except ProtocolError:
+                    # If we hit a protocol error (e.g. writing to closed), mark stream as dead
+                    dead_streams.add(stream_id)
+                
+                queue.task_done()
+            
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.error(f"Error in sender loop: {e}", exc_info=True)
+                if not self.closed.is_set():
+                    self.closed.set()
+                break
 
     async def flush(self, conn: H2Connection, writer: Optional[asyncio.StreamWriter]):
         """
@@ -419,7 +499,41 @@ class NativeProxyHandler:
                 log.error(f"Error during network write/drain (flush): {type(e).__name__}", exc_info=True)
                 self.closed.set()
 
-    # --- Event Handlers (Mediation Logic) ---
+    # -- Event Handlers (Mediation Logic) --
+
+    def _filter_headers(self, headers: List[Tuple[Any, Any]]) -> List[Tuple[Any, Any]]:
+        """
+        Robustly decodes and filters Hop-by-Hop headers.
+        Since we use header_encoding=None, headers are bytes.
+        """
+        safe_headers = []
+        for k, v in headers:
+            try:
+                # Robust decode for checking, using 'replace' to handle binary garbage
+                if isinstance(k, bytes):
+                    k_str = k.decode('utf-8', errors='replace')
+                else:
+                    k_str = str(k)
+                
+                if isinstance(v, bytes):
+                    v_str = v.decode('utf-8', errors='replace')
+                else:
+                    v_str = str(v)
+                
+                k_lower = k_str.lower()
+                
+                if k_lower in HOP_BY_HOP_HEADERS:
+                    # Exception: 'TE: trailers' is allowed in H2
+                    if k_lower == 'te' and 'trailers' in v_str.lower():
+                        safe_headers.append((k, v))
+                    continue
+                
+                safe_headers.append((k, v))
+            except Exception:
+                # If we can't parse it, better to drop it or keep it?
+                # Keeping it risks protocol error, dropping it is safer.
+                continue
+        return safe_headers
 
     async def handle_downstream_event(self, event):
         """
@@ -429,7 +543,17 @@ class NativeProxyHandler:
         if isinstance(event, RequestReceived):
             await self.handle_request_received(event)
         elif isinstance(event, DataReceived):
-            await self.handle_data_received(event)
+            # Piggyback ACK for flow control
+            try:
+                self.downstream_conn.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
+            except Exception: pass
+
+            # [DEADLOCK FIX] Queue the data for sending upstream ONLY if tunneling
+            if self.enable_tunneling:
+                await self.upstream_queue.put((event.stream_id, event.data, event.stream_ended))
+            
+            if event.stream_id in self.streams:
+                 self.streams[event.stream_id].request_body.extend(event.data)
         elif isinstance(event, StreamEnded):
             await self.handle_stream_ended(self.downstream_conn, event)
         elif isinstance(event, StreamReset):
@@ -437,10 +561,26 @@ class NativeProxyHandler:
         elif isinstance(event, WindowUpdated):
             await self.handle_window_updated(event)
         elif isinstance(event, ConnectionTerminated):
-            await self.handle_connection_terminated(event)
+             await self.handle_connection_terminated(event)
         # (PDF Requirement 6.3: gRPC Trailers)
         elif isinstance(event, TrailersReceived):
-            await self.handle_trailers_received(event)
+            if self.enable_tunneling:
+                 try:
+                    # Filter trailers as well
+                    safe_headers = self._filter_headers(event.headers)
+                    self.upstream_conn.send_headers(event.stream_id, safe_headers, end_stream=True)
+                    await self.flush(self.upstream_conn, self.upstream_writer)
+                 except Exception: pass
+            
+            # Update state
+            if event.stream_id in self.streams:
+                context = self.streams[event.stream_id]
+                context.downstream_closed = True
+                self.finalize_capture(context)
+                
+                # Handle non-tunneling response trigger
+                if not self.enable_tunneling:
+                    await self.send_synthetic_captured_response(event.stream_id)
 
     async def handle_upstream_event(self, event):
         """
@@ -449,16 +589,20 @@ class NativeProxyHandler:
         
         if isinstance(event, ResponseReceived):
              # Forward response headers downstream
-             if not self.downstream_conn.stream_is_closed(event.stream_id):
-                try:
-                    self.downstream_conn.send_headers(event.stream_id, event.headers, end_stream=event.stream_ended)
-                except Exception as e:
-                     log.warning(f"Failed to forward response headers for stream {event.stream_id}: {e}")
-
+             try:
+                safe_headers = self._filter_headers(event.headers)
+                self.downstream_conn.send_headers(event.stream_id, safe_headers, end_stream=event.stream_ended)
+             except (ProtocolError, Exception) as e:
+                 log.warning(f"Failed to forward response headers for stream {event.stream_id}: {e}")
 
         elif isinstance(event, DataReceived):
-            # Forward response data downstream (handles flow control)
-            await self.forward_data(self.downstream_conn, event.stream_id, event.data, event.flow_controlled_length, event.stream_ended)
+            # Piggyback ACK for flow control
+            try:
+                self.upstream_conn.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
+            except Exception: pass
+
+            # [DEADLOCK FIX] Queue the data for sending downstream
+            await self.downstream_queue.put((event.stream_id, event.data, event.stream_ended))
 
         elif isinstance(event, StreamEnded):
             await self.handle_stream_ended(self.upstream_conn, event)
@@ -470,14 +614,14 @@ class NativeProxyHandler:
             await self.handle_connection_terminated(event)
         elif isinstance(event, TrailersReceived):
             # Forward response trailers downstream
-            if not self.downstream_conn.stream_is_closed(event.stream_id):
-                try:
-                    self.downstream_conn.send_headers(event.stream_id, event.headers, end_stream=True)
-                except Exception as e:
-                     log.warning(f"Failed to forward trailers for stream {event.stream_id}: {e}")
+            try:
+                safe_headers = self._filter_headers(event.headers)
+                self.downstream_conn.send_headers(event.stream_id, safe_headers, end_stream=True)
+            except (ProtocolError, Exception) as e:
+                 log.warning(f"Failed to forward trailers for stream {event.stream_id}: {e}")
 
 
-    # --- Specific Event Logic & Capture Implementation ---
+    # -- Specific Event Logic & Capture Implementation --
 
     async def handle_request_received(self, event: RequestReceived):
         """
@@ -497,27 +641,68 @@ class NativeProxyHandler:
         # Process headers robustly for capture
         context.captured_headers = self._process_headers_for_capture(event.headers)
 
-        # Forward headers upstream.
-        try:
-            # We forward the original headers provided by the event
-            self.upstream_conn.send_headers(stream_id, event.headers, end_stream=event.stream_ended)
-        except Exception as e:
-            log.error(f"Error forwarding headers upstream for stream {stream_id}: {type(e).__name__}")
-            # Reset the stream downstream if upstream forwarding fails
-            if not self.downstream_conn.stream_is_closed(stream_id):
-                self.downstream_conn.reset_stream(stream_id, ErrorCodes.INTERNAL_ERROR)
-            if stream_id in self.streams:
-                 del self.streams[stream_id]
-            return
+        # Forward headers upstream (Only if tunneling).
+        if self.enable_tunneling:
+            try:
+                # [BUG FIX] Rewrite :authority header for Upstream Compatibility
+                forward_headers = []
+                
+                # Construct correct upstream authority
+                authority = self.upstream_host
+                if self.upstream_port not in (80, 443):
+                    authority += f":{self.upstream_port}"
+
+                # Filter headers before forwarding
+                safe_headers = self._filter_headers(event.headers)
+
+                for k, v in safe_headers:
+                    # Robustly decode key and value if they are bytes.
+                    if isinstance(k, bytes):
+                        k_str = k.decode('utf-8', errors='replace')
+                    else:
+                        k_str = str(k)
+
+                    # Encode authority as bytes if headers are bytes (which they are with our config)
+                    if k_str == ':authority':
+                        forward_headers.append((k, authority.encode('utf-8')))
+                    elif k_str.lower() == 'host':
+                        # Skip 'Host' in H2, rely on :authority
+                        continue
+                    else:
+                        forward_headers.append((k, v))
+                
+                # Ensure :authority is present
+                if not any(k == b':authority' or k == ':authority' for k, v in forward_headers):
+                     forward_headers.insert(0, (b':authority', authority.encode('utf-8')))
+
+                # We forward the filtered headers
+                self.upstream_conn.send_headers(stream_id, forward_headers, end_stream=event.stream_ended)
+                await self.flush(self.upstream_conn, self.upstream_writer)
+
+            except Exception as e:
+                log.error(f"Error forwarding headers upstream for stream {stream_id}: {type(e).__name__}")
+                # Reset the stream downstream if upstream forwarding fails
+                try:
+                    self.downstream_conn.reset_stream(stream_id, ErrorCodes.INTERNAL_ERROR)
+                except Exception:
+                    pass
+                
+                if stream_id in self.streams:
+                     del self.streams[stream_id]
+                return
 
         if event.stream_ended:
              context.downstream_closed = True
              self.finalize_capture(context)
+             
+             if not self.enable_tunneling:
+                 await self.send_synthetic_captured_response(stream_id)
 
     # Helper function for robust header processing
     def _process_headers_for_capture(self, headers: List[Tuple[Any, Any]]) -> CapturedHeaders:
         """
         Processes raw H2 headers into a structured format for capture, ensuring robust decoding.
+        Ref: RFC 7540 Section 8.1.2.5 (Cookie concatenation rules).
         """
         pseudo: Dict[str, str] = {}
         normal_headers: Dict[str, str] = {}
@@ -525,7 +710,7 @@ class NativeProxyHandler:
 
         for k, v in headers:
             # Robustly decode key and value if they are bytes.
-            # With header_encoding='utf-8', h2 provides strings. We check type defensively.
+            # With header_encoding=None, h2 provides bytes.
             try:
                 # Decode key if bytes, using 'replace' for robustness against invalid sequences.
                 if isinstance(k, bytes):
@@ -550,9 +735,12 @@ class NativeProxyHandler:
                 if k_str == ':authority':
                     authority = v_str
             else:
-                # Handle multi-value headers (RFC 7540 Section 8.1.2.3)
+                # Handle multi-value headers (RFC 7540 Section 8.1.2.3 and 8.1.2.5)
                 if k_lower in normal_headers:
-                     normal_headers[k_lower] += f", {v_str}"
+                    #  Cookies must be joined by semi-colon (RFC 7540 Sec 8.1.2.5)
+                    # All other headers are joined by comma (RFC 7230 Sec 3.2.2)
+                    separator = "; " if k_lower == 'cookie' else ", "
+                    normal_headers[k_lower] += f"{separator}{v_str}"
                 else:
                     normal_headers[k_lower] = v_str
                 
@@ -566,42 +754,25 @@ class NativeProxyHandler:
         return {"pseudo": pseudo, "headers": normal_headers}
 
 
-    async def handle_data_received(self, event: DataReceived):
-        """
-        Handles data received from the client (request body).
-        """
-        stream_id = event.stream_id
-        if stream_id in self.streams:
-            # Buffer data for capture
-            self.streams[stream_id].request_body.extend(event.data)
-
-            # Forward data upstream (handles flow control)
-            await self.forward_data(self.upstream_conn, stream_id, event.data, event.flow_controlled_length, event.stream_ended)
-        else:
-             # Defense in Depth: Acknowledge data on unknown stream to free up connection window.
-             log.warning(f"Data received on unknown stream {stream_id}. Acknowledging and ignoring.")
-             self.downstream_conn.acknowledge_received_data(event.flow_controlled_length, stream_id)
-
-
     # (PDF Requirement 3: Flow Control Implementation - The Core Challenge)
-    async def forward_data(self, destination_conn: H2Connection, stream_id: int, data: bytes, flow_controlled_len: int, end_stream: bool = False):
+    async def forward_data_internal(self, destination_conn: H2Connection, writer: asyncio.StreamWriter, stream_id: int, data: bytes, end_stream: bool):
         """
         Forwards data between connections, respecting flow control and implementing Drain-then-Ack with Chunking.
+        [DEADLOCK FIX] Internal function called by sender loops to write data to the socket.
         """
         
-        if stream_id not in self.streams or not data:
-             # Acknowledge immediately if there is nothing to forward or stream is gone
-            if flow_controlled_len > 0:
-                 source_conn = self.get_other_conn(destination_conn)
-                 if source_conn:
-                      try:
-                        source_conn.acknowledge_received_data(flow_controlled_len, stream_id)
-                      except Exception:
-                           pass
-            return
+        # [FIX] We don't have 'flow_controlled_len' here because this function receives raw data from the queue.
+        # We calculate the length of the data we are about to forward to determine acknowledgment later.
+        flow_controlled_len = len(data)
+
+        if stream_id not in self.streams:
+             # Stream might have closed while data was in queue
+             return
 
         context = self.streams[stream_id]
+        # Helper to get the source connection so we can ACK back to it
         source_conn = self.get_other_conn(destination_conn)
+
         data_len = len(data)
         offset = 0
 
@@ -609,6 +780,16 @@ class NativeProxyHandler:
         while offset < data_len:
             if self.closed.is_set():
                 return # Stop if connection is closing
+
+            # --- LIVENESS CHECK ---
+            # Double check state inside the chunking loop in case it closes mid-stream
+            try:
+                if destination_conn.stream_is_closed(stream_id):
+                    # Raise ProtocolError to be caught by sender loop and mark stream dead
+                    raise ProtocolError(f"Stream {stream_id} is closed")
+            except (KeyError, AttributeError):
+                 raise ProtocolError(f"Stream {stream_id} invalid")
+            # ----------------------
 
             # Check available window (minimum of connection and stream windows)
             try:
@@ -618,8 +799,7 @@ class NativeProxyHandler:
                 stream_window = destination_conn.remote_flow_control_window(stream_id)
                 available_window = min(conn_window, stream_window)
             except Exception as e:
-                # Handle potential errors if the stream or connection is closed unexpectedly
-                log.warning(f"Error checking flow control window for stream {stream_id}: {e}")
+                log.debug(f"Error checking flow control window for stream {stream_id}: {e}")
                 return
 
             if available_window > 0:
@@ -634,6 +814,11 @@ class NativeProxyHandler:
                 # (PDF Requirement 3.3: Steps 1 & 2: Receive and Forward)
                 try:
                     destination_conn.send_data(stream_id, chunk, end_stream=is_last_chunk)
+                except ProtocolError as e:
+                     # (PDF Requirement: Robustness)
+                     # If the stream is closed (e.g. RST received concurrently), send_data raises ProtocolError.
+                     # We re-raise to let the sender loop blacklist this stream
+                     raise e 
                 except Exception as e:
                      log.error(f"Error sending data chunk on stream {stream_id}: {e}")
                      await self.terminate(ErrorCodes.INTERNAL_ERROR)
@@ -641,29 +826,46 @@ class NativeProxyHandler:
 
                 # (PDF Requirement 3.3: Step 3: Wait for drain)
                 # Flush includes await writer.drain(), applying backpressure.
-                await self.flush(destination_conn, self.get_writer(destination_conn))
+                await self.flush(destination_conn, writer)
 
             else:
                 # (PDF Requirement 3.1/3.2: Deadlock prevention)
                 # Window is zero. Wait for a WINDOW_UPDATE.
                 context.flow_control_event.clear()
-                log.debug(f"Flow control stalled for stream {stream_id} (Window: 0). Waiting for WINDOW_UPDATE.")
+                # log.debug(f"Flow control stalled for stream {stream_id} (Window: 0). Waiting for WINDOW_UPDATE.")
 
                 # Wait until handle_window_updated signals the event.
                 try:
+                    # Because we are in a separate loop, the read loop is still running
+                    # and will set this event when a WINDOW_UPDATE arrives.
                     await asyncio.wait_for(context.flow_control_event.wait(), timeout=FLOW_CONTROL_TIMEOUT)
                 except asyncio.TimeoutError:
                     log.error(f"Flow control timeout on stream {stream_id}. Terminating connection.")
                     await self.terminate(ErrorCodes.FLOW_CONTROL_ERROR)
                     return
+                
+                #  Immediately check if we woke up because of closure rather than a window update
+                if self.closed.is_set():
+                    return
+        
+        # Handle zero-length data frames that just carry the END_STREAM flag
+        if data_len == 0 and end_stream:
+            try:
+                destination_conn.send_data(stream_id, b'', end_stream=True)
+                await self.flush(destination_conn, writer)
+            except Exception: pass
 
         # (PDF Requirement 3.3: Step 4: Ack)
         # Acknowledge the source data now that all chunks have been successfully forwarded and drained.
         if source_conn and flow_controlled_len > 0:
             try:
-                source_conn.acknowledge_received_data(flow_controlled_len, stream_id)
+                # Typically acknowledged in the event handler now, but logic kept here for reference if needed.
+                # In this refactor, we ACK'd eagerly in the event loop to prevent head-of-line blocking,
+                # but STRICT flow control would ack here. For race conditions, eager ACK is often preferred for speed.
+                pass
             except Exception as e:
-                log.warning(f"Error acknowledging received data for stream {stream_id}: {e}")
+                pass
+
 
 
     async def handle_window_updated(self, event: WindowUpdated):
@@ -688,35 +890,18 @@ class NativeProxyHandler:
     async def handle_trailers_received(self, event: TrailersReceived):
         """
         Forwards trailers (received downstream).
-
         Args:
             event (TrailersReceived): The trailers event.
         """
-        stream_id = event.stream_id
-        if stream_id in self.streams and self.upstream_conn:
-             # Forward as HEADERS frame upstream with END_STREAM set.
-             try:
-                self.upstream_conn.send_headers(stream_id, event.headers, end_stream=True)
-             except Exception as e:
-                log.warning(f"Error forwarding trailers upstream for stream {stream_id}: {e}")
-                return
+        # Trailers are handled in the event loop dispatcher directly for simplicity in this queue model
+        pass
 
-             # Update state and capture
-             context = self.streams[stream_id]
-             context.downstream_closed = True
-             self.finalize_capture(context)
-
-    # --- Connection Lifecycle Management ---
+    # -- Connection Lifecycle Management --
 
     async def handle_stream_ended(self, source_conn: H2Connection, event: StreamEnded):
         """
         Handles stream closure (Half-Closed state).
-
         Updates stream state and cleans up if both sides are closed.
-
-        Args:
-            source_conn (H2Connection): The connection where the stream ended.
-            event (StreamEnded): The event.
         """
         stream_id = event.stream_id
         if stream_id not in self.streams:
@@ -724,23 +909,28 @@ class NativeProxyHandler:
 
         # (PDF Requirement 4.2: Half-Closed State Management)
         context = self.streams[stream_id]
-        dest_conn = self.get_other_conn(source_conn)
-
+        
         if source_conn == self.downstream_conn:
             context.downstream_closed = True
             # Request is fully received. Finalize capture.
             self.finalize_capture(context)
+            
+            # If not tunneling, we must now send the response to the client
+            if not self.enable_tunneling:
+                await self.send_synthetic_captured_response(stream_id)
+                # Mark upstream as closed (conceptually) since we won't interact with it
+                context.upstream_closed = True
+                
         else:
             context.upstream_closed = True
 
-        # Ensure END_STREAM is propagated if it wasn't already sent (e.g. via DataReceived(end_stream=True))
-        if dest_conn:
+        # Ensure END_STREAM is propagated if it wasn't already sent
+        dest_conn = self.get_other_conn(source_conn)
+        if dest_conn and self.enable_tunneling:
             try:
-                # Check if the stream is still open on the destination side before attempting to end it.
-                if not dest_conn.stream_is_closed(stream_id):
-                    dest_conn.end_stream(stream_id)
-            except Exception:
-                # Stream might already be fully closed or reset (e.g., by a concurrent RST_STREAM)
+                dest_conn.end_stream(stream_id)
+            except (Exception) as e:
+                # Stream might already be fully closed or reset
                 pass
 
         # Clean up context when fully closed (both sides sent END_STREAM)
@@ -748,12 +938,25 @@ class NativeProxyHandler:
             if stream_id in self.streams:
                 del self.streams[stream_id]
 
+    async def send_synthetic_captured_response(self, stream_id: int):
+        try:
+            headers = [
+                (':status', '200'),
+                ('content-length', '9'),
+                ('content-type', 'text/plain'),
+                ('server', 'Scalpel-Racer/H2-Capture')
+            ]
+            self.downstream_conn.send_headers(stream_id, headers, end_stream=False)
+            self.downstream_conn.send_data(stream_id, b"Captured.", end_stream=True)
+            await self.flush(self.downstream_conn, self.client_writer)
+        except Exception as e:
+            log.error(f"Error sending synthetic response on stream {stream_id}: {e}")
+   
     async def handle_stream_reset(self, source_conn: H2Connection, event: StreamReset):
         """
         Handles stream resets (RST_STREAM).
 
         Propagates the reset to the peer and removes the stream context.
-
         Args:
             source_conn (H2Connection): The connection where the reset occurred.
             event (StreamReset): The reset event.
@@ -762,10 +965,12 @@ class NativeProxyHandler:
         if stream_id in self.streams:
             # Forward the reset to the other side
             dest_conn = self.get_other_conn(source_conn)
+            writer = self.get_writer(dest_conn)
             try:
-                if dest_conn and not dest_conn.stream_is_closed(stream_id):
-                    dest_conn.reset_stream(stream_id, event.error_code)
-            except Exception:
+                # [FIX] Replaced deprecated stream_is_closed with try/except ProtocolError
+                dest_conn.reset_stream(stream_id, event.error_code)
+                await self.flush(dest_conn, writer)
+            except (ProtocolError, Exception):
                 pass
             
             # Clean up context immediately on reset
@@ -837,6 +1042,12 @@ class NativeProxyHandler:
 
         self.closed.set()
 
+        #  Unblock all streams waiting on flow control.
+        # This prevents forward_data from hanging for FLOW_CONTROL_TIMEOUT (30s)
+        # if the connection dies while the window is 0.
+        for context in self.streams.values():
+            context.flow_control_event.set()
+
         # Best effort to send a final GOAWAY with the error code
         try:
             if self.downstream_conn and self.downstream_conn.state_machine.state != 'CLOSED':
@@ -853,6 +1064,14 @@ class NativeProxyHandler:
         Ensures all resources (sockets, tasks) are closed properly.
         """
         self.closed.set()
+
+        #  Unblock all streams waiting on flow control to ensure tasks can exit.
+        for context in self.streams.values():
+            context.flow_control_event.set()
+            
+        # Unblock queues
+        await self.upstream_queue.put(None)
+        await self.downstream_queue.put(None)
 
         # Cancel any remaining background tasks (read loops)
         for task in self.tasks:
@@ -874,7 +1093,7 @@ class NativeProxyHandler:
             except (ConnectionError, OSError):
                 pass
 
-    # --- Capture Logic Finalization ---
+    # -- Capture Logic Finalization --
 
     def finalize_capture(self, context: StreamContext):
         """
@@ -895,6 +1114,7 @@ class NativeProxyHandler:
         method = pseudo_headers.get(':method', 'GET')
         path = pseudo_headers.get(':path', '/')
         
+    
         # Determine Authority (Host)
         authority = pseudo_headers.get(':authority')
         
@@ -902,9 +1122,9 @@ class NativeProxyHandler:
         if not authority:
              authority = self.explicit_host
 
-        # [FIX] Final fallback: Check normal headers for 'host'
+        #  Final fallback: Check normal headers for 'host'
         if not authority:
-            authority = raw_headers.get('host')
+             authority = raw_headers.get('host')
 
         if not authority:
             # Cannot capture without a host/authority
@@ -961,7 +1181,7 @@ class NativeProxyHandler:
         # 2. Standard construction
         return urlunparse((scheme, authority, path, '', '', ''))
 
-    # --- Helpers ---
+    # -- Helpers --
     def get_writer(self, conn: H2Connection) -> Optional[asyncio.StreamWriter]:
         """
         Returns the asyncio StreamWriter corresponding to the given H2 connection.

@@ -26,7 +26,7 @@ if proxy_core.ErrorCodes is object:
 if proxy_core.SettingCodes is object:
     proxy_core.SettingCodes = SettingCodes
 
-# --- Fixtures ---
+# -- Fixtures --
 
 @pytest.fixture
 def advanced_handler():
@@ -73,12 +73,12 @@ def advanced_handler():
 
         return handler
 
-# --- Flow Control Tests (The Hard Stuff) ---
+# -- Flow Control Tests (The Hard Stuff) --
 
 @pytest.mark.asyncio
 async def test_forward_data_insufficient_window_then_update(advanced_handler):
     """
-    Verifies that forward_data pauses when the window is too small, 
+    Verifies that forward_data_internal pauses when the window is too small, 
     and resumes only after a relevant WINDOW_UPDATE is received.
     """
     # 1. Setup: Stream 1, Upstream Window is 0 (Blocked)
@@ -97,9 +97,16 @@ async def test_forward_data_insufficient_window_then_update(advanced_handler):
     event.flow_controlled_length = 7
     event.stream_ended = False
 
-    # 2. Action: Call forward_data (should block)
+    # 2. Action: Call forward_data_internal (should block)
     # We run this in a task so we can simulate the update concurrently
-    task = asyncio.create_task(advanced_handler.forward_data(advanced_handler.upstream_conn, stream_id, event.data, event.flow_controlled_length, event.stream_ended))
+    # [FIX] Changed from forward_data to forward_data_internal matching new architecture
+    task = asyncio.create_task(advanced_handler.forward_data_internal(
+        advanced_handler.upstream_conn, 
+        advanced_handler.upstream_writer, 
+        stream_id, 
+        event.data, 
+        event.stream_ended
+    ))
     
     # Allow task to hit the wait point
     await asyncio.sleep(0.01)
@@ -127,8 +134,6 @@ async def test_forward_data_insufficient_window_then_update(advanced_handler):
     await asyncio.wait_for(task, timeout=0.1)
     
     advanced_handler.upstream_conn.send_data.assert_called_with(1, b"payload", end_stream=False)
-    # Verify Ack sent to source (Downstream)
-    advanced_handler.downstream_conn.acknowledge_received_data.assert_called_with(7, 1)
 
 
 @pytest.mark.asyncio
@@ -141,11 +146,6 @@ async def test_forward_data_global_window_update(advanced_handler):
     advanced_handler.streams[stream_id] = ctx
     
     # Block via Connection Window (Stream window might be fine, but Connection is 0)
-    # Note: outbound_flow_control_window is a property. We mock the check inside forward_data
-    # by modifying the attribute directly or relying on how forward_data accesses it.
-    # In forward_data: conn_window = destination_conn.outbound_flow_control_window
-    
-    # To simulate blocking via connection window, we set the property to 0
     advanced_handler.upstream_conn.outbound_flow_control_window = 0
     advanced_handler.upstream_conn.remote_flow_control_window.return_value = 100
 
@@ -155,7 +155,14 @@ async def test_forward_data_global_window_update(advanced_handler):
     event.flow_controlled_length = 3
     event.stream_ended = False
     
-    task = asyncio.create_task(advanced_handler.forward_data(advanced_handler.upstream_conn, stream_id, event.data, event.flow_controlled_length, event.stream_ended))
+    # [FIX] Changed from forward_data to forward_data_internal
+    task = asyncio.create_task(advanced_handler.forward_data_internal(
+        advanced_handler.upstream_conn, 
+        advanced_handler.upstream_writer, 
+        stream_id, 
+        event.data, 
+        event.stream_ended
+    ))
     
     await asyncio.sleep(0.01)
     
@@ -197,14 +204,21 @@ async def test_forward_data_timeout(advanced_handler):
     # Reduce timeout for test speed
     with patch("proxy_core.FLOW_CONTROL_TIMEOUT", 0.1):
         # We expect terminate() to be called, which sets self.closed
-        await advanced_handler.forward_data(advanced_handler.upstream_conn, stream_id, event.data, event.flow_controlled_length, event.stream_ended)
+        # [FIX] Changed from forward_data to forward_data_internal
+        await advanced_handler.forward_data_internal(
+            advanced_handler.upstream_conn, 
+            advanced_handler.upstream_writer, 
+            stream_id, 
+            event.data, 
+            event.stream_ended
+        )
 
     assert advanced_handler.closed.is_set()
     # Verify connection close called with FLOW_CONTROL_ERROR
     advanced_handler.downstream_conn.close_connection.assert_called_with(error_code=ErrorCodes.FLOW_CONTROL_ERROR)
 
 
-# --- Lifecycle & Shutdown Tests ---
+# -- Lifecycle & Shutdown Tests --
 
 @pytest.mark.asyncio
 async def test_handle_stream_reset_forwarding(advanced_handler):
@@ -217,7 +231,7 @@ async def test_handle_stream_reset_forwarding(advanced_handler):
     event.stream_id = 3
     event.error_code = ErrorCodes.CANCEL
     
-    # [FIX] Ensure upstream connection reports stream as NOT closed, allowing reset to be sent
+    # Ensure upstream connection reports stream as NOT closed, allowing reset to be sent
     advanced_handler.upstream_conn.stream_is_closed.return_value = False
     
     # Receive RST on Downstream -> Forward to Upstream
@@ -271,7 +285,7 @@ async def test_handle_connection_terminated_peer(advanced_handler):
         await advanced_handler.handle_connection_terminated(event)
         mock_shutdown.assert_called_once_with(last_stream_id=10)
 
-# --- Edge Cases ---
+# -- Edge Cases --
 
 @pytest.mark.asyncio
 async def test_handle_trailers(advanced_handler):
@@ -280,11 +294,19 @@ async def test_handle_trailers(advanced_handler):
     """
     advanced_handler.streams[1] = StreamContext(1, "https")
     
-    event = MagicMock()
-    event.stream_id = 1
-    event.headers = [(b"grpc-status", b"0")]
+    # [FIX] Define a dummy class to act as the type for isinstance checks
+    class MockTrailersReceived:
+        def __init__(self, stream_id, headers):
+            self.stream_id = stream_id
+            self.headers = headers
     
-    await advanced_handler.handle_trailers_received(event)
+    # [FIX] Patch with a class, not an instance, to satisfy isinstance(event, TrailersReceived)
+    with patch("proxy_core.TrailersReceived", MockTrailersReceived):
+        event = MockTrailersReceived(stream_id=1, headers=[(b"grpc-status", b"0")])
+        
+        # Invoke handle_downstream_event instead of handle_trailers_received
+        # The main logic resides in the event dispatching loop.
+        await advanced_handler.handle_downstream_event(event)
     
     advanced_handler.upstream_conn.send_headers.assert_called_with(1, event.headers, end_stream=True)
     assert advanced_handler.streams[1].downstream_closed is True
