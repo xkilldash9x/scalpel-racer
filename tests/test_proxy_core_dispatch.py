@@ -122,13 +122,16 @@ async def test_handle_upstream_dispatch(dispatch_handler):
     # 1. ResponseReceived (Direct header send)
     evt_resp = create_event(ResponseReceived, stream_id=1, headers=[], stream_ended=False)
     
+    # [FIX] Ensure downstream is considered open so headers are sent
+    dispatch_handler.downstream_conn.stream_is_closed.return_value = False
+    
     await dispatch_handler.handle_upstream_event(evt_resp)
     dispatch_handler.downstream_conn.send_headers.assert_called_with(1, [], end_stream=False)
 
     # 2. DataReceived
-    evt_data = create_event(DataReceived, stream_id=1, data=b'', flow_controlled_length=0)
+    evt_data = create_event(DataReceived, stream_id=1, data=b'', flow_controlled_length=0, stream_ended=False)
     await dispatch_handler.handle_upstream_event(evt_data)
-    dispatch_handler.forward_data.assert_awaited_with(dispatch_handler.downstream_conn, evt_data)
+    dispatch_handler.forward_data.assert_awaited_with(dispatch_handler.downstream_conn, 1, b'', 0, False)
 
     # 3. StreamEnded
     evt_end = create_event(StreamEnded, stream_id=1)

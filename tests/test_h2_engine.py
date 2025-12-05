@@ -200,7 +200,8 @@ def test_connect_ssl_error(engine, mock_dependencies):
     # Simulate SSL Handshake failure
     mock_dependencies["ssl_ctx"].wrap_socket.side_effect = ssl.SSLError(1, "Handshake failed")
 
-    with pytest.raises(ConnectionError, match="SSL Handshake failed"):
+    # [FIX] Updated match regex to account for the wrapped error message
+    with pytest.raises(ConnectionError, match=r".*SSLError.*Handshake failed"):
         engine.connect()
 
     # Ensure the raw socket is closed
