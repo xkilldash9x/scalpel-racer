@@ -449,10 +449,22 @@ class CaptureServer:
             # [FIX: CRITICAL B01] Use StreamWriter.start_tls if available (Python 3.11+)
             if hasattr(client_writer, 'start_tls'):
                 try:
+                    # Note: StreamWriter.start_tls signature does not include server_side in 3.11+
+                    # It relies on the ssl_context being configured for server side.
                     await asyncio.wait_for(
-                        client_writer.start_tls(ssl_context, server_side=True),
+                        client_writer.start_tls(ssl_context),
                         timeout=TLS_HANDSHAKE_TIMEOUT
                     )
+                except TypeError:
+                     # Fallback if signature differs in some versions or mocked environments
+                     try:
+                        await asyncio.wait_for(
+                            client_writer.start_tls(ssl_context, server_side=True),
+                            timeout=TLS_HANDSHAKE_TIMEOUT
+                        )
+                     except Exception as ex:
+                         print(f"[!] TLS handshake failed (StreamWriter.start_tls fallback): {ex}")
+                         return
                 except Exception as e:
                     print(f"[!] TLS handshake failed (StreamWriter.start_tls): {e}")
                     return
