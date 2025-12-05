@@ -1,3 +1,4 @@
+# tests/test_proxy_core_io.py
 import pytest
 import asyncio
 import ssl
@@ -11,7 +12,9 @@ def io_handler():
     """
     Instantiates a NativeProxyHandler with mocks suitable for testing IO loops.
     """
-    client_reader = AsyncMock()
+    # Use MagicMock to strictly control async behavior in tests and avoid
+    # generating unused AsyncMocks that might trigger warnings.
+    client_reader = MagicMock()
     
     # Explicitly define writer as MagicMock (sync methods like close/write)
     # but attach AsyncMock for async methods (drain, wait_closed).
@@ -50,6 +53,7 @@ async def test_run_orchestration_success(io_handler):
     io_handler.upstream_writer.is_closing.return_value = False
     
     io_handler.flush = AsyncMock()
+    io_handler._sender_loop = AsyncMock() # Mock the sender loop method
 
     with patch("asyncio.TaskGroup") as MockTaskGroup:
         tg_instance = MockTaskGroup.return_value
@@ -61,7 +65,8 @@ async def test_run_orchestration_success(io_handler):
         await io_handler.run()
 
     io_handler.connect_upstream.assert_called_once()
-    assert tg_instance.create_task.call_count == 2
+    # Expect 4 tasks (2 reads + 2 writes)
+    assert tg_instance.create_task.call_count == 4
 
 @pytest.mark.asyncio
 async def test_connect_upstream_success(io_handler):
@@ -112,12 +117,20 @@ async def test_run_connection_failure(io_handler):
 
 @pytest.mark.asyncio
 async def test_read_loop_data_flow(io_handler):
-    mock_reader = AsyncMock()
-    mock_reader.read.side_effect = [b"DATA", b""]
+    # Setup data flow: DATA -> EOF
+    f_data = asyncio.Future()
+    f_data.set_result(b"DATA")
+    f_eof = asyncio.Future()
+    f_eof.set_result(b"")
+    
+    mock_reader = MagicMock()
+    # read() returns a Future, which is awaitable
+    mock_reader.read.side_effect = [f_data, f_eof]
     
     mock_conn = MagicMock()
     mock_conn.receive_data.return_value = [] 
     
+    # Use AsyncMock for flush to properly handle the await in read_loop
     io_handler.flush = AsyncMock()
     
     # Use simple async function to avoid AsyncMock overhead for simple callback
@@ -126,7 +139,10 @@ async def test_read_loop_data_flow(io_handler):
     await io_handler.read_loop(mock_reader, mock_conn, noop_handler)
 
     mock_conn.receive_data.assert_called_with(b"DATA")
-    io_handler.flush.assert_called()
+    
+    # Verify flush was awaited
+    io_handler.flush.assert_awaited()
+    
     assert io_handler.closed.is_set()
 
 @pytest.mark.asyncio
@@ -146,8 +162,12 @@ async def test_read_loop_idle_timeout(io_handler):
 
 @pytest.mark.asyncio
 async def test_read_loop_protocol_error(io_handler):
-    mock_reader = AsyncMock()
-    mock_reader.read.return_value = b"BAD_DATA"
+    # Setup data to trigger processing
+    f_data = asyncio.Future()
+    f_data.set_result(b"BAD_DATA")
+    
+    mock_reader = MagicMock()
+    mock_reader.read.return_value = f_data
     
     mock_conn = MagicMock()
     mock_conn.receive_data.side_effect = Exception("Protocol Violation")
@@ -160,6 +180,7 @@ async def test_read_loop_protocol_error(io_handler):
 
     io_handler.terminate = mock_terminate
     
+    # Bypass wait_for to ensure exceptions propagate immediately
     async def bypass_wait_for(coro, timeout):
         return await coro
 

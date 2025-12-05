@@ -1,7 +1,8 @@
+# tests/test_b01_tls_interception.py
 import pytest
 import asyncio
 import ssl
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, AsyncMock
 import scalpel_racer
 
 try:
@@ -66,6 +67,9 @@ async def test_b01_handle_connect_stream_rebinding(monkeypatch):
     mock_protocol.connection_made(initial_transport)
 
     initial_writer = asyncio.StreamWriter(initial_transport, mock_protocol, managed_reader, loop)
+    # [DEADLOCK FIX] Mock wait_closed on the initial writer to prevent hanging on the mock transport
+    initial_writer.wait_closed = AsyncMock()
+    
     initial_reader_arg = managed_reader
 
     # [FIX] Pre-fill the reader with all data to avoid timing issues in mock_wait_for
@@ -81,9 +85,21 @@ async def test_b01_handle_connect_stream_rebinding(monkeypatch):
     
     connect_target = "secure.example.com:443"
     
+    # [DEADLOCK FIX] Patch asyncio.StreamWriter class. 
+    # When handle_connect creates the *new* writer for the TLS tunnel, it gets a Mock 
+    # with a mocked wait_closed(), preventing the deadlock.
     with patch.object(scalpel_racer, 'CA_MANAGER', mock_ca), \
-         patch('asyncio.wait_for', side_effect=mock_wait_for):
+         patch('asyncio.wait_for', side_effect=mock_wait_for), \
+         patch('asyncio.StreamWriter') as MockStreamWriterClass:
         
+        # Configure the mock writer instance returned by the class constructor
+        mock_internal_writer = MockStreamWriterClass.return_value
+        mock_internal_writer.wait_closed = AsyncMock()
+        mock_internal_writer.drain = AsyncMock()
+        mock_internal_writer.is_closing.return_value = False
+        # Ensure get_extra_info returns correct protocol for ALPN detection if needed
+        mock_internal_writer.get_extra_info.return_value = MagicMock(selected_alpn_protocol=lambda: None)
+
         await server.handle_connect(initial_reader_arg, initial_writer, connect_target)
 
     # Assertions

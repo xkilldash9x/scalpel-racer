@@ -36,8 +36,7 @@ class CapturedRequest:
     """
     # Add attributes expected by the engine
     def __init__(self, id=0, method="GET", url="", headers=None, body=b""):
-        self.id = id; self.method = method; self.url = url
-        self.headers = headers or {}; self.body = body; self.edited_body = None
+        self.id = id; self.method = method; self.url = url; self.headers = headers or {}; self.body = body; self.edited_body = None
 
     def get_attack_payload(self) -> bytes:
         return self.edited_body if self.edited_body is not None else self.body

@@ -54,10 +54,16 @@ class CapturedRequest:
     pass 
 
 MAX_RESPONSE_BODY_READ = 1024 * 1024
+HOP_BY_HOP_HEADERS = [
+    'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+    'te', 'trailers', 'transfer-encoding', 'upgrade',
+    'host', 'accept-encoding', 'upgrade-insecure-requests',
+    'proxy-connection', 'content-length'
+]
 
 try:
     # Attempt to import the actual definitions when running via scalpel_racer.py
-    from structures import ScanResult, CapturedRequest, MAX_RESPONSE_BODY_READ
+    from structures import ScanResult, CapturedRequest, MAX_RESPONSE_BODY_READ, HOP_BY_HOP_HEADERS
 except ImportError:
     # This is expected if running low_level_h2.py independently
     pass
@@ -237,7 +243,12 @@ class HTTP2RaceEngine:
                     pass
 
         # 4. Initialize H2 Connection State Machine
-        config = H2Configuration(client_side=True, header_encoding='utf-8')
+        # [CRITICAL FIX] relaxed validation and raw byte handling
+        config = H2Configuration(
+            client_side=True, 
+            header_encoding=None, 
+            validate_inbound_headers=False
+        )
         self.conn = H2Connection(config=config)
         self.conn.initiate_connection()
         # Send the initial H2 preface and SETTINGS frame
@@ -498,9 +509,10 @@ class HTTP2RaceEngine:
         for k, v in self.request.headers.items():
             k_lower = k.lower()
             header_keys.add(k_lower)
-            # Skip headers managed by H2 pseudo-headers or connection protocols
-            if k_lower not in ['host', 'connection', 'transfer-encoding', 'content-length', 'keep-alive', 'upgrade']:
-                headers.append((k_lower, v))
+            # [CRITICAL FIX] Strictly filter Hop-by-Hop headers preventing ProtocolErrors
+            if k_lower in HOP_BY_HOP_HEADERS:
+                continue
+            headers.append((k_lower, v))
 
         # Ensure Content-Type if missing
         if 'content-type' not in header_keys and self.request.method in ["POST", "PUT", "PATCH"] and content_length > 0:
@@ -607,17 +619,16 @@ class HTTP2RaceEngine:
                 if isinstance(event, ResponseReceived):
                     # Parse headers (H2 headers are typically bytes tuples)
                     for header, value in event.headers:
-                        # [FIX] Robust decoding: H2Configuration(header_encoding='utf-8') returns str keys/values.
-                        # However, to be safe against mixed behavior or future config changes, we check type.
+                        # [FIX] Robust decoding: H2Configuration(header_encoding=None) returns bytes keys/values.
                         if isinstance(header, bytes):
-                            header_str = header.decode('utf-8', errors='ignore')
+                            header_str = header.decode('utf-8', errors='replace')
                         else:
-                            header_str = header
+                            header_str = str(header)
                         
                         if isinstance(value, bytes):
-                            value_str = value.decode('utf-8', errors='ignore')
+                            value_str = value.decode('utf-8', errors='replace')
                         else:
-                            value_str = value
+                            value_str = str(value)
                             
                         stream_data["headers"][header_str] = value_str
                 

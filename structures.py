@@ -1,5 +1,4 @@
 # structures.py
-# structures.py
 """
 Data structures and constants for the Scalpel Racer application.
 
@@ -14,15 +13,24 @@ from typing import Dict, Optional
 MAX_RESPONSE_BODY_READ = 1024 * 1024  # 1MB max read for analysis
 SYNC_MARKER = b"{{SYNC}}"
 
-# RFC 2616 Hop-by-Hop headers + others managed by httpx/proxies
-# [B04 FIX] Consolidated definition. Added 'content-length' as it is managed by proxies/clients
-# and should be stripped during capture/forwarding to allow underlying libraries to recalculate it.
+# RFC 2616 Hop-by-Hop headers + others managed by httpx/proxies.
+# These headers MUST be stripped when forwarding to/from HTTP/2 to prevent 
+# ProtocolErrors (e.g., 'Connection' header is strictly forbidden in H2).
 HOP_BY_HOP_HEADERS = [
-    'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
-    'te', 'trailers', 'transfer-encoding', 'upgrade',
-    'host', 'accept-encoding', 'upgrade-insecure-requests',
+    'connection', 
+    'keep-alive', 
+    'proxy-authenticate', 
+    'proxy-authorization',
+    'te', 
+    'trailers', 
+    'transfer-encoding', 
+    'upgrade',
+    'host', 
+    'accept-encoding', 
+    'upgrade-insecure-requests',
     'proxy-connection',
-    'content-length'
+    'content-length',
+    'http2-settings'
 ]
 
 
