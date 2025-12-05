@@ -84,7 +84,7 @@ def test_main_cli_flow(mock_asyncio_run, MockCAManager, MockCaptureServer, mock_
             assert excinfo.value.code == 0
 
     # Verify initialization calls
-    MockCaptureServer.assert_called_with(9090, None, None, enable_tunneling=True)
+    MockCaptureServer.assert_called_with(9090, None, None, enable_tunneling=True, bind_address='127.0.0.1')
     
     # Verify asyncio.run calls: server start, run_scan, client close
     assert mock_asyncio_run.call_count >= 3

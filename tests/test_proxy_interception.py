@@ -163,6 +163,9 @@ async def test_handle_connect_logic(monkeypatch):
         # Configure get_extra_info on the writer mock
         writer.get_extra_info.side_effect = lambda name, default=None: mock_transport if name == 'transport' else default
         
+        # Configure start_tls for Python 3.11+ path simulation
+        writer.start_tls = AsyncMock()
+
         # Crucial: Set _protocol attribute as the implementation relies on it for robust retrieval
         writer._protocol = mock_protocol
 
@@ -226,13 +229,14 @@ async def test_handle_connect_logic(monkeypatch):
         # Verify 200 OK sent before upgrade (on the initial writer)
         writer.write.assert_any_call(b"HTTP/1.1 200 Connection Established\r\n\r\n")
 
-        # Verify start_tls was called correctly
-        # The call arguments (transport, protocol) are now correctly retrieved from the mock writer.
-        mock_start_tls.assert_called_once()
+        # Verify start_tls was called correctly (Writer method preferred)
+        writer.start_tls.assert_called_once()
+
+        # Ensure legacy loop.start_tls was NOT called
+        mock_start_tls.assert_not_called()
         
-        # Verify StreamWriter was initialized with the new transport
-        # We verify the call arguments to ensure the correct components were passed.
-        MockStreamWriter.assert_called_with(mock_new_transport, mock_protocol, reader, mock_loop)
+        # Verify StreamWriter was NOT re-initialized (as we used in-place upgrade)
+        MockStreamWriter.assert_not_called()
 
         # Verify both requests inside the tunnel were processed and captured
         assert len(server.request_log) == 2
@@ -244,15 +248,14 @@ async def test_handle_connect_logic(monkeypatch):
         assert captured2.method == "GET"
         assert captured2.url == f"https://{connect_target}/api/relaxed"
 
-
-        # Verify responses inside the tunnel (Dummy response) - written to the NEW writer
+        # Verify responses inside the tunnel (Dummy response) - written to the ORIGINAL writer (updated in-place)
         # Request 1 (HTTP/1.1) is keep-alive
         expected_response1 = b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: keep-alive\r\n\r\nCaptured."
         # Request 2 (Defaulted to HTTP/1.0 by the fix) is close
         expected_response2 = b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nCaptured."
         
-        mock_new_writer.write.assert_any_call(expected_response1)
-        mock_new_writer.write.assert_any_call(expected_response2)
+        writer.write.assert_any_call(expected_response1)
+        writer.write.assert_any_call(expected_response2)
 
 @pytest.mark.asyncio
 async def test_handle_connect_invalid_target(monkeypatch):

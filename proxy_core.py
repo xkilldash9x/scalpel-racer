@@ -174,12 +174,11 @@ class NativeProxyHandler:
         self.upstream_scheme: str = "https"  # H2 interception is always over TLS (h2)
 
         # H2 State Machines (PDF Requirement 1.2)
-        # [CRITICAL FIX] Configure for relaxed validation and raw bytes to prevent crashes on Google headers
         ds_config = H2Configuration(
             client_side=False, 
             header_encoding=None, # Return headers as bytes to handle arbitrary binary data
-            validate_inbound_headers=False, # Disable strict RFC validation
-            validate_outbound_headers=False
+            validate_inbound_headers=True, # Enable strict RFC validation (RFC 9113)
+            validate_outbound_headers=True
         )
         
         # Handle potential initialization failure if H2Connection is a mock object or dependencies are missing
@@ -187,8 +186,10 @@ class NativeProxyHandler:
             self.downstream_conn = H2Connection(config=ds_config)
             
             # (PDF Requirement 6.2: Enable Extended CONNECT (RFC 8441))
-            # [FIX] Disabled because h2 < 4.4 has ambiguous behavior with SETTINGS ACK which confuses nghttp2
-            # self.downstream_conn.update_settings({SettingCodes.ENABLE_CONNECT_PROTOCOL: 1})
+            self.downstream_conn.update_settings({
+                SettingCodes.ENABLE_CONNECT_PROTOCOL: 1,
+                SettingCodes.MAX_HEADER_LIST_SIZE: 65536 # Prevent HPACK bombs
+            })
         except Exception as e:
             if not H2_AVAILABLE:
                  self.downstream_conn = None
@@ -227,12 +228,11 @@ class NativeProxyHandler:
                 await self.connect_upstream()
 
                 # 3. Initialize H2 on upstream side
-                # [CRITICAL FIX] Relaxed validation for upstream as well
                 us_config = H2Configuration(
                     client_side=True, 
                     header_encoding=None, 
-                    validate_inbound_headers=False,
-                    validate_outbound_headers=False
+                    validate_inbound_headers=True, # Enable strict RFC validation
+                    validate_outbound_headers=True
                 )
                 self.upstream_conn = H2Connection(config=us_config)
                 self.upstream_conn.initiate_connection()
@@ -372,6 +372,17 @@ class NativeProxyHandler:
         Reads data from the network, feeds it to the H2 state machine, and processes events.
         """
         while not self.closed.is_set():
+            # Manual Flow Control: Pause reading if write buffer is full
+            writer = self.get_writer(self.get_other_conn(conn))
+            if writer:
+                try:
+                    # Check transport buffer to prevent unbounded growth
+                    if hasattr(writer, 'transport') and writer.transport:
+                         while writer.transport.get_write_buffer_size() > 65536:
+                             await asyncio.sleep(0.1)
+                except Exception:
+                    pass
+
             # (PDF Requirement 7.2: Idle Timeout)
             try:
                 data = await asyncio.wait_for(reader.read(65536), timeout=IDLE_TIMEOUT)
@@ -508,12 +519,12 @@ class NativeProxyHandler:
     def _filter_headers(self, headers: List[Tuple[Any, Any]]) -> List[Tuple[Any, Any]]:
         """
         Robustly decodes and filters Hop-by-Hop headers.
-        Since we use header_encoding=None, headers are bytes.
+        Enforces strict RFC 9113 compliance.
         """
         safe_headers = []
         for k, v in headers:
             try:
-                # Robust decode for checking, using 'replace' to handle binary garbage
+                # Robust decode for checking
                 if isinstance(k, bytes):
                     k_str = k.decode('utf-8', errors='replace')
                 else:
@@ -524,18 +535,25 @@ class NativeProxyHandler:
                 else:
                     v_str = str(v)
                 
+                # RFC 9113: Field names of zero length are malformed
+                if not k_str:
+                    continue
+
+                # RFC 9113: Prohibit CR, LF, NUL in values
+                if any(c in v_str for c in ('\r', '\n', '\0')):
+                    continue
+
                 k_lower = k_str.lower()
                 
+                # Filter connection-specific headers (RFC 9113 Section 8.2.2)
                 if k_lower in HOP_BY_HOP_HEADERS:
                     # Exception: 'TE: trailers' is allowed in H2
-                    if k_lower == 'te' and 'trailers' in v_str.lower():
+                    if k_lower == 'te' and v_str.lower() == 'trailers':
                         safe_headers.append((k, v))
                     continue
                 
                 safe_headers.append((k, v))
             except Exception:
-                # If we can't parse it, better to drop it or keep it?
-                # Keeping it risks protocol error, dropping it is safer.
                 continue
         return safe_headers
 
@@ -645,6 +663,13 @@ class NativeProxyHandler:
         # Process headers robustly for capture
         context.captured_headers = self._process_headers_for_capture(event.headers)
 
+        # Check for Extended CONNECT (RFC 8441)
+        pseudo_headers = context.captured_headers["pseudo"]
+        method = pseudo_headers.get(':method', '')
+        protocol = pseudo_headers.get(':protocol')
+
+        is_extended_connect = (method == 'CONNECT' and protocol is not None)
+
         # Forward headers upstream (Only if tunneling).
         if self.enable_tunneling:
             try:
@@ -668,7 +693,10 @@ class NativeProxyHandler:
 
                     # Encode authority as bytes if headers are bytes (which they are with our config)
                     if k_str == ':authority':
-                        forward_headers.append((k, authority.encode('utf-8')))
+                        if not is_extended_connect:
+                            forward_headers.append((k, authority.encode('utf-8')))
+                        else:
+                            forward_headers.append((k, v))
                     elif k_str.lower() == 'host':
                         # Skip 'Host' in H2, rely on :authority
                         continue
@@ -677,7 +705,8 @@ class NativeProxyHandler:
                 
                 # Ensure :authority is present
                 if not any(k == b':authority' or k == ':authority' for k, v in forward_headers):
-                     forward_headers.insert(0, (b':authority', authority.encode('utf-8')))
+                     if not is_extended_connect:
+                        forward_headers.insert(0, (b':authority', authority.encode('utf-8')))
 
                 # We forward the filtered headers
                 self.upstream_conn.send_headers(stream_id, forward_headers, end_stream=event.stream_ended)
@@ -1086,15 +1115,15 @@ class NativeProxyHandler:
         if self.client_writer and not self.client_writer.is_closing():
             try:
                 self.client_writer.close()
-                await self.client_writer.wait_closed()
-            except (ConnectionError, OSError):
+                await asyncio.wait_for(self.client_writer.wait_closed(), timeout=2.0)
+            except (ConnectionError, OSError, asyncio.TimeoutError):
                 pass
 
         if self.upstream_writer and not self.upstream_writer.is_closing():
             try:
                 self.upstream_writer.close()
-                await self.upstream_writer.wait_closed()
-            except (ConnectionError, OSError):
+                await asyncio.wait_for(self.upstream_writer.wait_closed(), timeout=2.0)
+            except (ConnectionError, OSError, asyncio.TimeoutError):
                 pass
 
     # -- Capture Logic Finalization --
