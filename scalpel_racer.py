@@ -466,10 +466,18 @@ class CaptureServer:
                 protocol.eof_received = types.MethodType(patched_eof_received, protocol)
             
             # [FIX: CRITICAL B01] Capture the NEW transport returned by start_tls
-            new_transport = await asyncio.wait_for(
-                loop.start_tls(transport, protocol, ssl_context, server_side=True),
-                timeout=TLS_HANDSHAKE_TIMEOUT
-            )
+            try:
+                new_transport = await asyncio.wait_for(
+                    loop.start_tls(transport, protocol, ssl_context, server_side=True),
+                    timeout=TLS_HANDSHAKE_TIMEOUT
+                )
+            except RuntimeError as e:
+                # Catch "cannot reuse already awaited coroutine" or similar errors during TLS upgrade
+                print(f"[!] Critical Runtime Error during TLS handshake (start_tls): {e}")
+                return
+            except Exception as e:
+                print(f"[!] TLS handshake failed: {e}")
+                return
             
             # Refresh reader from protocol if available
             if hasattr(protocol, '_stream_reader') and protocol._stream_reader:
