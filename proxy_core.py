@@ -187,7 +187,8 @@ class NativeProxyHandler:
             self.downstream_conn = H2Connection(config=ds_config)
             
             # (PDF Requirement 6.2: Enable Extended CONNECT (RFC 8441))
-            self.downstream_conn.update_settings({SettingCodes.ENABLE_CONNECT_PROTOCOL: 1})
+            # [FIX] Disabled because h2 < 4.4 has ambiguous behavior with SETTINGS ACK which confuses nghttp2
+            # self.downstream_conn.update_settings({SettingCodes.ENABLE_CONNECT_PROTOCOL: 1})
         except Exception as e:
             if not H2_AVAILABLE:
                  self.downstream_conn = None
