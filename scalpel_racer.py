@@ -1,3 +1,4 @@
+# scalpel_racer.py
 # FILE: ./scalpel_racer.py
 """
 Scalpel Racer - Advanced Race Condition Testing Tool.
@@ -47,7 +48,8 @@ from structures import (
     CapturedRequest, 
     MAX_RESPONSE_BODY_READ,
     SYNC_MARKER,
-    HOP_BY_HOP_HEADERS as OLD_HEADERS 
+    # [B04 FIX] Import HOP_BY_HOP_HEADERS directly, removing the confusing alias.
+    HOP_BY_HOP_HEADERS
 )
 
 DEFAULT_CONCURRENCY = 15
@@ -63,13 +65,8 @@ BODY_READ_TIMEOUT = 15.0
 TUNNEL_IDLE_TIMEOUT = 30.0
 TLS_HANDSHAKE_TIMEOUT = 10.0
 
-# Consolidated HOP_BY_HOP_HEADERS
-HOP_BY_HOP_HEADERS = [
-    'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
-    'te', 'trailers', 'transfer-encoding', 'upgrade',
-    'content-length', 'host', 'accept-encoding', 'upgrade-insecure-requests',
-    'proxy-connection' # Ensure this is included
-]
+# [B04 FIX] Removed the redundant local definition of HOP_BY_HOP_HEADERS.
+# We now rely entirely on the definition imported from structures.py.
 
 try:
     from low_level import HTTP2RaceEngine
@@ -218,36 +215,54 @@ class CAManager:
             context.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
 
         try:
-            context.set_alpn_protocols(["http/1.1"])
+            # Support both H2 and HTTP/1.1 for maximum compatibility
+            context.set_alpn_protocols(["h2", "http/1.1"])
         except NotImplementedError:
             pass 
 
         cert_pem = cert.public_bytes(Encoding.PEM)
         key_pem = key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption())
 
-        cert_path = None
-        key_path = None
+        # [B20 FIX] Robust temporary file handling to prevent resource leaks.
+        cert_file = None
+        key_file = None
         
         try:
-            with tempfile.NamedTemporaryFile(suffix=".pem", delete=False) as cert_file:
-                cert_file.write(cert_pem)
-                cert_path = cert_file.name
+            # Create temporary files first (delete=False as SSLContext needs the path)
+            cert_file = tempfile.NamedTemporaryFile(suffix=".pem", delete=False)
+            key_file = tempfile.NamedTemporaryFile(suffix=".key", delete=False)
 
-            with tempfile.NamedTemporaryFile(suffix=".key", delete=False) as key_file:
-                key_file.write(key_pem)
-                key_path = key_file.name
+            # Write data
+            cert_file.write(cert_pem)
+            cert_file.close() # Close to ensure data is flushed before load_cert_chain
 
-            context.load_cert_chain(certfile=cert_path, keyfile=key_path)
+            key_file.write(key_pem)
+            key_file.close()
+
+            # Load cert chain
+            context.load_cert_chain(certfile=cert_file.name, keyfile=key_file.name)
+            
+            # Cache and return the context
             self.cert_cache[hostname] = context
             return context
-        finally:
-            if cert_path:
-                try: os.remove(cert_path)
-                except OSError: pass
         
-            if key_path:
-                try: os.remove(key_path)
-                except OSError: pass
+        # Ensure temporary files are always cleaned up
+        finally:
+            if cert_file:
+                if not cert_file.closed:
+                    cert_file.close()
+                try:
+                    os.remove(cert_file.name)
+                except OSError:
+                    pass
+        
+            if key_file:
+                if not key_file.closed:
+                    key_file.close()
+                try:
+                    os.remove(key_file.name)
+                except OSError:
+                    pass
 
     def generate_host_cert(self, hostname: str):
         """
@@ -740,8 +755,10 @@ class CaptureServer:
             except asyncio.IncompleteReadError as e:
                  # If readexactly fails (e.partial), we re-raise with the full body read so far
                  # Ensure e.partial is handled correctly if it exists
-                 partial_data = e.partial if e.partial else b''
-                 raise asyncio.IncompleteReadError(bytes(chunked_body) + partial_data, e.expected)
+                 partial_data = e.partial if hasattr(e, 'partial') and e.partial else b''
+                 # Handle expected attribute for compatibility
+                 expected = e.expected if hasattr(e, 'expected') else None
+                 raise asyncio.IncompleteReadError(bytes(chunked_body) + partial_data, expected)
 
         try:
             # P2: Apply timeout to the entire header reading process
@@ -778,7 +795,10 @@ class CaptureServer:
                   body = await asyncio.wait_for(reader.readexactly(content_length), timeout=BODY_READ_TIMEOUT)
              except asyncio.IncompleteReadError as e:
                  if not writer.is_closing():
-                     msg = f"Incomplete body read. Expected {e.expected}, got {len(e.partial)}.".encode()
+                     # Handle expected and partial attributes for compatibility
+                     expected = e.expected if hasattr(e, 'expected') else content_length
+                     partial_len = len(e.partial) if hasattr(e, 'partial') else 0
+                     msg = f"Incomplete body read. Expected {expected}, got {partial_len}.".encode()
                      writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: " + str(len(msg)).encode() + b"\r\n\r\n" + msg)
                      await writer.drain()
                  return
@@ -820,6 +840,7 @@ class CaptureServer:
 
         req_id = len(self.request_log)
         
+        # [B04 FIX] Uses the consolidated HOP_BY_HOP_HEADERS imported from structures.
         safe_headers = {k: v for k, v in original_headers_dict.items()
                         if k.lower() not in HOP_BY_HOP_HEADERS}
 
@@ -860,6 +881,7 @@ class CaptureServer:
         if self.proxy_client is None:
             self.proxy_client = httpx.AsyncClient(verify=False, timeout=60.0, http2=True)
 
+        # [B04 FIX] Uses the consolidated HOP_BY_HOP_HEADERS imported from structures.
         forward_headers = {k: v for k, v in headers.items()
                            if k.lower() not in HOP_BY_HOP_HEADERS}
 
@@ -987,7 +1009,7 @@ async def send_probe_advanced(client: httpx.AsyncClient, request: CapturedReques
 
     try:
         req_headers = request.headers.copy()
-        req_headers["User-Agent"] = "Scalpel-CLI/5.3-Optimized" # Version Bump
+        req_headers["User-Agent"] = "Scalpel-CLI/5.4-Optimized" # Version Bump
         req_headers["X-Scalpel-Probe"] = f"{index}_{int(time.time())}"
 
         has_content_type = any(k.lower() == 'content-type' for k in req_headers.keys())
@@ -1285,7 +1307,7 @@ def main():
         globals()['CA_MANAGER'] = CAManager()
 
     # P3: Update version string to reflect optimization
-    parser = argparse.ArgumentParser(description="Scalpel Racer v5.3 (Optimized I/O) - Advanced Race Condition Tester",
+    parser = argparse.ArgumentParser(description="Scalpel Racer v5.4 (Robustified) - Advanced Race Condition Tester",
                                      formatter_class=argparse.RawTextHelpFormatter) # Use RawTextHelpFormatter for better help alignment
 
     parser.add_argument("-l", "--listen", type=int, default=8080, help="Listening port (default: 8080)")
