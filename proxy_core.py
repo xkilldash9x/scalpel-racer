@@ -36,7 +36,7 @@ try:
         ResponseReceived
     )
     from h2.errors import ErrorCodes
-    from h2.exceptions import FlowControlError, ProtocolError
+    from h2.exceptions import FlowControlError, ProtocolError, StreamClosedError
     from h2.settings import SettingCodes
     H2_AVAILABLE = True
 except ImportError:
@@ -82,6 +82,7 @@ except ImportError:
 
     class FlowControlError(Exception): pass
     class ProtocolError(Exception): pass
+    class StreamClosedError(ProtocolError): pass
 
 # Import structures from the main application (if available)
 try:
@@ -417,6 +418,13 @@ class NativeProxyHandler:
             try:
                 events = conn.receive_data(data)
             
+            # [FIX] Handle StreamClosedError gracefully (Race condition robustness)
+            except StreamClosedError as e:
+                # Typically happens if data arrives for a stream that was just reset/closed locally.
+                # We ignore this frame and continue, rather than killing the connection.
+                log.warning(f"Ignored frame for closed stream {e.stream_id}: {e}")
+                continue
+
             # [AUDIT FIX] Fail-Fast on ProtocolError as per RFC 9113
             except ProtocolError as e:
                 msg = str(e)
