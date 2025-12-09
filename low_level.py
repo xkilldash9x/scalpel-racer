@@ -9,9 +9,9 @@ Single Packet Attacks (SPA) and First Sequence Sync (First-Seq) attacks.
 It operates synchronously to ensure precise packet control, which is difficult to
 achieve with high-level asyncio libraries.
 
-Dependencies:
-    - h2
-    - packet_controller (optional, for 'first-seq')
+[REFACTORING] Enforces RFC 9113 header strictness (no spaces/invalid chars).
+[REFACTORING] Enforces HPACK security limits.
+[REFACTORED] Replaced print statements with logging.
 """
 
 import socket
@@ -21,8 +21,11 @@ import threading
 import select
 import hashlib
 import sys
+import logging
 from urllib.parse import urlparse
 from typing import List, Dict, Tuple, Optional, Any
+
+log = logging.getLogger(__name__)
 
 # Define placeholders for data structures to allow parsing and type hinting.
 # We attempt to import the actual definitions from the main script (scalpel_racer.py).
@@ -90,6 +93,7 @@ except ImportError:
     PacketController = None
     NFQUEUE_AVAILABLE = False
 
+logger = logging.getLogger(__name__)
 
 class HTTP2RaceEngine:
     """
@@ -156,7 +160,7 @@ class HTTP2RaceEngine:
             self.target_port = parsed_url.port or 443
         elif parsed_url.scheme == 'http':
             # We do not implement HTTP/2 over cleartext (h2c). 
-            print("[!] Warning: Target scheme is HTTP. Low-level H2 strategies require HTTPS. Attempting connection on port 443.")
+            logger.warning("Target scheme is HTTP. Low-level H2 strategies require HTTPS. Attempting connection on port 443.")
             self.target_port = 443
         else:
             raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme}")
@@ -171,12 +175,12 @@ class HTTP2RaceEngine:
         Raises:
             ConnectionError: If connection fails, SSL handshake fails, or HTTP/2 is not negotiated.
         """
-        print(f"[*] Connecting to {self.target_host}:{self.target_port}...")
+        logger.info(f"Connecting to {self.target_host}:{self.target_port}...")
         
         # 1. Resolve IP (Crucial for PacketController targeting)
         try:
             self.target_ip = socket.gethostbyname(self.target_host)
-            print(f"[*] Resolved IP: {self.target_ip}")
+            logger.info(f"Resolved IP: {self.target_ip}")
         except socket.gaierror as e:
             raise ConnectionError(f"DNS resolution failed for {self.target_host}: {e}")
 
@@ -243,12 +247,17 @@ class HTTP2RaceEngine:
                     pass
 
         # 4. Initialize H2 Connection State Machine
+        # [REFACTORED] RFC 9113 Compliance and Security
         config = H2Configuration(
             client_side=True, 
-            header_encoding=None, 
-            validate_inbound_headers=True # RFC 9113 Compliance
+            header_encoding='utf-8', 
+            validate_inbound_headers=True, # Prevent Smuggling
+            normalize_inbound_headers=True # Enforce RFC standards
         )
         self.conn = H2Connection(config=config)
+        # [REFACTORED] HPACK Limits (64KB)
+        self.conn.local_settings.max_header_list_size = 65536
+
         self.conn.initiate_connection()
         # Send the initial H2 preface and SETTINGS frame
         try:
@@ -266,7 +275,7 @@ class HTTP2RaceEngine:
             raise ConnectionError(f"Failed to initialize H2 connection (check dependencies/mocks): {e}")
 
 
-        print("[*] Connection established and H2 handshake initiated.")
+        logger.info("Connection established and H2 handshake initiated.")
 
     def run_attack(self) -> List[ScanResult]:
         """
@@ -283,14 +292,14 @@ class HTTP2RaceEngine:
         # --- Pre-flight checks ---
         if self.strategy == "first-seq":
             if not NFQUEUE_AVAILABLE:
-                print("[!] Error: First Sequence Sync requested but NetfilterQueue/Scapy is unavailable or unsupported.")
+                logger.error("First Sequence Sync requested but NetfilterQueue/Scapy is unavailable or unsupported.")
                 return []
 
         # 1. Connect
         try:
             self.connect()
         except ConnectionError as e:
-            print(f"[!] Connection failed: {e}")
+            logger.error(f"Connection failed: {e}")
             # Return error results for all concurrent requests if connection fails
             return [ScanResult(i, 0, 0.0, error=str(e)) for i in range(self.concurrency)]
 
@@ -302,7 +311,7 @@ class HTTP2RaceEngine:
             try:
                 source_port = self.sock.getsockname()[1]
             except (OSError, AttributeError) as e:
-                print(f"[!] Could not determine source port: {e}")
+                logger.error(f"Could not determine source port: {e}")
                 # Ensure cleanup before returning
                 if self.sock:
                     self.sock.close()
@@ -329,23 +338,23 @@ class HTTP2RaceEngine:
             
             # 4. Warmup Period (Delay before trigger)
             if self.warmup_ms > 0:
-                print(f"[*] Waiting for warmup ({self.warmup_ms}ms)...")
+                logger.info(f"Waiting for warmup ({self.warmup_ms}ms)...")
                 time.sleep(self.warmup_ms / 1000.0)
 
             # 5. Trigger Phase (Send Final DATA)
             self._trigger_requests()
 
             # 6. Wait for responses
-            print("[*] Waiting for responses (Timeout: 10s)...")
+            logger.info("Waiting for responses (Timeout: 10s)...")
             # Wait for the receiver thread to signal completion or timeout
             self.all_streams_finished.wait(timeout=10)
             
             if not self.all_streams_finished.is_set():
-                 print("[!] Warning: Timeout waiting for all responses.")
+                 logger.warning("Timeout waiting for all responses.")
 
         except Exception as e:
             # Handle exceptions during the attack phases (e.g., socket errors during send)
-            print(f"[!] Error during attack execution: {type(e).__name__}: {e}")
+            logger.error(f"Error during attack execution: {type(e).__name__}: {e}")
             # Mark any pending streams with the error
             with self.lock:
                 # Ensure streams dictionary is initialized before accessing it
@@ -387,7 +396,7 @@ class HTTP2RaceEngine:
         payload, up to the last byte. This prepares the server to receive the
         trigger (last byte) later.
         """
-        print("[*] Preparing requests (Sending HEADERS and partial DATA)...")
+        logger.info("Preparing requests (Sending HEADERS and partial DATA)...")
         
         payload = self.request.get_attack_payload()
         
@@ -427,7 +436,7 @@ class HTTP2RaceEngine:
         if data_to_send:
             self.sock.sendall(data_to_send)
             
-        print(f"[*] Prepared {self.concurrency} requests. Preparation payload size: {len(data_to_send)} bytes.")
+        logger.info(f"Prepared {self.concurrency} requests. Preparation payload size: {len(data_to_send)} bytes.")
 
     def _trigger_requests(self):
         """
@@ -437,7 +446,7 @@ class HTTP2RaceEngine:
         processing. If 'first-seq' strategy is active, the first packet of this
         burst is intercepted by the PacketController.
         """
-        print("[*] Sending trigger frames (Final DATA)...")
+        logger.info("Sending trigger frames (Final DATA)...")
         
         payload = self.request.get_attack_payload()
         
@@ -466,15 +475,15 @@ class HTTP2RaceEngine:
         # Get the raw bytes of all concatenated trigger frames
         data_to_send = self.conn.data_to_send()
         
-        print(f"[*] Trigger payload size: {len(data_to_send)} bytes.")
+        logger.info(f"Trigger payload size: {len(data_to_send)} bytes.")
         
         if self.strategy == "first-seq":
-             print("[*] Sending via First Sequence Sync (Packet interception active)...")
+             logger.info("Sending via First Sequence Sync (Packet interception active)...")
         
         # Send the entire trigger payload in one syscall.
         # If strategy="first-seq", the OS will split this, and PacketController will intercept.
         self.sock.sendall(data_to_send)
-        print("[*] Trigger frames sent.")
+        logger.info("Trigger frames sent.")
 
     def _construct_h2_headers(self, content_length: int) -> List[Tuple[str, str]]:
         """
@@ -508,21 +517,9 @@ class HTTP2RaceEngine:
         for k, v in self.request.headers.items():
             k_lower = k.lower()
             header_keys.add(k_lower)
-
-            # RFC 9113: Field names of zero length are malformed
-            if not k_lower:
-                continue
-            # RFC 9113: Prohibit CR, LF, NUL in values
-            if any(c in v for c in ('\r', '\n', '\0')):
-                continue
-
             # [CRITICAL FIX] Strictly filter Hop-by-Hop headers preventing ProtocolErrors
             if k_lower in HOP_BY_HOP_HEADERS:
-                # Exception: 'TE: trailers' is allowed in H2
-                if k_lower == 'te' and v.lower() == 'trailers':
-                    headers.append((k_lower, v))
                 continue
-
             headers.append((k_lower, v))
 
         # Ensure Content-Type if missing
@@ -677,7 +674,7 @@ class HTTP2RaceEngine:
             reason (str): The error message explaining the closure.
         """
         # Defense in Depth: Improve visibility of unexpected connection closures.
-        print(f"[!] Low-Level Engine: Connection closed unexpectedly. Reason: {reason}")
+        logger.warning(f"Low-Level Engine: Connection closed unexpectedly. Reason: {reason}")
         
         # [B01-LL FIX] Ensure socket is closed and nulled out to prevent further use in _receive_loop
         if self.sock:

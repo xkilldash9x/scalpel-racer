@@ -157,7 +157,11 @@ def test_parse_target(engine):
     assert engine.target_host == "example.com"
     assert engine.target_port == 443
 
-def test_parse_target_http_warning(capsys, engine):
+def test_parse_target_http_warning(caplog, engine):
+    import logging
+    # Ensure capture level allows warnings
+    caplog.set_level(logging.WARNING)
+    
     req = CapturedRequest(url="http://example.com/foo")
     # Retrieve class dynamically to avoid reload issues
     HTTP2RaceEngine = engine.__class__
@@ -166,9 +170,8 @@ def test_parse_target_http_warning(capsys, engine):
     engine_http = HTTP2RaceEngine(req, 1)
     
     assert engine_http.target_port == 443 # Defaults to 443 for H2
-    captured = capsys.readouterr()
-    assert "Warning: Target scheme is HTTP" in captured.out
-
+    # [FIX] Use caplog text for log verification
+    assert "Target scheme is HTTP" in caplog.text   
 # --- Connection Handling ---
 
 def test_connect_success(engine, mock_dependencies):

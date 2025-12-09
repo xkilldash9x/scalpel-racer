@@ -7,6 +7,8 @@ This module provides a specialized attack engine (`HTTP11SyncEngine`) that uses 
 threads and barriers to synchronize the sending of request payloads across multiple
 connections. It is designed to achieve higher precision than asyncio-based approaches
 by synchronizing threads immediately before the `socket.send` call.
+
+[REFACTORED] Switched from print/traceback to logging for operational output.
 """
 
 import socket
@@ -15,11 +17,14 @@ import time
 import threading
 import hashlib
 import sys
+import logging
 from urllib.parse import urlparse
 from typing import List, Dict, Tuple, Optional
 # Import HTTPResponse for robust parsing over raw sockets
 from http.client import HTTPResponse
 import io
+
+logger = logging.getLogger(__name__)
 
 # Define placeholders for data structures (similar to low_level.py)
 class ScanResult:
@@ -119,14 +124,14 @@ class HTTP11SyncEngine:
         """
         Executes the synchronized attack.
         """
-        print(f"[*] Connecting to {self.target_host}:{self.target_port}...")
+        logger.info(f"Connecting to {self.target_host}:{self.target_port}...")
         
         # 1. Resolve IP (Centralized resolution)
         try:
             self.target_ip = socket.gethostbyname(self.target_host)
-            print(f"[*] Resolved IP: {self.target_ip}")
+            logger.info(f"Resolved IP: {self.target_ip}")
         except socket.gaierror as e:
-            print(f"[!] DNS resolution failed: {e}")
+            logger.error(f"DNS resolution failed: {e}")
             # Return error results immediately if DNS fails
             return [ScanResult(i, 0, 0.0, error=f"DNS error: {e}") for i in range(self.concurrency)]
 
@@ -288,7 +293,7 @@ class HTTP11SyncEngine:
             
             # Check if more data remains (response too large)
             if response.read(1):
-                 print(f"[!] Warning: Response truncated (>{MAX_RESPONSE_BODY_READ} bytes) for probe {index}.")
+                 logger.warning(f"Response truncated (>{MAX_RESPONSE_BODY_READ} bytes) for probe {index}.")
 
             duration = (time.perf_counter() - start_time) * 1000
 

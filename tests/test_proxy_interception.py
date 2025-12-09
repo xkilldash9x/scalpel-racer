@@ -1,5 +1,4 @@
-# FILE: ./tests/test_proxy_interception.py
-# FILE: ./tests/test_proxy_interception.py
+# tests/test_proxy_interception.py
 import pytest
 import asyncio
 import httpx
@@ -19,7 +18,8 @@ async def server_manager(unused_tcp_port_factory):
     # This fixture enables tunneling for interception tests by default
     async def _start_server(target_override=None, scope_regex=None, enable_tunneling=True):
         port = unused_tcp_port_factory()
-        server = CaptureServer(port=port, target_override=target_override, scope_regex=scope_regex, enable_tunneling=enable_tunneling)
+        # [FIX] Added bind_addr="127.0.0.1" to fix TypeError
+        server = CaptureServer(port=port, bind_addr="127.0.0.1", target_override=target_override, scope_regex=scope_regex, enable_tunneling=enable_tunneling)
         servers.append(server)
         task = asyncio.create_task(server.start())
 
@@ -68,7 +68,6 @@ class MockStreamErrorContext:
         pass
 
 # -- Tests for HTTP Tunneling --
-# (Tests for test_http_tunneling_success and test_http_tunneling_upstream_error remain the same)
 @pytest.mark.asyncio
 async def test_http_tunneling_success(server_manager):
     server, port = await server_manager(enable_tunneling=True)
@@ -116,13 +115,13 @@ async def test_http_tunneling_upstream_error(server_manager):
             pass
 
 # -- Tests for HTTPS Interception (New Functionality) --
-# Updated to handle the complexity of mocking asyncio.wait_for in the new structure
 @pytest.mark.asyncio
 async def test_handle_connect_logic(monkeypatch):
     """Test the logic inside handle_connect, mocking the TLS upgrade."""
 
     # Test without tunneling first to verify capture and dummy response
-    server = CaptureServer(port=8000, enable_tunneling=False)
+    # [FIX] Added bind_addr="127.0.0.1"
+    server = CaptureServer(port=8000, bind_addr="127.0.0.1", enable_tunneling=False)
 
     # 1. Mock Dependencies (CA_MANAGER and loop.start_tls)
 
@@ -181,7 +180,6 @@ async def test_handle_connect_logic(monkeypatch):
         
         # We define side_effects on the reader.readline METHOD directly.
         # This ensures that when the SUT calls await reader.readline(), it gets these values.
-        
         reader.readline.side_effect = [
             # Read by handle_connect loop (1st iteration)
             b"GET /api/data HTTP/1.1\r\n",
@@ -253,14 +251,14 @@ async def test_handle_connect_logic(monkeypatch):
         expected_response1 = b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: keep-alive\r\n\r\nCaptured."
         # Request 2 (Defaulted to HTTP/1.0 by the fix) is close
         expected_response2 = b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nCaptured."
-        
         writer.write.assert_any_call(expected_response1)
         writer.write.assert_any_call(expected_response2)
 
 @pytest.mark.asyncio
 async def test_handle_connect_invalid_target(monkeypatch):
     """Test handle_connect with an invalid target format."""
-    server = CaptureServer(port=8000)
+    # [FIX] Added bind_addr="127.0.0.1"
+    server = CaptureServer(port=8000, bind_addr="127.0.0.1")
 
     # Ensure CA_MANAGER is mocked/available so the global lookup inside handle_connect works.
     with patch.dict('scalpel_racer.__dict__', {'CA_MANAGER': MagicMock()}):
@@ -281,7 +279,8 @@ async def test_handle_connect_invalid_target(monkeypatch):
 @pytest.mark.asyncio
 async def test_handle_connect_ca_disabled(capsys):
     """Test CONNECT request when CA_MANAGER is globally disabled."""
-    server = CaptureServer(port=8001)
+    # [FIX] Added bind_addr="127.0.0.1"
+    server = CaptureServer(port=8001, bind_addr="127.0.0.1")
 
     # Explicitly set global CA_MANAGER to None
     with patch.dict('scalpel_racer.__dict__', {'CA_MANAGER': None}):
