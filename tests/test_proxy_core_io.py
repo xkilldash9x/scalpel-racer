@@ -68,6 +68,14 @@ async def test_run_orchestration_success(io_handler):
     # Expect 4 tasks (2 reads + 2 writes)
     assert tg_instance.create_task.call_count == 4
 
+    # [FIX] Cleanup unawaited coroutines passed to create_task mock.
+    # When create_task is mocked, the coroutines passed to it are never awaited.
+    # We must explicitly close them to satisfy asyncio's debug checks and prevent RuntimeWarnings.
+    for call in tg_instance.create_task.call_args_list:
+        coro = call.args[0]
+        if asyncio.iscoroutine(coro):
+            coro.close()
+
 @pytest.mark.asyncio
 async def test_connect_upstream_success(io_handler):
     io_handler.upstream_host = "secure.com"
@@ -161,7 +169,15 @@ async def test_read_loop_idle_timeout(io_handler):
     io_handler.graceful_shutdown.assert_awaited()
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
+@pytest.mark.filterwarnings("ignore::RuntimeWarning:unittest.mock")
 async def test_read_loop_protocol_error(io_handler):
+    """
+    Verifies that ProtocolError triggers the correct termination code.
+    """
+    # Import the exact ProtocolError class used by proxy_core to ensure the except block catches it
+    from proxy_core import ProtocolError
+
     # Setup data to trigger processing
     f_data = asyncio.Future()
     f_data.set_result(b"BAD_DATA")
@@ -170,25 +186,20 @@ async def test_read_loop_protocol_error(io_handler):
     mock_reader.read.return_value = f_data
     
     mock_conn = MagicMock()
-    mock_conn.receive_data.side_effect = Exception("Protocol Violation")
+    # [FIX] Raise specific ProtocolError so the code catches it and sends PROTOCOL_ERROR
+    mock_conn.receive_data.side_effect = ProtocolError("Protocol Violation")
     
-    terminate_called = False
-    async def mock_terminate(error_code):
-        nonlocal terminate_called
-        terminate_called = True
-        assert error_code == ErrorCodes.PROTOCOL_ERROR
+    # Patch terminate as an AsyncMock to avoid unawaited coroutine warnings
+    with patch.object(io_handler, 'terminate', new_callable=AsyncMock) as mock_terminate:
+        # Bypass wait_for to ensure exceptions propagate immediately
+        async def bypass_wait_for(coro, timeout):
+            return await coro
 
-    io_handler.terminate = mock_terminate
-    
-    # Bypass wait_for to ensure exceptions propagate immediately
-    async def bypass_wait_for(coro, timeout):
-        return await coro
+        with patch("asyncio.wait_for", side_effect=bypass_wait_for):
+            async def noop_handler(evt): pass
+            await io_handler.read_loop(mock_reader, mock_conn, noop_handler)
 
-    with patch("asyncio.wait_for", side_effect=bypass_wait_for):
-        async def noop_handler(evt): pass
-        await io_handler.read_loop(mock_reader, mock_conn, noop_handler)
-
-    assert terminate_called is True
+        mock_terminate.assert_awaited_with(ErrorCodes.PROTOCOL_ERROR)
 
 # -- Flush & Write Tests --
 

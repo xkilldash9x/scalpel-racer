@@ -1,8 +1,10 @@
+# tests/test_coverage_gaps.py
 import pytest
 import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch
 from scalpel_racer import CaptureServer, Last_Byte_Stream_Body, main
 import sys
+import logging
 
 async def a_next(gen):
     try:
@@ -13,7 +15,8 @@ async def a_next(gen):
 @pytest.mark.asyncio
 async def test_capture_server_absolute_uri_request():
     port = 8891
-    server = CaptureServer(port=port, enable_tunneling=False)
+    # [FIX] Added bind_addr
+    server = CaptureServer(port=port, bind_addr="127.0.0.1", enable_tunneling=False)
     reader = AsyncMock()
     writer = MagicMock()
     writer.write = MagicMock()
@@ -34,8 +37,9 @@ async def test_capture_server_absolute_uri_request():
     assert server.request_log[0].url == "http://external.com/foo"
 
 @pytest.mark.asyncio
-async def test_capture_server_handle_client_exception(capsys):
-    server = CaptureServer(port=8892, enable_tunneling=False)
+async def test_capture_server_handle_client_exception(caplog):
+    # [FIX] Added bind_addr
+    server = CaptureServer(port=8892, bind_addr="127.0.0.1", enable_tunneling=False)
     reader = AsyncMock()
     writer = MagicMock()
     writer.close = MagicMock()
@@ -45,9 +49,12 @@ async def test_capture_server_handle_client_exception(capsys):
     await server.handle_client(reader, writer)
     writer.close.assert_called()
     reader.readline.side_effect = Exception("Generic Error")
-    await server.handle_client(reader, writer)
-    captured = capsys.readouterr()
-    assert "[!] Error handling request: Generic Error" in captured.out
+    
+    # [FIX] Use caplog to capture logger error
+    with caplog.at_level(logging.ERROR):
+        await server.handle_client(reader, writer)
+    
+    assert "Error handling request: Generic Error" in caplog.text
 
 @pytest.mark.asyncio
 async def test_xy_stream_body_broken_barrier():
@@ -77,7 +84,7 @@ def test_main_keyboard_interrupt(capsys):
       
         mock_args.return_value = MagicMock(
             listen=8080, target=None, scope=None, concurrency=10, 
-            warmup=100, strategy="auto", http2=False
+            warmup=100, strategy="auto", http2=False, bind="127.0.0.1"
         )
         server_instance = MockServer.return_value
         req = MagicMock()

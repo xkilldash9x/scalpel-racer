@@ -21,15 +21,10 @@ except ImportError:
     class ResponseReceived: pass
 
 def create_event(cls, **kwargs):
-    """
-    Helper to instantiate H2 events compatibly.
-    Real h2 events require arguments in __init__.
-    Mock/Fallback events might not accept arguments.
-    """
+    """Helper to instantiate H2 events compatibly."""
     try:
         return cls(**kwargs)
     except TypeError:
-        # Fallback for dummy classes that take no init args
         obj = cls()
         for k, v in kwargs.items():
             setattr(obj, k, v)
@@ -37,11 +32,6 @@ def create_event(cls, **kwargs):
 
 @pytest.fixture
 def dispatch_handler():
-    # Patch H2 deps to ensure init works.
-    # CRITICAL: We must patch the event classes in proxy_core to match the ones
-    # used in this test. Otherwise, if proxy_core loaded the fallback 'object' aliases,
-    # isinstance(event, proxy_core.RequestReceived) will return True for ANY event.
-    
     with patch("proxy_core.H2_AVAILABLE", True), \
          patch("proxy_core.H2Connection"), \
          patch("proxy_core.H2Configuration"), \
@@ -58,8 +48,6 @@ def dispatch_handler():
         handler = NativeProxyHandler(AsyncMock(), MagicMock(), "test:443", MagicMock(), None, None)
         handler.downstream_conn = MagicMock()
         handler.upstream_conn = MagicMock()
-        
-        # [FIX] Initialize queues which are used in dispatch
         handler.upstream_queue = AsyncMock()
         handler.downstream_queue = AsyncMock()
         
@@ -71,7 +59,6 @@ def dispatch_handler():
 async def test_handle_downstream_dispatch(dispatch_handler):
     # Mock all specific handlers
     dispatch_handler.handle_request_received = AsyncMock()
-    # dispatch_handler.handle_data_received = AsyncMock()  <-- No longer called directly
     dispatch_handler.handle_stream_ended = AsyncMock()
     dispatch_handler.handle_stream_reset = AsyncMock()
     dispatch_handler.handle_window_updated = AsyncMock()
@@ -84,12 +71,9 @@ async def test_handle_downstream_dispatch(dispatch_handler):
     dispatch_handler.handle_request_received.assert_awaited_with(evt_req)
 
     # 2. DataReceived
-    # [FIX] Added stream_ended=False explicitly to match expectations
     evt_data = create_event(DataReceived, stream_id=1, data=b'', flow_controlled_length=0, stream_ended=False)
     await dispatch_handler.handle_downstream_event(evt_data)
-    
-    # [FIX] Verify queue interaction instead of handler call
-    dispatch_handler.upstream_queue.put.assert_awaited_with((1, b'', False))
+    dispatch_handler.upstream_queue.put.assert_awaited_with((1, b'', False, dispatch_handler.downstream_conn, 0))
 
     # 3. StreamEnded
     evt_end = create_event(StreamEnded, stream_id=1)
@@ -114,19 +98,8 @@ async def test_handle_downstream_dispatch(dispatch_handler):
     # 7. TrailersReceived
     evt_trail = create_event(TrailersReceived, stream_id=1, headers=[])
     await dispatch_handler.handle_downstream_event(evt_trail)
-    # TrailersReceived logic might be inline or handler, checking implementation:
-    # It enqueues headers. So queue.put is expected if trailers are treated as data, 
-    # OR calls send_headers directly.
-    # Looking at proxy_core source: handle_downstream_event for TrailersReceived
-    # calls upstream_conn.send_headers(...) directly.
-    # But wait, test_handle_trailers in advanced tests showed it calls handle_downstream_event?
-    # Actually, line 370 in proxy_core.py calls upstream_conn.send_headers. 
-    # It does NOT call handle_trailers_received (which is empty/pass).
-    # So we can't assert handle_trailers_received is awaited. We check logic execution.
-    # Since dispatcher mocks upstream_conn, we verify send_headers.
     
-    # However, for THIS test file, we mock the handler methods. 
-    # If the logic is inline, we verify the inline action (send_headers).
+    # [FIXED] This assertion is now properly indented inside the test function
     dispatch_handler.upstream_conn.send_headers.assert_called_with(1, [], end_stream=True)
 
 # -- Upstream Dispatch Tests --
@@ -140,20 +113,15 @@ async def test_handle_upstream_dispatch(dispatch_handler):
 
     # 1. ResponseReceived (Direct header send)
     evt_resp = create_event(ResponseReceived, stream_id=1, headers=[], stream_ended=False)
-    
-    # Ensure downstream is considered open so headers are sent
     dispatch_handler.downstream_conn.stream_is_closed.return_value = False
     
     await dispatch_handler.handle_upstream_event(evt_resp)
     dispatch_handler.downstream_conn.send_headers.assert_called_with(1, [], end_stream=False)
 
     # 2. DataReceived
-    # [FIX] Added stream_ended=False explicitly to match expectations
     evt_data = create_event(DataReceived, stream_id=1, data=b'', flow_controlled_length=0, stream_ended=False)
     await dispatch_handler.handle_upstream_event(evt_data)
-    
-    # [FIX] Verify queue interaction instead of handler call
-    dispatch_handler.downstream_queue.put.assert_awaited_with((1, b'', False))
+    dispatch_handler.downstream_queue.put.assert_awaited_with((1, b'', False, dispatch_handler.upstream_conn, 0))
 
     # 3. StreamEnded
     evt_end = create_event(StreamEnded, stream_id=1)
@@ -162,7 +130,6 @@ async def test_handle_upstream_dispatch(dispatch_handler):
 
     # 4. TrailersReceived (Direct header send)
     evt_trail = create_event(TrailersReceived, stream_id=1, headers=[])
-    
     await dispatch_handler.handle_upstream_event(evt_trail)
     dispatch_handler.downstream_conn.send_headers.assert_called_with(1, [], end_stream=True)
 
@@ -171,24 +138,17 @@ async def test_handle_upstream_dispatch(dispatch_handler):
 @pytest.mark.asyncio
 async def test_read_loop_wrapper_success(dispatch_handler):
     dispatch_handler.read_loop = AsyncMock()
-    
     await dispatch_handler._read_loop_wrapper("reader", "conn", "handler")
     dispatch_handler.read_loop.assert_awaited_with("reader", "conn", "handler")
 
 @pytest.mark.asyncio
 async def test_read_loop_wrapper_connection_error(dispatch_handler):
-    # Simulate connection reset inside read_loop
     dispatch_handler.read_loop = AsyncMock(side_effect=ConnectionResetError())
-    
-    # Should catch error and set closed
     await dispatch_handler._read_loop_wrapper("reader", "conn", "handler")
     assert dispatch_handler.closed.is_set()
 
 @pytest.mark.asyncio
 async def test_read_loop_wrapper_unexpected_error(dispatch_handler):
-    # Simulate unexpected error
     dispatch_handler.read_loop = AsyncMock(side_effect=ValueError("Boom"))
-    
-    # Should re-raise so TaskGroup sees it
     with pytest.raises(ValueError, match="Boom"):
         await dispatch_handler._read_loop_wrapper("reader", "conn", "handler")

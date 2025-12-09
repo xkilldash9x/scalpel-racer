@@ -12,6 +12,8 @@ Dependencies:
     - NetfilterQueue (Python)
     - scapy (Python)
     - root privileges (for iptables and NFQueue binding)
+
+[REFACTORED] Switched from print/traceback to logging for operational output.
 """
 
 import os
@@ -20,7 +22,11 @@ import threading
 import time
 import subprocess
 import socket
+import logging
 from typing import Optional, Tuple, List
+
+# Configure logger
+logger = logging.getLogger(__name__)
 
 # Conditional imports and availability check for Linux-specific libraries
 NFQUEUE_AVAILABLE = False
@@ -35,13 +41,13 @@ if sys.platform.startswith("linux"):
     except ImportError:
         # Check if we are likely in a mocked test environment before printing warnings
         if 'unittest' not in sys.modules:
-            print("[!] 'NetfilterQueue' or 'scapy' not found. First Sequence Sync will be disabled.")
-            print("[!] Install them via: pip install NetfilterQueue scapy")
-            print("[!] Ensure system dependencies (e.g. libnetfilter-queue-dev) are installed.")
+            logger.warning("'NetfilterQueue' or 'scapy' not found. First Sequence Sync will be disabled.")
+            logger.warning("Install them via: pip install NetfilterQueue scapy")
+            logger.warning("Ensure system dependencies (e.g. libnetfilter-queue-dev) are installed.")
     except Exception as e:
         if 'unittest' not in sys.modules:
             # Catch other potential initialization errors
-            print(f"[!] Error initializing NFQueue/Scapy: {e}. First Sequence Sync disabled.")
+            logger.error(f"Error initializing NFQueue/Scapy: {e}. First Sequence Sync disabled.")
 # If not Linux, NFQUEUE_AVAILABLE remains False.
 
 # Configuration Constants
@@ -120,7 +126,7 @@ class PacketController:
             PermissionError: If root privileges are missing.
             RuntimeError: If binding to the queue fails.
         """
-        print(f"[*] PacketController: Starting interception for {self.target_ip}:{self.target_port} (Source Port: {self.source_port})")
+        logger.info(f"PacketController: Starting interception for {self.target_ip}:{self.target_port} (Source Port: {self.source_port})")
 
         # 1. Set up the iptables rule (PC1: Now idempotent)
         self._manage_iptables(action='A')
@@ -153,7 +159,7 @@ class PacketController:
         self.release_thread = threading.Thread(target=self._delayed_release_first_packet, daemon=True)
         self.release_thread.start()
 
-        print("[*] PacketController: Active and listening on NFQueue.")
+        logger.info("PacketController: Active and listening on NFQueue.")
 
     def stop(self):
         """
@@ -165,7 +171,7 @@ class PacketController:
         if not self.active:
             return
 
-        print("[*] PacketController: Stopping...")
+        logger.info("PacketController: Stopping...")
         self.active = False
 
         # 1. Unbind the queue (causes nfqueue.run() to return)
@@ -186,15 +192,15 @@ class PacketController:
         if self.listener_thread:
             self.listener_thread.join(timeout=1)
             if self.listener_thread.is_alive():
-                print("[!] Warning: PacketController listener thread did not terminate cleanly (zombie thread).")
+                logger.warning("PacketController listener thread did not terminate cleanly (zombie thread).")
         
         if self.release_thread:
             self.release_thread.join(timeout=1)
             if self.release_thread.is_alive():
-                 print("[!] Warning: PacketController release thread did not terminate cleanly.")
+                 logger.warning("PacketController release thread did not terminate cleanly.")
 
 
-        print("[*] PacketController: Stopped.")
+        logger.info("PacketController: Stopped.")
 
     def _manage_iptables(self, action: str):
         """
@@ -265,7 +271,7 @@ class PacketController:
                 raise RuntimeError(f"Failed to configure iptables (Return code {e.returncode}).")
             # If deletion fails (rare due to the check), log a warning.
             elif action == 'D':
-                print(f"[!] Warning: Failed to remove iptables rule (Return code {e.returncode}). Rule might need manual removal.")
+                logger.warning(f"Failed to remove iptables rule (Return code {e.returncode}). Rule might need manual removal.")
 
     def _listener_loop(self):
         """
@@ -280,7 +286,7 @@ class PacketController:
         except Exception as e:
             if self.active:
                 # Log errors only if the controller is supposed to be active
-                print(f"[!] NFQueue listener loop error: {e}")
+                logger.error(f"NFQueue listener loop error: {e}")
 
     def _queue_callback(self, pkt):
         """
@@ -318,7 +324,7 @@ class PacketController:
             with self.lock:
                 if self.first_packet_info is None:
                     # This is the very first data packet of the burst. Hold it.
-                    print(f"[*] Intercepted and holding First Packet (Seq: {seq}, Len: {payload_len})")
+                    logger.info(f"Intercepted and holding First Packet (Seq: {seq}, Len: {payload_len})")
                     self.first_packet_info = (seq, pkt)
                     # Calculate the sequence number expected for the next packet
                     self.expected_next_seq = seq + payload_len
@@ -343,7 +349,7 @@ class PacketController:
 
         except Exception as e:
             # Safety catch: Accept the packet if processing fails
-            print(f"[!] Error processing packet: {e}")
+            logger.error(f"Error processing packet: {e}")
             if hasattr(pkt, 'accept'):
                 pkt.accept()
 
@@ -359,14 +365,14 @@ class PacketController:
         # 1. Wait until the first packet is intercepted and held
         if not self.first_packet_held.wait(timeout=5):
             if self.active:
-                print("[!] Timeout waiting for the first packet to be intercepted.")
+                logger.warning("Timeout waiting for the first packet to be intercepted.")
             return
 
         # 2. Synchronization: Wait until subsequent packets are released first.
         if not self.subsequent_packets_released.wait(timeout=0.5):  # 500ms timeout
             # If timeout occurs, the entire payload likely fit in the first packet (smaller than MTU).
             if self.active:
-                print("[*] Note: No subsequent packets detected. Payload likely smaller than MTU. Releasing immediately.")
+                logger.info("Note: No subsequent packets detected. Payload likely smaller than MTU. Releasing immediately.")
         else:
             # 3. If subsequent packets were released, add the fixed delay.
             time.sleep(REORDER_DELAY)
@@ -377,10 +383,10 @@ class PacketController:
             if self.first_packet_info and self.active:
                 seq, pkt = self.first_packet_info
                 try:
-                    print(f"[*] Releasing First Packet (Seq: {seq})")
+                    logger.info(f"Releasing First Packet (Seq: {seq})")
                     # Verdict the packet (Accept) so the OS sends it out (now out of order).
                     pkt.accept()
                 except Exception as e:
                     # Handle potential errors if the packet already expired from the queue
-                    print(f"[!] Error releasing first packet: {e}")
+                    logger.error(f"Error releasing first packet: {e}")
                 self.first_packet_info = None

@@ -1,3 +1,4 @@
+# tests/test_sync_http11.py
 import pytest
 from unittest.mock import MagicMock, patch, ANY, call
 import socket
@@ -150,6 +151,7 @@ def test_run_attack_dns_failure(engine, mock_dependencies):
 @patch('sync_http11.HTTPResponse')
 def test_attack_thread_success_flow(MockHTTPResponse, engine, mock_dependencies):
     engine.target_ip = "1.2.3.4"
+    # [CONFIRMATION] Retaining mock_sock to assert send calls later
     mock_sock = mock_dependencies["wrapped_sock"]
     
     # Mock Response
@@ -192,11 +194,13 @@ def test_attack_thread_truncated_response(MockHTTPResponse, engine, mock_depende
     engine.barrier = MagicMock() # Bypass barrier for this unit test
     
     # Run synchronously
-    with patch("builtins.print") as mock_print:
+    # [FIX] Patch 'sync_http11.logger.warning' instead of 'builtins.print' because
+    # the refactored code uses logger.warning().
+    with patch("sync_http11.logger.warning") as mock_log_warn:
         engine._attack_thread(0)
         
-        # Verify warning printed
-        args, _ = mock_print.call_args
+        # Verify warning logged
+        args, _ = mock_log_warn.call_args
         assert "Response truncated" in args[0]
 
 @patch('sync_http11.HTTPResponse')

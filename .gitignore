@@ -10,6 +10,7 @@ venv/
 venv
 .idea/
 .vscode/
-collect_code.sh
 scalpel_ca.pem
 scalpel_ca.key
+collect_code.sh
+
