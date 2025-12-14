@@ -1,1119 +1,1118 @@
 # proxy_core.py
+
 """
-Implements the HTTP/2 Native Proxy Handler using Sans-IO principles.
+Implements a RFC-Compliant Dual-Stack (HTTP/1.1 and HTTP/2) Proxy Handler.
 
-This module provides the `NativeProxyHandler` class, which manages the lifecycle
-of HTTP/2 connections between a client (downstream) and a target server (upstream).
-It implements a full-duplex proxy with support for flow control, state machine
-synchronization, and traffic interception/capture.
-
-It handles:
-- RFC 9113 header strictness.
-- RFC 8441 (Extended CONNECT) for WebSocket bootstrapping.
-- Structured concurrency via `asyncio.TaskGroup`.
-- "Drain-then-ACK" flow control to prevent deadlocks and memory issues.
-- HPACK Bomb mitigation.
-- Graceful shutdown logic.
+Refactored for Manager Integration and Scalpel Racer MITM capabilities.
+Includes full logic for recursive TLS upgrading and strict HTTP parsing.
 """
 
 import asyncio
 import ssl
-import socket
-import logging
-from typing import Dict, Optional, Callable, Tuple, List, Any, TypedDict
-from urllib.parse import urljoin, urlunparse
-import sys
+import re
+import time
+from typing import Dict, Optional, Callable, Tuple, List, Any, Set, TypedDict
+from urllib.parse import urljoin, urlunparse, urlparse
 
-# Import hyper-h2 (Sans-IO library - PDF Section 1)
+try:
+    from structures import CapturedRequest, HOP_BY_HOP_HEADERS, CapturedHeaders
+except ImportError:
+    from dataclasses import dataclass
+    @dataclass
+    class CapturedRequest:
+        id: int
+        method: str
+        url: str
+        headers: List[Tuple[str, str]]
+        body: bytes
+        truncated: bool = False
+        protocol: str = "HTTP/1.1"
+        edited_body: Optional[bytes] = None
+    
+    class CapturedHeaders(TypedDict):
+        pseudo: Dict[str, str]
+        headers: List[Tuple[str, str]]
+
+    HOP_BY_HOP_HEADERS = ['connection', 'keep-alive', 'te', 'transfer-encoding', 'upgrade', 'proxy-connection']
+
 try:
     from h2.connection import H2Connection
     from h2.config import H2Configuration
     from h2.events import (
         RequestReceived, DataReceived, StreamEnded, StreamReset, WindowUpdated,
-        SettingsAcknowledged, ConnectionTerminated, TrailersReceived, PingAckReceived,
-        ResponseReceived
+        SettingsAcknowledged, ConnectionTerminated, TrailersReceived,
+        ResponseReceived, RemoteSettingsChanged, PingReceived, PriorityUpdated
     )
     from h2.errors import ErrorCodes
     from h2.exceptions import FlowControlError, ProtocolError, StreamClosedError
     from h2.settings import SettingCodes
-    H2_AVAILABLE = True
 except ImportError:
-    H2_AVAILABLE = False
-    # Define placeholders as classes to satisfy type checkers (Pylance/MyPy)
-    class H2Connection: pass
-    class H2Configuration: pass
-    class RequestReceived: pass
-    class DataReceived: pass
-    class StreamEnded: pass
-    class StreamReset: pass
-    class WindowUpdated: pass
-    class SettingsAcknowledged: pass 
-    class ConnectionTerminated: pass
-    class TrailersReceived: pass
-    class PingAckReceived: pass 
-    class ResponseReceived: pass
-    
-    class ErrorCodes:
-        NO_ERROR = 0x0
-        PROTOCOL_ERROR = 0x1
-        INTERNAL_ERROR = 0x2
-        FLOW_CONTROL_ERROR = 0x3
-        SETTINGS_TIMEOUT = 0x4
-        STREAM_CLOSED = 0x5
-        FRAME_SIZE_ERROR = 0x6
-        REFUSED_STREAM = 0x7
-        CANCEL = 0x8
-        COMPRESSION_ERROR = 0x9
-        CONNECT_ERROR = 0xa
-        ENHANCE_YOUR_CALM = 0xb
-        INADEQUATE_SECURITY = 0xc
-        HTTP_1_1_REQUIRED = 0xd
+    raise ImportError("The 'h2' library is required. Install via: pip install h2")
 
-    class SettingCodes:
-        HEADER_TABLE_SIZE = 0x1
-        ENABLE_PUSH = 0x2
-        MAX_CONCURRENT_STREAMS = 0x3
-        INITIAL_WINDOW_SIZE = 0x4
-        MAX_FRAME_SIZE = 0x5
-        MAX_HEADER_LIST_SIZE = 0x6
-        ENABLE_CONNECT_PROTOCOL = 0x8
-
-    class FlowControlError(Exception): pass
-    class ProtocolError(Exception): pass
-    class StreamClosedError(ProtocolError): pass
-
-# Import structures from the main application (if available)
 try:
-    # We rely on these structures being available in the environment
-    from structures import CapturedRequest, HOP_BY_HOP_HEADERS
+    import hpack
 except ImportError:
-    # Placeholders for independent testing/development
-    class CapturedRequest:
-        """Mock CapturedRequest for testing/independence."""
-        def __init__(self, id, method, url, headers, body):
-            self.id = id; self.method = method; self.url = url; self.headers = headers;
-            self.body = body
-        def __str__(self): return f"{self.method} {self.url}"
-    # Use a robust default list if import fails
-    HOP_BY_HOP_HEADERS = [
-        'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
-        'te', 'trailers', 'transfer-encoding', 'upgrade',
-        'host', 'accept-encoding', 'upgrade-insecure-requests',
-        'proxy-connection', 'content-length', 'http2-settings'
-    ]
+    hpack = None
 
-# Setup logging
-log = logging.getLogger("proxy_core")
+# Constants
+H2_FORBIDDEN_HEADERS: Set[str] = {
+    'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade'
+}
 
-# Configuration Constants
+SENSITIVE_HEADERS: Set[str] = {
+    'authorization', 'proxy-authorization', 'cookie', 'set-cookie', 'x-auth-token'
+}
+
+STRICT_HEADER_PATTERN = re.compile(rb'^([^:\s]+):[ \t]*(.*)$')
+
 UPSTREAM_CONNECT_TIMEOUT = 10.0
 IDLE_TIMEOUT = 60.0
-GRACEFUL_SHUTDOWN_TIMEOUT = 10.0
-FLOW_CONTROL_TIMEOUT = 30.0  # Timeout for waiting on WINDOW_UPDATE
-SOCKET_CLOSE_TIMEOUT = 5.0 # Prevent wait_closed() hangs
-MAX_HEADER_LIST_SIZE = 65536  # 64KB (RFC 9113 Security: Prevent HPACK Bomb)
-QUEUE_MAX_SIZE = 1000 # Backpressure limit
-MAX_STREAM_ID = 2147483647 # 2^31 - 1 (RFC 7540)
-
-# Define TypedDict for captured header structure
-class CapturedHeaders(TypedDict):
-    pseudo: Dict[str, str]
-    headers: Dict[str, str] # Store normal headers as a dictionary for easier manipulation
-
+KEEPALIVE_INTERVAL = 10.0
+FLOW_CONTROL_TIMEOUT = 30.0
+MAX_HEADER_LIST_SIZE = 262144
+MAX_CAPTURE_BODY_SIZE = 10 * 1024 * 1024
+STREAM_QUEUE_SIZE = 100
+H2_PREFACE = b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
+GOAWAY_MAX_FRAME = b'\x00\x00\x08\x07\x00\x00\x00\x00\x00\x7f\xff\xff\xff\x00\x00\x00\x00'
 
 class StreamContext:
-    """
-    Manages the state, synchronization, and capture data for a single proxied stream.
-    """
     def __init__(self, stream_id: int, scheme: str):
         self.stream_id = stream_id
         self.scheme = scheme
-        
-        # Half-Closed State tracking
         self.downstream_closed = False
         self.upstream_closed = False
-        
-        # Synchronization for flow control
-        self.flow_control_event = asyncio.Event()
-        self.flow_control_event.set()  # Start open
-
-        # Capture data structures
-        self.captured_headers: CapturedHeaders = {"pseudo": {}, "headers": {}}
+        self.upstream_flow_event = asyncio.Event()
+        self.downstream_flow_event = asyncio.Event()
+        self.upstream_flow_event.set()
+        self.downstream_flow_event.set()
+        self.upstream_queue = asyncio.Queue(maxsize=STREAM_QUEUE_SIZE)
+        self.downstream_queue = asyncio.Queue(maxsize=STREAM_QUEUE_SIZE)
+        self.sender_tasks: List[asyncio.Task] = []
+        self.captured_headers = {"pseudo": {}, "headers": []}
         self.request_body = bytearray()
         self.capture_finalized = False
+        self.truncated = False
 
+class ProxyError(Exception):
+    pass
+class PayloadTooLargeError(ProxyError):
+    pass
 
-class NativeProxyHandler:
-    """
-    Implements the core HTTP/2 proxy logic using Sans-IO principles (hyper-h2).
-    Manages the lifecycle of both downstream (client) and upstream (server) connections,
-    mediating events between them while handling interception and modification logic.
-    """
-
-    def __init__(self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter, 
-                 explicit_host: str, capture_callback: Callable, 
-                 target_override: Optional[str], scope_pattern: Optional[Any],
-                 enable_tunneling: bool = True):
-        """
-        Initializes the NativeProxyHandler.
-
-        Args:
-            client_reader (asyncio.StreamReader): The reader for the client connection.
-            client_writer (asyncio.StreamWriter): The writer for the client connection.
-            explicit_host (str): The host/authority derived from the CONNECT request.
-            capture_callback (Callable): Callback to invoke when a request is captured.
-            target_override (Optional[str]): Base URL to override target (if any).
-            scope_pattern (Optional[Any]): Compiled regex pattern for scope filtering.
-            enable_tunneling (bool): Whether to forward requests upstream.
-        """
-        if not H2_AVAILABLE:
-            # Allow initialization if in a mocked test environment
-            if 'unittest' not in sys.modules and 'pytest' not in sys.modules:
-                raise RuntimeError("hyper-h2 is required for NativeProxyHandler.")
-
-        self.client_reader = client_reader
-        self.client_writer = client_writer
-        
-        self.explicit_host = explicit_host # Host derived from CONNECT
-        self.capture_callback = capture_callback
-        self.target_override = target_override
-        self.scope_pattern = scope_pattern
-        self.enable_tunneling = enable_tunneling
-
-        # Upstream connection details
-        self.upstream_reader: Optional[asyncio.StreamReader] = None
-        self.upstream_writer: Optional[asyncio.StreamWriter] = None
+class BaseProxyHandler:
+    def __init__(self, explicit_host: str, upstream_verify_ssl: bool, 
+                 upstream_ca_bundle: Optional[str], manager_callback: Callable,
+                 ssl_context_factory: Optional[Callable] = None):
+        self.explicit_host = explicit_host
+        self.upstream_verify_ssl = upstream_verify_ssl
+        self.upstream_ca_bundle = upstream_ca_bundle
+        self.callback = manager_callback
+        self.ssl_context_factory = ssl_context_factory
         self.upstream_host: str = ""
         self.upstream_port: int = 443
-        
-        self.upstream_scheme: str = "https"  # H2 interception is always over TLS (h2)
 
-        # H2 State Machines
-        # Enforce strictness: validate=True, normalize=True (RFC 9113)
-        ds_config = H2Configuration(
-            client_side=False, 
-            header_encoding='utf-8', 
-            validate_inbound_headers=True, 
-            validate_outbound_headers=True,
-            normalize_inbound_headers=True,
-            normalize_outbound_headers=True
+    def log(self, level: str, msg: Any):
+        if self.callback:
+            self.callback(level, msg)
+
+    def _parse_target(self, explicit_host: str) -> Tuple[str, int]:
+        if explicit_host.startswith('['):
+            end_bracket = explicit_host.find(']')
+            if end_bracket != -1:
+                host = explicit_host[1:end_bracket]
+                remaining = explicit_host[end_bracket+1:]
+                if remaining.startswith(':'):
+                    try: return host, int(remaining[1:])
+                    except ValueError: pass
+                else: return host, 443
+        if ':' in explicit_host:
+            host, port_str = explicit_host.rsplit(':', 1)
+            try: return host, int(port_str)
+            except ValueError: pass
+        return explicit_host, 443
+
+    async def _connect_upstream(self, host: str, port: int, alpn_protocols: List[str] = None) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        ctx = ssl.create_default_context()
+        if self.upstream_verify_ssl:
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            ctx.check_hostname = True
+            if self.upstream_ca_bundle:
+                ctx.load_verify_locations(cafile=self.upstream_ca_bundle)
+        else:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        
+        if alpn_protocols:
+            try: ctx.set_alpn_protocols(alpn_protocols)
+            except NotImplementedError: pass
+
+        return await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ctx),
+            timeout=UPSTREAM_CONNECT_TIMEOUT
         )
-        
-        # Handle potential initialization failure if H2Connection is a mock object or dependencies are missing
-        try:
-            self.downstream_conn = H2Connection(config=ds_config)
+    
+    def _is_url_allowed(self, url: str, scope_pattern: Optional[Any]) -> bool:
+        if not scope_pattern:
+            return True
+        return bool(scope_pattern.search(url))
+
+class Http11ProxyHandler(BaseProxyHandler):
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, 
+                 explicit_host: str, manager_callback, target_override, scope_pattern,
+                 upstream_verify_ssl=False, upstream_ca_bundle=None, initial_data=b"",
+                 ssl_context_factory=None, enable_tunneling=True):
+        super().__init__(explicit_host, upstream_verify_ssl, upstream_ca_bundle, manager_callback, ssl_context_factory)
+        self.reader = reader
+        self.writer = writer
+        self.target_override = target_override
+        self.scope_pattern = scope_pattern
+        self.buffer = bytearray(initial_data)
+        self.enable_tunneling = enable_tunneling
+        self._previous_byte_was_cr = False
+
+    async def _read_strict_line(self) -> bytes:
+        while True:
+            try:
+                lf_index = self.buffer.index(b'\n')
+            except ValueError:
+                if self.buffer:
+                    self._previous_byte_was_cr = (self.buffer[-1] == 0x0D)
+                if len(self.buffer) > MAX_HEADER_LIST_SIZE:
+                    raise ProxyError("Header Line Exceeded Max Length")
+                
+                try:
+                    data = await asyncio.wait_for(self.reader.read(4096), timeout=IDLE_TIMEOUT)
+                except asyncio.TimeoutError:
+                    raise ProxyError("Read Timeout (Idle)")
+                
+                if not data:
+                    if self.buffer: raise ProxyError("Incomplete message")
+                    return b""
+                self.buffer.extend(data)
+                continue
             
-            # HPACK Bomb Protection
-            self.downstream_conn.local_settings.max_header_list_size = MAX_HEADER_LIST_SIZE
+            if lf_index > MAX_HEADER_LIST_SIZE:
+                raise ProxyError("Header Line Exceeded Max Length")
 
-            # Enable Extended CONNECT (RFC 8441)
-            self.downstream_conn.local_settings.enable_connect_protocol = 1
-        except Exception as e:
-            if not H2_AVAILABLE:
-                 self.downstream_conn = None
+            is_crlf = False
+            if lf_index > 0:
+                if self.buffer[lf_index - 1] == 0x0D:
+                    is_crlf = True
+            elif lf_index == 0:
+                if self._previous_byte_was_cr:
+                    is_crlf = True
+            
+            if not is_crlf:
+                raise ProxyError("Bare LF detected or missing CR. Strict CRLF required")
+            
+            if lf_index > 0:
+                line = self.buffer[:lf_index - 1]
             else:
-                 raise e
-
-
-        # Upstream (Proxy acts as Client) - Initialized after connection
-        self.upstream_conn: Optional[H2Connection] = None
-
-        self.streams: Dict[int, StreamContext] = {}
-        self.closed = asyncio.Event()
-        self.tasks = []
-
-        # Bounded queues for outbound data.
-        # Queue Items: (stream_id, data, end_stream, ack_target_connection, ack_length)
-        # Bounded size applies backpressure to the read loop when the write loop (network) is slow.
-        self.upstream_queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
-        self.downstream_queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
+                line = b"" 
+            
+            self.buffer = self.buffer[lf_index + 1:] 
+            self._previous_byte_was_cr = False 
+            return line
 
     async def run(self):
-        """
-        Main execution loop for the proxy connection.
-        """
-        # Safety check if initialization failed due to missing dependencies
-        if not self.downstream_conn:
+        try:
+            while True:
+                try:
+                    line = await self._read_strict_line()
+                except ProxyError as e:
+                    self.log("ERROR", f"Framing Error: {e}")
+                    if "Timeout" not in str(e) and "Incomplete" not in str(e):
+                        await self._send_error(400, "Bad Request")
+                    return
+
+                if not line: break 
+
+                try:
+                    method_b, target_b, version_b = line.split(b' ', 2)
+                    method = method_b.decode('ascii')
+                    target = target_b.decode('ascii')
+                    http_version = version_b.decode('ascii').upper()
+                except ValueError:
+                    await self._send_error(400, "Malformed Request Line")
+                    return
+
+                headers = []
+                headers_dict = {}
+                
+                try:
+                    while True:
+                        h_line = await self._read_strict_line()
+                        if not h_line: break 
+                        if h_line[0] in (0x20, 0x09):
+                            raise ProxyError("Obsolete Line Folding Rejected")
+                        match = STRICT_HEADER_PATTERN.match(h_line)
+                        if not match:
+                            raise ProxyError("Invalid Header Syntax")
+                        key = match.group(1).decode('ascii')
+                        val = match.group(2).decode('ascii').strip() 
+                        headers.append((key, val))
+                        headers_dict[key.lower()] = val
+                except ProxyError as e:
+                    await self._send_error(400, str(e))
+                    return
+
+                # [FIXED] Proper H1 Validation: Ban Pseudo-headers, Allow TE/Connection
+                validation_rules = [
+                    (
+                        method == 'OPTIONS' and 'access-control-request-method' not in headers_dict,
+                        "OPTIONS requires Access-Control-Request-Method"
+                    ),
+                    (
+                        method == 'CONNECT' and 'host' not in headers_dict,
+                        "CONNECT requires Host header"
+                    ),
+                    (
+                        # Pseudo-headers (starting with :) are illegal in HTTP/1.x
+                        any(k.startswith(':') for k in headers_dict),
+                        "Pseudo-header in HTTP/1.1" 
+                    )
+                ]
+
+                for is_invalid, error_msg in validation_rules:
+                    if is_invalid:
+                        await self._send_error(400, error_msg)
+                        return
+
+                te_header = headers_dict.get('transfer-encoding')
+                cl_header = headers_dict.get('content-length')
+                if te_header:
+                    if cl_header:
+                        headers = [h for h in headers if h[0].lower() != 'content-length']
+                        if 'content-length' in headers_dict:
+                             del headers_dict['content-length']
+                    encodings = [e.strip() for e in te_header.split(',')]
+                    # RFC 7230: 'chunked' must be the final encoding
+                    if 'chunked' in encodings and encodings[-1].lower() != 'chunked':
+                        await self._send_error(400, "Bad Transfer-Encoding")
+                        return
+
+                conn_header = headers_dict.get('connection', '').lower()
+                keep_alive = True
+                if http_version == 'HTTP/1.0':
+                    if 'keep-alive' not in conn_header: keep_alive = False
+                elif 'close' in conn_header:
+                    keep_alive = False
+
+                if method == 'CONNECT':
+                    await self._handle_connect(target)
+                    return 
+                else:
+                    await self._handle_request(method, target, version_b, headers, headers_dict)
+                    if not keep_alive: break
+
+        except Exception as e:
+            self.log("ERROR", f"HTTP/1.1 Proxy Error: {e}")
+        finally:
+            if not self.writer.is_closing():
+                self.writer.close()
+
+    async def _send_error(self, code, message):
+        try:
+            self.writer.write(f"HTTP/1.1 {code} {message}\r\nConnection: close\r\n\r\n".encode())
+            await self.writer.drain()
+        except Exception: pass
+
+    async def _handle_request(self, method, target, version_b, headers, headers_dict):
+        req_host = self.explicit_host or headers_dict.get('host')
+        if not req_host:
+            parsed = urlparse(target)
+            req_host = parsed.netloc
+        host, port = self._parse_target(req_host)
+        
+        scheme = "https" if self.upstream_verify_ssl else "http"
+        
+        full_url = ""
+        if self.target_override:
+            full_url = urljoin(self.target_override, target.lstrip('/'))
+        else:
+            if target.startswith("http"):
+                full_url = target
+            else:
+                full_url = f"{scheme}://{host}:{port}{target}"
+
+        if not self._is_url_allowed(full_url, self.scope_pattern):
+            self.log("WARN", f"Blocked Request to {full_url} (Scope Violation)")
+            await self._send_error(403, "Forbidden by Proxy Scope")
+            return
+
+        body = b""
+        transfer_encoding = headers_dict.get('transfer-encoding', '').lower()
+        content_length = headers_dict.get('content-length')
+
+        if 'chunked' in transfer_encoding:
+            body = await self._read_chunked_body()
+        elif content_length:
+            try:
+                length = int(content_length)
+                body = await self._read_bytes(length)
+            except ValueError:
+                pass 
+
+        self._record_capture(method, target, headers, body, scheme, host)
+
+        if not self.enable_tunneling:
+            msg = b"Captured."
+            self.writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(msg)).encode() + b"\r\n\r\n" + msg)
+            await self.writer.drain()
             return
 
         try:
-            # 1. Determine Upstream Target
-            if not self._resolve_target():
+            u_reader, u_writer = await self._connect_upstream(host, port)
+        except asyncio.TimeoutError:
+            await self._send_error(504, "Gateway Timeout")
+            return
+        except Exception:
+            await self._send_error(502, "Bad Gateway")
+            return
+
+        req_line = f"{method} {target} {version_b.decode()}\r\n".encode()
+        u_writer.write(req_line)
+        hop_by_hop = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailers', 'upgrade'}
+        
+        final_headers = []
+        for k, v in headers:
+            if k.lower() not in hop_by_hop:
+                final_headers.append((k, v))
+        final_headers.append(('Content-Length', str(len(body))))
+        final_headers.append(('Connection', 'close')) 
+
+        for k, v in final_headers:
+            u_writer.write(f"{k}: {v}\r\n".encode())
+        u_writer.write(b"\r\n")
+        
+        if body:
+            u_writer.write(body)
+        await u_writer.drain()
+
+        await self._pipe(u_reader, self.writer)
+        u_writer.close()
+
+    async def _read_chunked_body(self) -> bytes:
+        body_parts = []
+        while True:
+            line = await self._read_strict_line()
+            if b';' in line: line, _ = line.split(b';', 1)
+            try: chunk_size = int(line.strip(), 16)
+            except ValueError: raise ProxyError("Invalid chunk size")
+            
+            if chunk_size == 0:
+                while True:
+                    trailer = await self._read_strict_line()
+                    if not trailer: break
+                break
+            
+            data = await self._read_bytes(chunk_size)
+            body_parts.append(data)
+            await self._read_strict_line()
+        return b"".join(body_parts)
+    
+    async def _read_bytes(self, n: int) -> bytes:
+        while len(self.buffer) < n:
+            try:
+                data = await asyncio.wait_for(self.reader.read(4096), timeout=IDLE_TIMEOUT)
+            except asyncio.TimeoutError:
+                raise ProxyError("Read Timeout (Idle) in Body")
+                
+            if not data: raise ProxyError("Incomplete read")
+            self.buffer.extend(data)
+        chunk = self.buffer[:n]
+        self.buffer = self.buffer[n:]
+        return bytes(chunk)
+
+    async def _handle_connect(self, target: str):
+        check_url = f"https://{target}/"
+        if not self._is_url_allowed(check_url, self.scope_pattern):
+            self.log("WARN", f"Blocked CONNECT to {target} (Scope Violation)")
+            await self._send_error(403, "Forbidden by Proxy Scope")
+            return
+
+        host, port = self._parse_target(target)
+        
+        if self.ssl_context_factory:
+            try:
+                ssl_ctx = self.ssl_context_factory(host)
+                self.writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await self.writer.drain()
+                await self.writer.start_tls(ssl_ctx)
+                
+                handler = DualProtocolHandler(
+                    self.reader, self.writer, 
+                    explicit_host=target, 
+                    manager_callback=self.callback,
+                    target_override=self.target_override,
+                    scope_pattern=self.scope_pattern,
+                    enable_tunneling=self.enable_tunneling,
+                    upstream_verify_ssl=self.upstream_verify_ssl,
+                    upstream_ca_bundle=self.upstream_ca_bundle,
+                    ssl_context_factory=self.ssl_context_factory
+                )
+                await handler.run()
                 return
 
-            # 2. Establish Upstream Connection (Only if tunneling is enabled)
-            if self.enable_tunneling:
-                await self.connect_upstream()
+            except Exception as e:
+                self.log("ERROR", f"MITM Handshake Failed for {target}: {e}")
+                return
 
-                # 3. Initialize H2 on upstream side
-                # Enforce strictness for upstream too
-                us_config = H2Configuration(
-                    client_side=True, 
-                    header_encoding='utf-8', 
-                    validate_inbound_headers=True,
-                    validate_outbound_headers=True,
-                    normalize_inbound_headers=True,
-                    normalize_outbound_headers=True
-                )
-                self.upstream_conn = H2Connection(config=us_config)
-                # Security Settings
-                self.upstream_conn.local_settings.max_header_list_size = MAX_HEADER_LIST_SIZE
-                self.upstream_conn.local_settings.enable_connect_protocol = 1
-                
-                self.upstream_conn.initiate_connection()
-                await self.flush(self.upstream_conn, self.upstream_writer)
+        try:
+            u_reader, u_writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=UPSTREAM_CONNECT_TIMEOUT
+            )
+            self.writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await self.writer.drain()
+            await asyncio.gather(
+                self._pipe(self.reader, u_writer, flush_buffer=True),
+                self._pipe(u_reader, self.writer)
+            )
+        except Exception:
+            await self._send_error(502, "Bad Gateway")
 
-            # Send Preface and SETTINGS to downstream
+    async def _pipe(self, r, w, flush_buffer=False):
+        try:
+            if flush_buffer and self.buffer:
+                w.write(self.buffer)
+                await w.drain()
+                self.buffer.clear()
+            while not r.at_eof():
+                data = await r.read(65536)
+                if not data: break
+                w.write(data)
+                await w.drain()
+        except: pass
+        finally:
+            try: w.close(); await w.wait_closed()
+            except: pass
+
+    def _record_capture(self, method, path, headers, body, scheme, authority):
+        if self.target_override:
+            url = urljoin(self.target_override, path.lstrip('/'))
+        else:
+            url = f"{scheme}://{authority}{path}"
+        
+        if self.scope_pattern and not self.scope_pattern.search(url): return
+
+        captured = CapturedRequest(
+            id=0, method=method, url=url,
+            headers=headers, body=body, truncated=(len(body) > MAX_CAPTURE_BODY_SIZE),
+            protocol="HTTP/1.1"
+        )
+        self.log("CAPTURE", captured)
+
+class NativeProxyHandler(BaseProxyHandler):
+    def __init__(self, client_reader, client_writer, explicit_host, manager_callback, 
+                 target_override, scope_pattern, enable_tunneling=True, 
+                 upstream_verify_ssl=False, upstream_ca_bundle=None, initial_data=b"",
+                 ssl_context_factory=None):
+        
+        super().__init__(explicit_host, upstream_verify_ssl, upstream_ca_bundle, manager_callback, ssl_context_factory)
+        self.client_reader = client_reader
+        self.client_writer = client_writer
+        self.target_override = target_override
+        self.scope_pattern = scope_pattern
+        self.enable_tunneling = enable_tunneling
+        self.initial_data = initial_data
+
+        self.upstream_reader: Optional[asyncio.StreamReader] = None
+        self.upstream_writer: Optional[asyncio.StreamWriter] = None
+        self.upstream_scheme: str = "https" 
+
+        self.ds_h2_lock = asyncio.Lock()
+        self.us_h2_lock = asyncio.Lock()
+        self.ds_socket_lock = asyncio.Lock()
+        self.us_socket_lock = asyncio.Lock()
+
+        ds_config = H2Configuration(
+            client_side=False, header_encoding='utf-8', 
+            validate_inbound_headers=True, validate_outbound_headers=True,
+            normalize_inbound_headers=True, normalize_outbound_headers=True
+        )
+        self.downstream_conn = H2Connection(config=ds_config)
+        self.downstream_conn.local_settings.enable_push = 0
+        self.downstream_conn.local_settings.max_header_list_size = MAX_HEADER_LIST_SIZE
+        self.downstream_conn.local_settings.enable_connect_protocol = 1
+
+        self.upstream_conn: Optional[H2Connection] = None
+        self.streams: Dict[int, StreamContext] = {}
+        self.closed = asyncio.Event()
+        self.draining = False
+
+    async def run(self):
+        try:
+            try:
+                self.upstream_host, self.upstream_port = self._parse_target(self.explicit_host)
+            except ValueError:
+                pass
+
+            if self.enable_tunneling and self.upstream_host:
+                check_url = f"https://{self.upstream_host}:{self.upstream_port}/"
+                if not self._is_url_allowed(check_url, self.scope_pattern):
+                     self.log("WARN", f"Blocked H2 Connection to {self.upstream_host} (Scope Violation)")
+                     await self.terminate(ErrorCodes.REFUSED_STREAM)
+                     return
+
+                try:
+                    await self.connect_upstream()
+                    us_config = H2Configuration(
+                        client_side=True, header_encoding='utf-8', 
+                        validate_inbound_headers=True, validate_outbound_headers=True,
+                        normalize_inbound_headers=True, normalize_outbound_headers=True
+                    )
+                    self.upstream_conn = H2Connection(config=us_config)
+                    self.upstream_conn.initiate_connection()
+                    await self.flush(self.upstream_conn, self.upstream_writer, self.us_h2_lock, self.us_socket_lock)
+                except Exception as e:
+                    self.log("ERROR", f"H2 Upstream Connection Failed: {e}")
+
             self.downstream_conn.initiate_connection()
-            await self.flush(self.downstream_conn, self.client_writer)
+            await self.flush(self.downstream_conn, self.client_writer, self.ds_h2_lock, self.ds_socket_lock)
 
-            # 4. Start Concurrent Loops
-            # Use asyncio.TaskGroup for Structured Concurrency (Python 3.11+)
-            # This prevents zombie tasks and ensures exceptions propagate correctly.
-            if hasattr(asyncio, 'TaskGroup'):
-                async with asyncio.TaskGroup() as tg:
-                    # Downstream Tasks
-                    tg.create_task(self._read_loop_wrapper(
-                        self.client_reader, self.downstream_conn, self.handle_downstream_event
-                    ))
-                    tg.create_task(self._sender_loop(
-                        self.downstream_queue, self.downstream_conn, self.client_writer
-                    ))
+            if self.initial_data:
+                async with self.ds_h2_lock:
+                    events = self.downstream_conn.receive_data(self.initial_data)
+                for event in events:
+                    await self.handle_downstream_event(event)
+                await self.flush(self.downstream_conn, self.client_writer, self.ds_h2_lock, self.ds_socket_lock)
 
-                    # Upstream Tasks (if tunneling)
-                    if self.enable_tunneling and self.upstream_conn:
-                        tg.create_task(self._read_loop_wrapper(
-                            self.upstream_reader, self.upstream_conn, self.handle_upstream_event
-                        ))
-                        tg.create_task(self._sender_loop(
-                            self.upstream_queue, self.upstream_conn, self.upstream_writer
-                        ))
-            else:
-                # Fallback for older Python (discouraged by audit, but kept for compatibility)
-                loop_tasks = [
-                    self._read_loop_wrapper(self.client_reader, self.downstream_conn, self.handle_downstream_event),
-                    self._sender_loop(self.downstream_queue, self.downstream_conn, self.client_writer)
-                ]
-                if self.enable_tunneling and self.upstream_conn:
-                    loop_tasks.append(self._read_loop_wrapper(self.upstream_reader, self.upstream_conn, self.handle_upstream_event))
-                    loop_tasks.append(self._sender_loop(self.upstream_queue, self.upstream_conn, self.upstream_writer))
-                
-                self.tasks = [asyncio.create_task(t) for t in loop_tasks]
-                await asyncio.gather(*self.tasks)
+            tasks = [
+                asyncio.create_task(self._monitor_shutdown()),
+                asyncio.create_task(self._read_loop_wrapper(
+                    self.client_reader, self.downstream_conn, self.ds_h2_lock,
+                    self.client_writer, self.ds_socket_lock, self.handle_downstream_event
+                )),
+                asyncio.create_task(self._keepalive_loop())
+            ]
+            if self.enable_tunneling and self.upstream_conn:
+                tasks.append(asyncio.create_task(self._read_loop_wrapper(
+                    self.upstream_reader, self.upstream_conn, self.us_h2_lock,
+                    self.upstream_writer, self.us_socket_lock, self.handle_upstream_event
+                )))
+            await asyncio.gather(*tasks)
 
-        except (ConnectionError, asyncio.TimeoutError) as e:
-            # log.debug(f"Proxy connection error ({self.upstream_host}): {type(e).__name__}: {e}")
-            await self.terminate(ErrorCodes.CONNECT_ERROR)
-        # Handle specific H2 errors gracefully
-        except FlowControlError as e:
-             log.error(f"H2 Flow Control Error (Global): {e}")
-             await self.terminate(ErrorCodes.FLOW_CONTROL_ERROR)
         except Exception as e:
-            # Catches exceptions raised within the TaskGroup/gather
             if not self.closed.is_set():
-                log.error(f"Unexpected error in proxy handler ({self.upstream_host}): {type(e).__name__}: {e}", exc_info=True)
+                self.log("ERROR", f"H2 Proxy Error: {e}")
             await self.terminate(ErrorCodes.INTERNAL_ERROR)
         finally:
-            # Use shield to ensure cleanup runs even if cancelled
-            await asyncio.shield(self.cleanup())
-
-    def _resolve_target(self) -> bool:
-        """
-        Resolves the upstream target based on the explicit host from CONNECT.
-        """
-        # Robust parsing of host:port string
-        try:
-            if ':' in self.explicit_host:
-                host, port_str = self.explicit_host.rsplit(':', 1)
-                port = int(port_str)
-            else:
-                # If port is missing, assume default 443
-                host = self.explicit_host
-                port = 443
-        except ValueError:
-            log.warning(f"Invalid CONNECT target format: {self.explicit_host}")
-            return False
-        
-        self.upstream_host = host
-        self.upstream_port = port
-        return True
+            await self.cleanup()
 
     async def connect_upstream(self):
-        """
-        Establishes the TCP/TLS connection to the target server.
-        """
-        # log.debug(f"Connecting upstream to {self.upstream_host}:{self.upstream_port}")
+        self.upstream_reader, self.upstream_writer = await self._connect_upstream(
+            self.upstream_host, self.upstream_port, alpn_protocols=["h2"]
+        )
+        transport = self.upstream_writer.get_extra_info('ssl_object')
+        if transport and transport.selected_alpn_protocol() != "h2":
+            raise ConnectionError("Upstream did not negotiate HTTP/2")
 
-        ssl_context = ssl.create_default_context()
-        
-        # For interception tools, verification is typically disabled.
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-
+    async def _read_loop_wrapper(self, reader, conn, h2_lock, writer, socket_lock, handler):
         try:
-            # We strictly require H2 upstream.
-            ssl_context.set_alpn_protocols(["h2"])
-        except NotImplementedError:
-            log.warning("ALPN not supported by the Python SSL implementation.")
+            await self.read_loop(reader, conn, h2_lock, writer, socket_lock, handler)
+        except Exception:
+            self.closed.set()
 
-        try:
-            self.upstream_reader, self.upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(self.upstream_host, self.upstream_port, ssl=ssl_context),
-                timeout=UPSTREAM_CONNECT_TIMEOUT
-            )
-
-            # Verify H2 negotiation success
-            transport = self.upstream_writer.get_extra_info('ssl_object')
-            negotiated_protocol = transport.selected_alpn_protocol() if transport else None
-
-            if negotiated_protocol != "h2":
-                raise ConnectionError(f"Upstream server did not negotiate HTTP/2 (ALPN: {negotiated_protocol}). Aborting to prevent protocol mismatch.")
-
-        # Catch specific exceptions and re-raise as ConnectionError
-        except (asyncio.TimeoutError, socket.gaierror, ssl.SSLError, ConnectionRefusedError, OSError) as e:
-            raise ConnectionError(f"Failed to connect upstream: {type(e).__name__}: {e}")
-        except Exception as e:
-            if isinstance(e, ConnectionError):
-                raise e
-            raise ConnectionError(f"Unexpected error during upstream connection: {type(e).__name__}: {e}")
-
-    # -- Sans-IO Core Loops --
-
-    async def _read_loop_wrapper(self, reader: asyncio.StreamReader, conn: H2Connection, event_handler: Callable):
-        """
-        Wrapper for the read loop to ensure exceptions are handled and propagated correctly.
-        """
-        try:
-            await self.read_loop(reader, conn, event_handler)
-        except (ConnectionResetError, ConnectionAbortedError, asyncio.IncompleteReadError, OSError) as e:
-            # Handle common network disconnections gracefully
-            if not self.closed.is_set():
-                log.warning(f"Connection closed unexpectedly (read loop): {type(e).__name__}: {e}")
-                self.closed.set()
-        except Exception as e:
-            # Re-raise other exceptions to ensure TaskGroup/gather registers the failure.
-            if not self.closed.is_set():
-                log.error(f"Read loop terminated unexpectedly: {type(e).__name__}: {e}", exc_info=True)
-            raise
-
-    async def read_loop(self, reader: asyncio.StreamReader, conn: H2Connection, event_handler: Callable):
-        """
-        Reads data from the network, feeds it to the H2 state machine, and processes events.
-        """
+    async def read_loop(self, reader, conn, h2_lock, writer, socket_lock, event_handler):
         while not self.closed.is_set():
             try:
                 data = await asyncio.wait_for(reader.read(65536), timeout=IDLE_TIMEOUT)
             except asyncio.TimeoutError:
-                log.info("Connection idle timeout reached. Initiating graceful shutdown.")
-                await self.graceful_shutdown()
-                break
+                if not self.draining: asyncio.create_task(self.graceful_shutdown())
+                continue
 
             if not data:
-                # EOF
                 self.closed.set()
                 break
 
-            try:
-                events = conn.receive_data(data)
-            
-            # Handle StreamClosedError gracefully (Race condition robustness)
-            except StreamClosedError as e:
-                # Typically happens if data arrives for a stream that was just reset/closed locally.
-                # We ignore this frame and continue, rather than killing the connection.
-                log.warning(f"Ignored frame for closed stream {e.stream_id}: {e}")
-                continue
-
-            # Fail-Fast on ProtocolError as per RFC 9113
-            except ProtocolError as e:
-                msg = str(e)
-                if "ConnectionState.CLOSED" in msg:
-                    self.closed.set()
+            async with h2_lock:
+                try: events = conn.receive_data(data)
+                except Exception:
+                    await self.terminate(ErrorCodes.PROTOCOL_ERROR)
                     break
-                log.error(f"H2 Protocol error during receive_data: {type(e).__name__}: {e}")
-                await self.terminate(ErrorCodes.PROTOCOL_ERROR)
-                break
-            
-            except Exception as e:
-                log.error(f"Generic error during receive_data: {type(e).__name__}: {e}", exc_info=True)
-                await self.terminate(ErrorCodes.INTERNAL_ERROR)
-                break
+                bytes_to_send = conn.data_to_send()
+
+            if bytes_to_send:
+                async with socket_lock:
+                    writer.write(bytes_to_send)
+                    await writer.drain()
 
             for event in events:
-                # Process events
                 await event_handler(event)
 
-            # Flush immediately after processing inputs to send ACKs/Updates
-            await self.flush(conn, self.get_writer(conn))
-
-    async def _sender_loop(self, queue: asyncio.Queue, conn: H2Connection, writer: asyncio.StreamWriter):
-        """
-        [Flow Control] Dequeues data, writes to socket, drains, and THEN acknowledges.
-        This "Drain-then-ACK" pattern prevents memory blooms and deadlocks.
-        """
-        dead_streams = set()
-
+    async def _stream_sender(self, stream_id, conn, writer, queue, flow_event, h2_lock, socket_lock, 
+                             ack_conn, ack_h2_lock, ack_writer, ack_socket_lock):
         while not self.closed.is_set():
             try:
                 item = await queue.get()
-                if item is None:
-                    break # Signal to stop
+                if item is None: break
 
-                stream_id, data, end_stream, ack_target_conn, ack_length = item
+                payload, end_stream, ack_length = item
 
-                # Optimization: Drop data for known dead streams immediately
-                if stream_id in dead_streams:
-                    queue.task_done()
-                    continue
+                if isinstance(payload, list):
+                    conn_data = None
+                    async with h2_lock:
+                        conn.send_headers(stream_id, payload, end_stream=end_stream)
+                        conn_data = conn.data_to_send()
+                    if conn_data:
+                        async with socket_lock:
+                            writer.write(conn_data)
+                            await writer.drain()
+                else:
+                    data = payload
+                    view = memoryview(data)
+                    offset = 0
+                    total_len = len(data)
 
-                # Liveness Check: If the H2 state machine says it's closed, don't try to send
-                try:
-                    # stream_is_closed returns True if stream is IDLE or CLOSED. 
-                    if conn.stream_is_closed(stream_id):
-                        dead_streams.add(stream_id)
-                        queue.task_done()
-                        continue
-                except Exception:
-                    # If stream_id doesn't exist in state machine, it's dead/invalid
-                    dead_streams.add(stream_id)
-                    queue.task_done()
-                    continue
+                    while offset < total_len or (total_len == 0 and end_stream):
+                        if self.closed.is_set(): break
+                        chunk_data = None
+                        break_loop = False
+                        
+                        async with h2_lock:
+                            conn_window = conn.outbound_flow_control_window
+                            stream_window = conn.remote_flow_control_window(stream_id)
+                            available = min(conn_window, stream_window)
 
-                try:
-                    await self.forward_data_internal(conn, writer, stream_id, data, end_stream)
-                    
-                    # [FLOW CONTROL] Acknowledge data to the *source* connection only after
-                    # it has been successfully written to the *destination* connection.
-                    # This prevents memory blooms if the network is slow.
-                    if ack_target_conn and ack_length > 0:
-                        try:
-                            ack_target_conn.acknowledge_received_data(ack_length, stream_id)
-                            await self.flush(ack_target_conn, self.get_writer(ack_target_conn))
-                        except Exception: pass
+                            if available > 0 or (total_len == 0 and end_stream):
+                                chunk_size = min(total_len - offset, available)
+                                chunk = view[offset:offset+chunk_size]
+                                is_last = (offset + chunk_size == total_len) and end_stream
+                                conn.send_data(stream_id, chunk.tobytes(), end_stream=is_last)
+                                chunk_data = conn.data_to_send()
+                                offset += chunk_size
+                                if offset >= total_len: break_loop = True
+                            else:
+                                flow_event.clear()
 
-                except ProtocolError:
-                    # If we hit a protocol error (e.g. writing to closed), mark stream as dead
-                    dead_streams.add(stream_id)
-                except Exception as e:
-                    log.error(f"Error in sender loop: {e}")
-                    if not self.closed.is_set():
-                        self.closed.set()
-                    break
-                
+                        if chunk_data:
+                            async with socket_lock:
+                                writer.write(chunk_data)
+                                await writer.drain()
+                        
+                        if break_loop: break
+                        
+                        if not chunk_data and not break_loop:
+                            try: await asyncio.wait_for(flow_event.wait(), timeout=FLOW_CONTROL_TIMEOUT)
+                            except asyncio.TimeoutError:
+                                async with h2_lock:
+                                    conn.reset_stream(stream_id, ErrorCodes.FLOW_CONTROL_ERROR)
+                                break
+
+                if ack_conn and ack_length > 0:
+                    ack_bytes = None
+                    async with ack_h2_lock:
+                        ack_conn.acknowledge_received_data(ack_length, stream_id)
+                        ack_bytes = ack_conn.data_to_send()
+                    if ack_bytes:
+                        async with ack_socket_lock:
+                            ack_writer.write(ack_bytes)
+                            await ack_writer.drain()
+
                 queue.task_done()
-            
-            except asyncio.CancelledError:
-                break
+                if end_stream: break
+
             except Exception as e:
-                log.error(f"Critical error in sender loop: {e}")
+                self.log("ERROR", f"Stream sender error: {e}")
                 break
 
-    async def flush(self, conn: H2Connection, writer: Optional[asyncio.StreamWriter]):
-        """
-        Retrieves data from the H2 state machine and writes it to the network.
-        """
-        # Safety check against writing to a closed connection
-        if self.closed.is_set() or writer is None or writer.is_closing():
-            return
+    async def handle_request_received(self, event: RequestReceived):
+        stream_id = event.stream_id
+        if stream_id in self.streams:
+             async with self.ds_h2_lock:
+                 self.downstream_conn.reset_stream(stream_id, ErrorCodes.PROTOCOL_ERROR)
+             return
 
-        try:
-            data_to_send = conn.data_to_send()
-        except Exception as e:
-            # Handle potential errors in the H2 state machine
-            log.error(f"Error retrieving data from H2 connection: {type(e).__name__}")
-            self.closed.set()
-            return
+        ctx = StreamContext(stream_id, self.upstream_scheme)
+        self.streams[stream_id] = ctx
+        ctx.captured_headers = self._process_headers_for_capture(event.headers)
 
-        if data_to_send:
+        if self.enable_tunneling and self.upstream_conn:
             try:
-                writer.write(data_to_send)
-                await writer.drain()
-            except (ConnectionResetError, ConnectionAbortedError, OSError):
-                # Handle common network write errors
-                if not self.closed.is_set():
-                    pass
-                self.closed.set()
-            except Exception as e:
-                log.error(f"Error during network write/drain (flush): {type(e).__name__}: {e}")
-                self.closed.set()
-
-    # -- Event Handlers (Mediation Logic) --
-
-    def _filter_headers(self, headers: List[Tuple[Any, Any]]) -> List[Tuple[str, str]]:
-        """
-        RFC 9113 Sanitizer: Removes connection-specific headers and rejects invalid chars.
-        """
-        safe_headers = []
-        for k, v in headers:
-            try:
-                # Robust decode
-                if isinstance(k, bytes): k_str = k.decode('utf-8', errors='replace')
-                else: k_str = str(k)
-                if isinstance(v, bytes): v_str = v.decode('utf-8', errors='replace')
-                else: v_str = str(v)
+                headers, protocol = self._prepare_forwarded_headers(event.headers, is_upstream=True)
                 
-                # Strict Field Validity
-                if '\r' in v_str or '\n' in v_str or '\0' in v_str:
-                    log.warning(f"Rejected invalid header chars in {k_str}")
-                    continue 
+                if protocol:
+                      enabled = self.upstream_conn.remote_settings.get(SettingCodes.ENABLE_CONNECT_PROTOCOL, 0)
+                      if not enabled:
+                          self.log("WARN", f"Client requested CONNECT protocol={protocol} but upstream disabled it.")
+                          async with self.ds_h2_lock:
+                              self.downstream_conn.reset_stream(stream_id, ErrorCodes.CONNECT_ERROR)
+                          self._cleanup_stream(stream_id, force_close=True)
+                          return
 
-                k_lower = k_str.lower()
-                if k_lower in HOP_BY_HOP_HEADERS:
-                    # Exception: 'TE: trailers' is allowed in H2
-                    if k_lower == 'te' and 'trailers' in v_str.lower():
-                        safe_headers.append((k_str, v_str))
-                    continue
-                
-                safe_headers.append((k_str, v_str))
-            except Exception:
-                continue
-        return safe_headers
+                async with self.us_h2_lock:
+                    self.upstream_conn.send_headers(stream_id, headers, end_stream=event.stream_ended)
+                await self.flush(self.upstream_conn, self.upstream_writer, self.us_h2_lock, self.us_socket_lock)
+            except ValueError as e:
+                self.log("ERROR", f"Header Validation Failed: {e}")
+                async with self.ds_h2_lock:
+                    self.downstream_conn.reset_stream(stream_id, ErrorCodes.PROTOCOL_ERROR)
+                self._cleanup_stream(stream_id, force_close=True)
+                return
+
+        if self.enable_tunneling and self.upstream_conn:
+            t_down = asyncio.create_task(self._stream_sender(
+                stream_id, self.downstream_conn, self.client_writer, 
+                ctx.downstream_queue, ctx.downstream_flow_event,
+                self.ds_h2_lock, self.ds_socket_lock,
+                self.upstream_conn, self.us_h2_lock, self.upstream_writer, self.us_socket_lock
+            ))
+            t_up = asyncio.create_task(self._stream_sender(
+                stream_id, self.upstream_conn, self.upstream_writer,
+                ctx.upstream_queue, ctx.upstream_flow_event,
+                self.us_h2_lock, self.us_socket_lock,
+                self.downstream_conn, self.ds_h2_lock, self.client_writer, self.ds_socket_lock
+            ))
+            ctx.sender_tasks.extend([t_down, t_up])
+
+        if event.stream_ended:
+            ctx.downstream_closed = True
+            self.finalize_capture(ctx)
+            if self.enable_tunneling:
+                ctx.upstream_queue.put_nowait(None)
 
     async def handle_downstream_event(self, event):
-        """
-        Processes events from the client (Downstream) and mediates them to the server (Upstream).
-        """
         if isinstance(event, RequestReceived):
             await self.handle_request_received(event)
         elif isinstance(event, DataReceived):
-            # [FLOW CONTROL] Defer ACK to sender loop. 
-            # We put the data into the upstream queue. When it's drained, downstream is ACKed.
-            if self.enable_tunneling:
-                await self.upstream_queue.put((
-                    event.stream_id, 
-                    event.data, 
-                    event.stream_ended, 
-                    self.downstream_conn, 
-                    event.flow_controlled_length
-                ))
-            
             if event.stream_id in self.streams:
-                 # Safety limit on capture size
-                 if len(self.streams[event.stream_id].request_body) < 10*1024*1024:
-                    self.streams[event.stream_id].request_body.extend(event.data)
-        elif isinstance(event, StreamEnded):
-            await self.handle_stream_ended(self.downstream_conn, event)
-        elif isinstance(event, StreamReset):
-            await self.handle_stream_reset(self.downstream_conn, event)
-        elif isinstance(event, WindowUpdated):
-            await self.handle_window_updated(event)
-        elif isinstance(event, ConnectionTerminated):
-             await self.handle_connection_terminated(event)
+                ctx = self.streams[event.stream_id]
+                if not ctx.truncated:
+                    ctx.request_body.extend(event.data)
+                async with self.ds_h2_lock:
+                    self.downstream_conn.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
+                await self.flush(self.downstream_conn, self.client_writer, self.ds_h2_lock, self.ds_socket_lock)
+                if self.enable_tunneling and self.upstream_conn:
+                    await ctx.upstream_queue.put((event.data, event.stream_ended, 0))
         elif isinstance(event, TrailersReceived):
-            if self.enable_tunneling:
-                 try:
-                    # Filter trailers as well
-                    safe_headers = self._filter_headers(event.headers)
-                    self.upstream_conn.send_headers(event.stream_id, safe_headers, end_stream=True)
-                    await self.flush(self.upstream_conn, self.upstream_writer)
-                 except Exception: pass
-            
-            # Update state
+            if event.stream_id in self.streams and self.enable_tunneling and self.upstream_conn:
+                try:
+                    safe_headers, _ = self._prepare_forwarded_headers(event.headers, is_upstream=True)
+                    ctx = self.streams[event.stream_id]
+                    await ctx.upstream_queue.put((safe_headers, event.stream_ended, 0))
+                except ValueError:
+                    self._cleanup_stream(event.stream_id, force_close=True)
+        elif isinstance(event, StreamEnded):
             if event.stream_id in self.streams:
-                context = self.streams[event.stream_id]
-                context.downstream_closed = True
-                self.finalize_capture(context)
-                
-                # Handle non-tunneling response trigger
-                if not self.enable_tunneling:
-                    await self.send_synthetic_captured_response(event.stream_id)
+                self._cleanup_stream(event.stream_id, downstream_closed=True)
+        elif isinstance(event, StreamReset):
+            if event.stream_id in self.streams:
+                self.log("WARN", f"Stream {event.stream_id} Reset by Client. Code: {event.error_code}")
+                self._cleanup_stream(event.stream_id, force_close=True)
+        elif isinstance(event, WindowUpdated):
+            await self.handle_window_updated(event, 'downstream')
 
     async def handle_upstream_event(self, event):
-        """
-        Processes events from the server (Upstream) and mediates them to the client (Downstream).
-        """
-        
         if isinstance(event, ResponseReceived):
-             # Forward response headers downstream
              try:
-                safe_headers = self._filter_headers(event.headers)
-                self.downstream_conn.send_headers(event.stream_id, safe_headers, end_stream=event.stream_ended)
-             except (ProtocolError, Exception) as e:
-                 pass
-
+                 safe, _ = self._prepare_forwarded_headers(event.headers, is_upstream=False)
+                 async with self.ds_h2_lock:
+                     self.downstream_conn.send_headers(event.stream_id, safe, end_stream=event.stream_ended)
+                 await self.flush(self.downstream_conn, self.client_writer, self.ds_h2_lock, self.ds_socket_lock)
+             except ValueError:
+                 async with self.ds_h2_lock:
+                     self.downstream_conn.reset_stream(event.stream_id, ErrorCodes.PROTOCOL_ERROR)
         elif isinstance(event, DataReceived):
-            # [FLOW CONTROL] Defer ACK to sender loop.
-            await self.downstream_queue.put((event.stream_id, event.data, event.stream_ended, self.upstream_conn, event.flow_controlled_length))
-
-        elif isinstance(event, StreamEnded):
-            await self.handle_stream_ended(self.upstream_conn, event)
-        elif isinstance(event, StreamReset):
-            await self.handle_stream_reset(self.upstream_conn, event)
-        elif isinstance(event, WindowUpdated):
-            await self.handle_window_updated(event)
-        elif isinstance(event, ConnectionTerminated):
-            await self.handle_connection_terminated(event)
+            if event.stream_id in self.streams:
+                ctx = self.streams[event.stream_id]
+                async with self.us_h2_lock:
+                    self.upstream_conn.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
+                await self.flush(self.upstream_conn, self.upstream_writer, self.us_h2_lock, self.us_socket_lock)
+                await ctx.downstream_queue.put((event.data, event.stream_ended, 0))
         elif isinstance(event, TrailersReceived):
-            # Forward response trailers downstream
-            try:
-                safe_headers = self._filter_headers(event.headers)
-                self.downstream_conn.send_headers(event.stream_id, safe_headers, end_stream=True)
-            except (ProtocolError, Exception) as e:
-                 pass
+            if event.stream_id in self.streams:
+                try:
+                    safe, _ = self._prepare_forwarded_headers(event.headers, is_upstream=False)
+                    ctx = self.streams[event.stream_id]
+                    await ctx.downstream_queue.put((safe, event.stream_ended, 0))
+                except ValueError:
+                    self._cleanup_stream(event.stream_id, force_close=True)
+        elif isinstance(event, StreamEnded):
+             if event.stream_id in self.streams:
+                self._cleanup_stream(event.stream_id, upstream_closed=True)
+        elif isinstance(event, WindowUpdated):
+             await self.handle_window_updated(event, 'upstream')
 
-
-    # -- Specific Event Logic & Capture Implementation --
-
-    async def handle_request_received(self, event: RequestReceived):
-        """
-        Handles new incoming requests (streams) from the client.
-        Includes RFC 8441 Validation logic.
-        """
-        stream_id = event.stream_id
-
-        if stream_id in self.streams:
-            log.error(f"Protocol Error: Stream ID {stream_id} reused by client.")
-            await self.terminate(ErrorCodes.PROTOCOL_ERROR)
-            return
-
-        # RFC 8441 / Extended CONNECT Validation
-        # H2 config with encoding='utf-8' returns strings.
-        headers_dict = dict(event.headers)
-        # Decode keys if bytes
-        decoded_headers = {}
-        for k, v in headers_dict.items():
+    def _prepare_forwarded_headers(self, headers, is_upstream=True):
+        decoded_headers = []
+        method = None
+        protocol = None
+        host_header_value = None
+        
+        for k, v in headers:
             k_s = k.decode('utf-8') if isinstance(k, bytes) else k
             v_s = v.decode('utf-8') if isinstance(v, bytes) else v
-            decoded_headers[k_s] = v_s
-            
-        method = decoded_headers.get(':method')
-        protocol = decoded_headers.get(':protocol')
-        
-        if method == 'CONNECT':
-            if protocol:
-                # Extended CONNECT: MUST contain :scheme and :path
-                if ':scheme' not in decoded_headers or ':path' not in decoded_headers:
-                     log.warning("Violation: Extended CONNECT missing scheme/path")
-                     self.downstream_conn.reset_stream(stream_id, ErrorCodes.PROTOCOL_ERROR)
-                     return
-            else:
-                # Standard CONNECT: MUST NOT contain :scheme or :path
-                if ':scheme' in decoded_headers or ':path' in decoded_headers:
-                     log.warning("Violation: Standard CONNECT contains scheme/path")
-                     self.downstream_conn.reset_stream(stream_id, ErrorCodes.PROTOCOL_ERROR)
-                     return
+            if '\n' in v_s or '\r' in v_s: raise ValueError(f"Illegal header value: {k_s}")
+            if k_s == ':method': method = v_s
+            elif k_s == ':protocol': protocol = v_s
+            elif k_s.lower() == 'host': host_header_value = v_s
+            decoded_headers.append((k_s, v_s))
 
-        # Initialize Stream Context
-        context = StreamContext(stream_id, self.upstream_scheme)
-        self.streams[stream_id] = context
+        out = []
+        seen_regular = False
+        is_connect = (method == 'CONNECT')
+        is_extended_connect = is_connect and (protocol is not None)
+        pseudo_headers = {}
 
-        # Process headers robustly for capture
-        context.captured_headers = self._process_headers_for_capture(event.headers)
-
-        # Forward headers upstream (Only if tunneling).
-        if self.enable_tunneling:
-            try:
-                forward_headers = []
-                
-                # Construct correct upstream authority
-                authority = self.upstream_host
-                if self.upstream_port not in (80, 443):
-                    authority += f":{self.upstream_port}"
-
-                # Filter headers before forwarding
-                safe_headers = self._filter_headers(event.headers)
-
-                for k, v in safe_headers:
-                    # Ensure strings
-                    if isinstance(k, bytes): k = k.decode('utf-8', errors='replace')
-                    if isinstance(v, bytes): v = v.decode('utf-8', errors='replace')
-
-                    if k == ':authority':
-                        forward_headers.append((k, authority))
-                    elif k == 'host':
-                        # Skip 'Host' in H2, rely on :authority
-                        continue
-                    else:
-                        forward_headers.append((k, v))
-                
-                # Ensure :authority is present
-                if not any(k == ':authority' for k, v in forward_headers):
-                     forward_headers.insert(0, (':authority', authority))
-
-                # We forward the filtered headers
-                self.upstream_conn.send_headers(stream_id, forward_headers, end_stream=event.stream_ended)
-                await self.flush(self.upstream_conn, self.upstream_writer)
-
-            except Exception as e:
-                log.error(f"Error forwarding headers upstream for stream {stream_id}: {type(e).__name__}")
-                # Reset the stream downstream if upstream forwarding fails
-                try:
-                    self.downstream_conn.reset_stream(stream_id, ErrorCodes.INTERNAL_ERROR)
-                except Exception:
-                    pass
-                
-                if stream_id in self.streams:
-                     del self.streams[stream_id]
-                return
-
-        if event.stream_ended:
-             context.downstream_closed = True
-             self.finalize_capture(context)
-             
-             if not self.enable_tunneling:
-                 await self.send_synthetic_captured_response(stream_id)
-
-    # Helper function for robust header processing
-    def _process_headers_for_capture(self, headers: List[Tuple[Any, Any]]) -> CapturedHeaders:
-        """
-        Processes raw H2 headers into a structured format for capture, ensuring robust decoding.
-        Ref: RFC 7540 Section 8.1.2.5 (Cookie concatenation rules).
-        """
-        pseudo: Dict[str, str] = {}
-        normal_headers: Dict[str, str] = {}
-        authority = None
-
-        for k, v in headers:
-            try:
-                if isinstance(k, bytes): k_str = k.decode('utf-8', errors='replace')
-                else: k_str = str(k)
-                if isinstance(v, bytes): v_str = v.decode('utf-8', errors='replace')
-                else: v_str = str(v)
-            except Exception:
+        for k_s, v_s in decoded_headers:
+            k_lower = k_s.lower()
+            if k_s.startswith(':'):
+                if seen_regular: raise ValueError("Pseudo-header found after regular header")
+                pseudo_headers[k_s] = v_s
                 continue
-
-            k_lower = k_str.lower()
-
-            if k_str.startswith(':'):
-                pseudo[k_str] = v_str
-                if k_str == ':authority':
-                    authority = v_str
             else:
-                # Handle multi-value headers (RFC 7540 Section 8.1.2.3 and 8.1.2.5)
-                if k_lower in normal_headers:
-                    #  Cookies must be joined by semi-colon (RFC 7540 Sec 8.1.2.5)
-                    # All other headers are joined by comma (RFC 7230 Sec 3.2.2)
-                    separator = "; " if k_lower == 'cookie' else ", "
-                    normal_headers[k_lower] += f"{separator}{v_str}"
-                else:
-                    normal_headers[k_lower] = v_str
-                
-                if k_lower == 'host' and authority is None:
-                    authority = v_str
+                seen_regular = True
 
-        # Ensure :authority is set, falling back to the Host header value if necessary (H2 spec allows this)
-        if ':authority' not in pseudo and authority:
-             pseudo[':authority'] = authority
-
-        return {"pseudo": pseudo, "headers": normal_headers}
-
-
-    # (PDF Requirement 3: Flow Control Implementation - The Core Challenge)
-    async def forward_data_internal(self, destination_conn: H2Connection, writer: asyncio.StreamWriter, stream_id: int, data: bytes, end_stream: bool):
-        """
-        Forwards data between connections, respecting flow control.
-        Internal function called by sender loops to write data to the socket.
-        """
+            if k_lower in H2_FORBIDDEN_HEADERS: continue
+            if k_lower == 'te':
+                if v_s.lower() == 'trailers': out.append((k_s, v_s))
+                continue
+            if k_lower == 'host': continue
+            out.append((k_s, v_s))
         
-        if stream_id not in self.streams:
-             # Stream might have closed while data was in queue
-             return
+        final_headers = []
+        if is_upstream:
+            if ':authority' in pseudo_headers: pass
+            elif host_header_value: pseudo_headers[':authority'] = host_header_value
+            elif self.upstream_host:
+                authority = self.upstream_host
+                if self.upstream_port not in (80, 443): authority += f":{self.upstream_port}"
+                pseudo_headers[':authority'] = authority
 
-        context = self.streams[stream_id]
+        for k, v in pseudo_headers.items():
+            if k == ':authority' and not is_upstream and ':authority' not in pseudo_headers: continue
+            if is_connect and not is_extended_connect and k in (':scheme', ':path'): continue
+            final_headers.append((k, v))
+        final_headers.extend(out)
+        return self._wrap_security(final_headers), protocol
 
-        data_len = len(data)
-        offset = 0
-
-        # Loop until all data is sent, handling window limitations
-        while offset < data_len:
-            if self.closed.is_set():
-                return # Stop if connection is closing
-
-            # --- LIVENESS CHECK ---
-            try:
-                if destination_conn.stream_is_closed(stream_id):
-                    raise ProtocolError(f"Stream {stream_id} is closed")
-            except (KeyError, AttributeError):
-                 raise ProtocolError(f"Stream {stream_id} invalid")
-            # ----------------------
-
-            # Check available window (minimum of connection and stream windows)
-            try:
-                # Connection window check
-                conn_window = destination_conn.outbound_flow_control_window
-                # Stream window check
-                stream_window = destination_conn.remote_flow_control_window(stream_id)
-                available_window = min(conn_window, stream_window)
-            except Exception as e:
-                return
-
-            if available_window > 0:
-                # Calculate how much we can send in this iteration
-                chunk_size = min(data_len - offset, available_window)
-                chunk = data[offset:offset + chunk_size]
-                offset += chunk_size
-                
-                # Check if this is the final chunk of the entire message
-                is_last_chunk = (offset == data_len) and end_stream
-
-                try:
-                    destination_conn.send_data(stream_id, chunk, end_stream=is_last_chunk)
-                except ProtocolError as e:
-                     raise e 
-                except Exception as e:
-                     log.error(f"Error sending data chunk on stream {stream_id}: {e}")
-                     await self.terminate(ErrorCodes.INTERNAL_ERROR)
-                     return
-
-                await self.flush(destination_conn, writer)
-
+    def _process_headers_for_capture(self, headers: List[Tuple[Any, Any]]) -> CapturedHeaders:
+        pseudo = {}
+        normal = []
+        cookies = []
+        authority = None
+        for k, v in headers:
+            k_s = k.decode('utf-8') if isinstance(k, bytes) else k
+            v_s = v.decode('utf-8') if isinstance(v, bytes) else v
+            k_lower = k_s.lower()
+            if k_lower == 'host' and not authority: authority = v_s
+            if k_lower in H2_FORBIDDEN_HEADERS: continue 
+            if k_s.startswith(':'):
+                pseudo[k_s] = v_s
+                if k_s == ':authority': authority = v_s
+            elif k_lower == 'cookie':
+                cookies.append(v_s)
             else:
-                # Window is zero. Wait for a WINDOW_UPDATE.
-                context.flow_control_event.clear()
-                
-                # Wait until handle_window_updated signals the event.
-                try:
-                    await asyncio.wait_for(context.flow_control_event.wait(), timeout=FLOW_CONTROL_TIMEOUT)
-                except asyncio.TimeoutError:
-                    log.error(f"Flow control timeout on stream {stream_id}. Terminating connection.")
-                    await self.terminate(ErrorCodes.FLOW_CONTROL_ERROR)
-                    return
-                
-                if self.closed.is_set():
-                    return
+                normal.append((k_s, v_s))
+        if cookies:
+            normal.append(('cookie', '; '.join(cookies)))
+        if ':authority' not in pseudo and authority: pseudo[':authority'] = authority
+        return {"pseudo": pseudo, "headers": normal}
+
+    def _wrap_security(self, headers):
+        if not hpack: return headers
+        return [hpack.NeverIndexedHeaderTuple(k, v) if k.lower() in SENSITIVE_HEADERS else (k, v) for k, v in headers]
+
+    async def handle_window_updated(self, event, direction):
+        sid = event.stream_id
+        streams_snapshot = list(self.streams.values())
+        if sid == 0:
+            for ctx in streams_snapshot:
+                if direction == 'upstream': ctx.upstream_flow_event.set()
+                else: ctx.downstream_flow_event.set()
+        elif sid in self.streams:
+            ctx = self.streams[sid]
+            if direction == 'upstream': ctx.upstream_flow_event.set()
+            else: ctx.downstream_flow_event.set()
+
+    def finalize_capture(self, ctx: StreamContext):
+        if ctx.capture_finalized: return
+        ctx.capture_finalized = True
         
-        # Handle zero-length data frames that just carry the END_STREAM flag
-        if data_len == 0 and end_stream:
-            try:
-                destination_conn.send_data(stream_id, b'', end_stream=True)
-                await self.flush(destination_conn, writer)
-            except Exception: pass
-
-
-    async def handle_window_updated(self, event: WindowUpdated):
-        """
-        Handles WINDOW_UPDATE frames, potentially unblocking stalled streams.
-
-        Args:
-            event (WindowUpdated): The flow control update event.
-        """
-        stream_id = event.stream_id
-
-        if stream_id == 0:
-            # Notify all streams as the global window has opened.
-            for context in self.streams.values():
-                context.flow_control_event.set()
-        elif stream_id in self.streams:
-            # Notify the specific stream
-            self.streams[stream_id].flow_control_event.set()
-
-    # -- Connection Lifecycle Management --
-
-    async def handle_stream_ended(self, source_conn: H2Connection, event: StreamEnded):
-        """
-        Handles stream closure (Half-Closed state).
-        Updates stream state and cleans up if both sides are closed.
-        """
-        stream_id = event.stream_id
-        if stream_id not in self.streams:
-            return
-
-        context = self.streams[stream_id]
+        pseudo = ctx.captured_headers["pseudo"]
+        method = pseudo.get(':method', 'GET')
+        path = pseudo.get(':path', '/')
+        authority = pseudo.get(':authority', self.explicit_host)
         
-        if source_conn == self.downstream_conn:
-            context.downstream_closed = True
-            # Request is fully received. Finalize capture.
-            self.finalize_capture(context)
-            
-            # If not tunneling, we must now send the response to the client
-            if not self.enable_tunneling:
-                await self.send_synthetic_captured_response(stream_id)
-                # Mark upstream as closed (conceptually) since we won't interact with it
-                context.upstream_closed = True
-                
-        else:
-            context.upstream_closed = True
-
-        # Ensure END_STREAM is propagated if it wasn't already sent
-        dest_conn = self.get_other_conn(source_conn)
-        if dest_conn and self.enable_tunneling:
-            try:
-                dest_conn.end_stream(stream_id)
-            except (Exception) as e:
-                # Stream might already be fully closed or reset
-                pass
-
-        # Clean up context when fully closed (both sides sent END_STREAM)
-        if context.downstream_closed and context.upstream_closed:
-            if stream_id in self.streams:
-                del self.streams[stream_id]
-
-    async def send_synthetic_captured_response(self, stream_id: int):
         try:
-            headers = [
-                (':status', '200'),
-                ('content-length', '9'),
-                ('content-type', 'text/plain'),
-                ('server', 'Scalpel-Racer/H2-Capture')
-            ]
-            self.downstream_conn.send_headers(stream_id, headers, end_stream=False)
-            self.downstream_conn.send_data(stream_id, b"Captured.", end_stream=True)
-            await self.flush(self.downstream_conn, self.client_writer)
-        except Exception as e:
-            log.error(f"Error sending synthetic response on stream {stream_id}: {e}")
-   
-    async def handle_stream_reset(self, source_conn: H2Connection, event: StreamReset):
-        """
-        Handles stream resets (RST_STREAM).
-        """
-        stream_id = event.stream_id
-        if stream_id in self.streams:
-            # Forward the reset to the other side
-            dest_conn = self.get_other_conn(source_conn)
-            try:
-                dest_conn.reset_stream(stream_id, event.error_code)
-                await self.flush(dest_conn, self.get_writer(dest_conn))
-            except (ProtocolError, Exception):
-                pass
-            
-            del self.streams[stream_id]
+            if self.target_override:
+                url = urljoin(self.target_override, path.lstrip('/'))
+            else:
+                url = urlunparse((ctx.scheme, authority, path, '', '', ''))
+        except: return
 
-    async def handle_connection_terminated(self, event: ConnectionTerminated):
-        await self.graceful_shutdown(last_stream_id=event.last_stream_id)
-
-    async def graceful_shutdown(self, last_stream_id=None):
-        """
-        Performs a graceful shutdown (double GOAWAY).
-        """
-        if self.closed.is_set():
-            return
-
-        # 1. Send initial GOAWAY (Max ID) to signal intent to stop accepting new streams.
-        try:
-            if self.downstream_conn and self.downstream_conn.state_machine.state != 'CLOSED':
-                 self.downstream_conn.close_connection(error_code=ErrorCodes.NO_ERROR, last_stream_id=MAX_STREAM_ID)
-                 await self.flush(self.downstream_conn, self.client_writer)
-
-            if self.upstream_conn and self.upstream_conn.state_machine.state != 'CLOSED':
-                self.upstream_conn.close_connection(error_code=ErrorCodes.NO_ERROR, last_stream_id=MAX_STREAM_ID)
-                await self.flush(self.upstream_conn, self.upstream_writer)
-        except Exception:
-            pass 
-
-        # 2. Wait for active streams to drain or timeout
-        try:
-            await asyncio.wait_for(self.wait_for_streams_to_drain(), timeout=GRACEFUL_SHUTDOWN_TIMEOUT)
-        except asyncio.TimeoutError:
-            pass
-
-        # 3. Send final GOAWAY with actual last stream ID
-        try:
-            if self.downstream_conn and self.downstream_conn.state_machine.state != 'CLOSED':
-                 self.downstream_conn.close_connection(error_code=ErrorCodes.NO_ERROR)
-                 await self.flush(self.downstream_conn, self.client_writer)
-            
-            if self.upstream_conn and self.upstream_conn.state_machine.state != 'CLOSED':
-                self.upstream_conn.close_connection(error_code=ErrorCodes.NO_ERROR)
-                await self.flush(self.upstream_conn, self.upstream_writer)
-        except Exception:
-            pass
-
-        self.closed.set()
-
-    async def wait_for_streams_to_drain(self):
-        while self.streams:
-            await asyncio.sleep(0.1)
-
-    async def terminate(self, error_code: ErrorCodes):
-        """
-        Immediately terminates the connection with an error code.
-        """
-        if self.closed.is_set():
-            return
-
-        self.closed.set()
-
-        # Unblock all streams waiting on flow control.
-        for context in self.streams.values():
-            context.flow_control_event.set()
-
-        try:
-            if self.downstream_conn:
-                self.downstream_conn.close_connection(error_code=error_code)
-                await self.flush(self.downstream_conn, self.client_writer)
-        except Exception:
-            pass
-
-    async def cleanup(self):
-        """
-        Ensures all resources (sockets, tasks) are closed properly.
-        """
-        self.closed.set()
-
-        for context in self.streams.values():
-            context.flow_control_event.set()
-            
-        await self.upstream_queue.put(None)
-        await self.downstream_queue.put(None)
-
-        for w in [self.client_writer, self.upstream_writer]:
-            if w and not w.is_closing():
-                try:
-                    w.close()
-                    # Hardened wait_closed to prevent hangs
-                    await asyncio.wait_for(w.wait_closed(), timeout=SOCKET_CLOSE_TIMEOUT)
-                except (ConnectionError, OSError, asyncio.TimeoutError):
-                    pass
-
-    # -- Capture Logic Finalization --
-
-    def finalize_capture(self, context: StreamContext):
-        if context.capture_finalized:
-            return
-        context.capture_finalized = True
-
-        pseudo_headers = context.captured_headers["pseudo"]
-        raw_headers = context.captured_headers["headers"]
-
-        method = pseudo_headers.get(':method', 'GET')
-        path = pseudo_headers.get(':path', '/')
-        
-        authority = pseudo_headers.get(':authority')
-        if not authority: authority = self.explicit_host
-        if not authority: authority = raw_headers.get('host')
-
-        if not authority:
-            return
-
-        try:
-            final_url = self.construct_target_url(context.scheme, path, authority)
-        except ValueError as e:
-            log.warning(f"Error constructing target URL for capture: {e}")
-            return
-
-        if self.scope_pattern and not self.scope_pattern.search(final_url):
-            return
-
-        safe_headers = {k: v for k, v in raw_headers.items()
-                        if k.lower() not in HOP_BY_HOP_HEADERS}
+        if self.scope_pattern and not self.scope_pattern.search(url): return
 
         captured = CapturedRequest(
-            id=0,
-            method=method,
-            url=final_url,
-            headers=safe_headers,
-            body=bytes(context.request_body)
+            id=0, method=method, url=url,
+            headers=ctx.captured_headers["headers"],
+            body=bytes(ctx.request_body),
+            truncated=ctx.truncated,
+            protocol="HTTP/2"
         )
+        self.log("CAPTURE", captured)
+
+    async def _monitor_shutdown(self):
+        await self.closed.wait()
+        for ctx in list(self.streams.values()):
+            try: ctx.upstream_queue.put_nowait(None)
+            except asyncio.QueueFull: pass
+            try: ctx.downstream_queue.put_nowait(None)
+            except asyncio.QueueFull: pass
+
+    async def _keepalive_loop(self):
+        while not self.closed.is_set():
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+            if self.upstream_conn:
+                async with self.us_h2_lock:
+                    try: self.upstream_conn.ping(b'KEEPALLV')
+                    except Exception: break
+                await self.flush(self.upstream_conn, self.upstream_writer, self.us_h2_lock, self.us_socket_lock)
+            async with self.ds_h2_lock:
+                try: self.downstream_conn.ping(b'KEEPALLV')
+                except Exception: break
+            await self.flush(self.downstream_conn, self.client_writer, self.ds_h2_lock, self.ds_socket_lock)
+
+    async def cleanup(self):
+        self.closed.set()
+        for w in [self.client_writer, self.upstream_writer]:
+            if w:
+                try: w.close(); await w.wait_closed()
+                except Exception: pass
+        for ctx in list(self.streams.values()):
+            for t in ctx.sender_tasks: t.cancel()
+
+    async def terminate(self, code):
+        self.closed.set()
+        async with self.ds_h2_lock:
+            try: self.downstream_conn.close_connection(code)
+            except Exception: pass
+        await self.flush(self.downstream_conn, self.client_writer, self.ds_h2_lock, self.ds_socket_lock)
+        
+    async def graceful_shutdown(self):
+        if self.draining or self.closed.is_set(): return
+        self.draining = True
+        async with self.ds_socket_lock:
+            try: self.client_writer.write(GOAWAY_MAX_FRAME); await self.client_writer.drain()
+            except Exception: pass
+        start_time = time.time()
+        while self.streams and (time.time() - start_time < 1.0):
+            try: await asyncio.sleep(0.1)
+            except asyncio.CancelledError: break
+        self.closed.set()
+        async with self.ds_h2_lock:
+            try: self.downstream_conn.close_connection(ErrorCodes.NO_ERROR)
+            except Exception: pass
+        await self.flush(self.downstream_conn, self.client_writer, self.ds_h2_lock, self.ds_socket_lock)
+
+    async def flush(self, conn, writer, h2_lock, socket_lock):
+        if self.closed.is_set(): return
+        bytes_to_send = None
+        async with h2_lock:
+            try: bytes_to_send = conn.data_to_send()
+            except: pass
+        if bytes_to_send:
+            async with socket_lock:
+                try:
+                    writer.write(bytes_to_send)
+                    await writer.drain()
+                except Exception:
+                    self.closed.set()
+
+    def _cleanup_stream(self, stream_id: int, downstream_closed=False, upstream_closed=False, force_close=False):
+        if stream_id not in self.streams: return
+        ctx = self.streams[stream_id]
+        if downstream_closed: ctx.downstream_closed = True
+        if upstream_closed: ctx.upstream_closed = True
+        
+        if ctx.downstream_closed:
+            self.finalize_capture(ctx)
+
+        if force_close or (ctx.downstream_closed and ctx.upstream_closed):
+            ctx.upstream_flow_event.set()
+            ctx.downstream_flow_event.set()
+            for t in ctx.sender_tasks:
+                t.cancel()
+            del self.streams[stream_id]
+
+class DualProtocolHandler:
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, 
+                 explicit_host: str, manager_callback: Callable, 
+                 target_override: Optional[str], scope_pattern: Optional[Any],
+                 enable_tunneling: bool = True,
+                 upstream_verify_ssl: bool = False,
+                 upstream_ca_bundle: Optional[str] = None,
+                 ssl_context_factory: Optional[Callable] = None):
+        
+        self.reader = reader
+        self.writer = writer
+        self.explicit_host = explicit_host
+        self.callback = manager_callback
+        self.target_override = target_override
+        self.scope_pattern = scope_pattern
+        self.enable_tunneling = enable_tunneling
+        self.upstream_verify_ssl = upstream_verify_ssl
+        self.upstream_ca_bundle = upstream_ca_bundle
+        self.ssl_context_factory = ssl_context_factory
+
+    async def run(self):
+        protocol, initial_data = await self._detect_protocol()
+        
+        handler = None
+        if protocol == "h2":
+            handler = NativeProxyHandler(
+                self.reader, self.writer, self.explicit_host, self.callback,
+                self.target_override, self.scope_pattern, self.enable_tunneling,
+                self.upstream_verify_ssl, self.upstream_ca_bundle,
+                initial_data=initial_data,
+                ssl_context_factory=self.ssl_context_factory
+            )
+        else:
+            handler = Http11ProxyHandler(
+                self.reader, self.writer, self.explicit_host, self.callback,
+                self.target_override, self.scope_pattern,
+                self.upstream_verify_ssl, self.upstream_ca_bundle,
+                initial_data=initial_data,
+                ssl_context_factory=self.ssl_context_factory,
+                enable_tunneling=self.enable_tunneling
+            )
+        await handler.run()
+
+    async def _detect_protocol(self) -> Tuple[str, bytes]:
+        ssl_obj = self.writer.get_extra_info('ssl_object')
+        if ssl_obj:
+            alpn_proto = ssl_obj.selected_alpn_protocol()
+            if alpn_proto == "h2": return "h2", b""
+            if alpn_proto == "http/1.1": return "http/1.1", b""
         
         try:
-            self.capture_callback(captured)
+            preface_len = len(H2_PREFACE)
+            data = await asyncio.wait_for(self.reader.read(preface_len), timeout=5.0)
+            
+            if data.startswith(H2_PREFACE[:4]):
+                if len(data) == preface_len and data == H2_PREFACE:
+                    return "h2", data
+                if b'HTTP/2.0' in data:
+                    return "h2", data
+            return "http/1.1", data
         except Exception as e:
-            log.error(f"Error in capture callback: {e}")
+            return "http/1.1", b""
 
-    def construct_target_url(self, scheme: str, path: str, authority: str) -> str:
-        if self.target_override:
-            return urljoin(self.target_override, path.lstrip('/'))
-        return urlunparse((scheme, authority, path, '', '', ''))
+async def start_proxy_server(host, port, manager_callback, target_override=None, scope_pattern=None, ssl_context_factory=None):
+    async def _handle_client(reader, writer):
+        handler = DualProtocolHandler(
+            reader, writer, explicit_host="", manager_callback=manager_callback,
+            target_override=target_override, scope_pattern=scope_pattern,
+            ssl_context_factory=ssl_context_factory
+        )
+        await handler.run()
 
-    def get_writer(self, conn: H2Connection) -> Optional[asyncio.StreamWriter]:
-        if conn == self.downstream_conn:
-            return self.client_writer
-        elif conn == self.upstream_conn:
-            return self.upstream_writer
-        return None
-
-    def get_other_conn(self, conn: H2Connection) -> Optional[H2Connection]:
-        if conn == self.downstream_conn:
-            return self.upstream_conn
-        elif conn == self.upstream_conn:
-            return self.downstream_conn
-        return None
+    server = await asyncio.start_server(_handle_client, host, port)
+    manager_callback("SYSTEM", f"TCP (H1/H2) Proxy listening on {host}:{port}")
+    
+    async with server:
+        try:
+            await server.serve_forever()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            manager_callback("SYSTEM", "TCP (H1/H2) Proxy stopped")

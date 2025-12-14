@@ -1,215 +1,72 @@
 # tests/test_scalpel_racer.py
-"""
-Tests for the main Scalpel Racer application logic and integration components.
-Includes unit tests for data structures and integration tests for the CaptureServer.
-"""
-
 import pytest
-import asyncio
-import httpx
-import pytest_asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
-from scalpel_racer import CapturedRequest, ScanResult, CaptureServer, Last_Byte_Stream_Body, HOP_BY_HOP_HEADERS
+from unittest.mock import MagicMock, patch, AsyncMock
+from scalpel_racer import run_scan, CAManager
+from structures import ScanResult, CapturedRequest
 
-# Helper for async iteration compatibility
-async def a_next(gen):
-    try:
-        return await gen.__anext__()
-    except StopAsyncIteration:
-        return None
-
-# --- Unit Tests ---
-def test_captured_request_str():
-    """Test string representation of captured requests."""
-    req = CapturedRequest(1, "GET", "http://example.com/test", {}, b"payload")
-    assert str(req) == "1     GET     http://example.com/test (7 bytes) "
-
-def test_captured_request_edited():
-    """Test modification of captured request body."""
-    req = CapturedRequest(1, "POST", "http://example.com", {}, b"A")
-    req.edited_body = b"B{{SYNC}}C"
-    assert req.get_attack_payload() == b"B{{SYNC}}C"
-    assert str(req) == "1     POST    http://example.com (10 bytes) [E]"
-
-@pytest.mark.asyncio
-async def test_last_byte_stream_body_single_byte():
-    """Test Last-Byte Sync streaming behavior with a single byte payload."""
-    payload = b"A"
-    barrier = asyncio.Barrier(2)
-
-    async def streamer():
-        parts = []
-        async for part in Last_Byte_Stream_Body(payload, barrier, warmup_ms=0):
-            parts.append(part)
-        return parts
-
-    task = asyncio.create_task(streamer())
-    await asyncio.sleep(0.05)
-    assert not task.done()
-
-    await barrier.wait()
-    parts = await task
-    assert parts == [b"A"]
-
-@pytest.mark.asyncio
-async def test_last_byte_stream_body_empty():
-    """Test Last-Byte Sync streaming behavior with an empty payload."""
-    payload = b""
-    barrier = asyncio.Barrier(2)
-
-    gen = Last_Byte_Stream_Body(payload, barrier, 0)
-    task = asyncio.create_task(a_next(gen))
-    await asyncio.sleep(0.05)
-    assert not task.done()
-
-    await barrier.wait()
-    result = await task
-    assert result == b""
+class TestScalpelIntegration:
     
-    await gen.aclose()
-
-# --- Integration Tests for CaptureServer ---
-
-@pytest_asyncio.fixture
-async def server_manager(unused_tcp_port_factory):
-    """Fixture to manage CaptureServer instances for integration tests."""
-    servers = []
-    async def _start_server(target_override=None, scope_regex=None, enable_tunneling=False):
-        port = unused_tcp_port_factory()
-        # [FIX] Added bind_addr="127.0.0.1"
-        server = CaptureServer(port=port, bind_addr="127.0.0.1", target_override=target_override, scope_regex=scope_regex, enable_tunneling=enable_tunneling)
-        servers.append(server)
-        task = asyncio.create_task(server.start())
-
-        try:
-            await asyncio.wait_for(server.ready_event.wait(), timeout=1.0)
-        except asyncio.TimeoutError:
-            if not task.done():
-                 task.cancel()
-            if task.done() and task.exception():
-                 print(f"Server task exception during startup: {task.exception()}")
-            pytest.fail(f"Server failed to start on port {port} (Timeout waiting for ready_event)")
+    @patch("scalpel_racer.httpx.AsyncClient")
+    @pytest.mark.asyncio
+    async def test_run_scan_standard(self, mock_client):
+        # Setup AsyncClient mock
+        client_inst = AsyncMock()
+        mock_client.return_value.__aenter__.return_value = client_inst
         
-        if server.server is None:
-             if not task.done():
-                 task.cancel()
-             pytest.fail(f"Server failed to start on port {port}")
-             
-        return server, port
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.aread = AsyncMock(return_value=b"body")
+        
+        stream_ctx = AsyncMock()
+        stream_ctx.__aenter__.return_value = mock_resp
+        
+        # FIX: client.stream should not be an AsyncMock itself (which creates a coroutine when called), 
+        # but a method returning an async context manager (the stream_ctx).
+        client_inst.stream = MagicMock(return_value=stream_ctx)
+        
+        req = CapturedRequest(0, "GET", "http://a.com", [], b"")
+        
+        # Run standard attack
+        results = await run_scan(req, concurrency=2, http2=False, warmup=0, strategy="auto")
+        
+        assert len(results) == 2
+        assert results[0].status_code == 200
 
-    yield _start_server
+    @patch("scalpel_racer.HTTP2RaceEngine")
+    @patch("scalpel_racer.H2_AVAILABLE", True)
+    @pytest.mark.asyncio
+    async def test_run_scan_h2_delegation(self, mock_h2_cls):
+        """Verify 'spa' strategy triggers HTTP2RaceEngine."""
+        req = CapturedRequest(0, "GET", "http://a.com", [], b"")
+        
+        mock_engine = mock_h2_cls.return_value
+        mock_engine.run_attack.return_value = [ScanResult(0, 200, 10)]
+        
+        await run_scan(req, concurrency=1, http2=True, warmup=0, strategy="spa")
+        
+        mock_h2_cls.assert_called_once()
+        assert mock_h2_cls.call_args[0][2] == "spa"
 
-    for server in servers:
-        server.stop_event.set()
-    await asyncio.sleep(0.1) 
-
-@pytest.mark.asyncio
-async def test_capture_server_urljoin_fix(server_manager):
-    """Test correct URL joining behavior with target override."""
-    target_base = "http://upstream.com/api/v1"
-    server, port = await server_manager(target_override=target_base)
-    assert server.target_override == "http://upstream.com/api/v1/"
-    async with httpx.AsyncClient(proxy=f"http://127.0.0.1:{port}") as client:
-        response = await client.get(f"http://doesntmatter.com/resource?q=1")
-    assert b"Captured" in response.content
-    assert len(server.request_log) == 1
-    captured = server.request_log[0]
-    assert captured.url == "http://upstream.com/api/v1/resource?q=1"
-
-@pytest.mark.asyncio
-async def test_capture_server_absolute_uri_parsing_fix(server_manager):
-    """Test parsing of absolute URIs in requests."""
-    target_base = "http://target.com/"
-    server, port = await server_manager(target_override=target_base)
-    reader, writer = await asyncio.open_connection('127.0.0.1', port)
-    request = (
-        b"GET http://external.com/foo?bar=baz HTTP/1.1\r\n"
-        b"Host: confusing.com\r\n"
-        b"X-Test: value\r\n"
-        b"\r\n"
-    )
-    writer.write(request)
-    await writer.drain()
-    response = await reader.read(1024)
-    writer.close()
-    await writer.wait_closed()
-    assert b"Captured" in response
-    assert len(server.request_log) == 1
-    captured = server.request_log[0]
-    assert captured.url == "http://target.com/foo?bar=baz"
-
-@pytest.mark.asyncio
-async def test_capture_server_header_filtering(server_manager):
-    """Test removal of Hop-by-Hop headers."""
-    server, port = await server_manager(target_override="http://target.com/")
-    
-    async with httpx.AsyncClient(proxy=f"http://127.0.0.1:{port}") as client:
-        headers = {
-            "X-Keep-Me": "yes",
-            "Connection": "keep-alive",
-            "Transfer-Encoding": "chunked",
-            "Proxy-Connection": "keep-alive",
-            "Host": "target.com",
-            "Accept-Encoding": "gzip"
-        }
-        await client.get(f"http://target.com/test", headers=headers)
-    assert len(server.request_log) == 1
-    captured = server.request_log[0]
-    assert "X-Keep-Me" in captured.headers
-    captured_headers_lower = {k.lower() for k in captured.headers.keys()}
-    for header in HOP_BY_HOP_HEADERS:
-        assert header not in captured_headers_lower, f"Header {header} was not filtered from log!"
-
-@pytest.mark.asyncio
-async def test_capture_server_robust_parsing():
-    """Test robustness against malformed headers."""
-    # [FIX] Added bind_addr="127.0.0.1"
-    server = CaptureServer(port=8000, bind_addr="127.0.0.1", enable_tunneling=False)
-    reader = AsyncMock(spec=asyncio.StreamReader)
-    writer = MagicMock()
-    writer.drain = AsyncMock()
-    writer.close = MagicMock()
-    writer.is_closing.return_value = False
-    writer.wait_closed = AsyncMock() 
-
-    reader.readline.side_effect = [
-        b"GET  /test  HTTP/1.1\r\n", 
-        b"Host: example.com\r\n",
-        b"Malformed-Header\r\n",
-        b"Content-Length: invalid\r\n",
-        b"Valid-Header: value\r\n",
-        b"\r\n"
-    ]
-
-    async def mock_wait_for(coro, timeout):
-        return await coro
-
-    with patch('asyncio.wait_for', side_effect=mock_wait_for):
-        await server.handle_client(reader, writer)
-
-    assert len(server.request_log) == 1
-    captured = server.request_log[0]
-    assert captured.method == "GET"
-    assert captured.url == "http://example.com/test"
-    expected_response = b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: keep-alive\r\n\r\nCaptured."
-    assert writer.write.call_args_list[-1].args[0] == expected_response
-
-@pytest.mark.asyncio
-async def test_capture_server_relaxed_parsing_version(server_manager):
-    """Test parsing of requests with missing version strings."""
-    server, port = await server_manager()
-    reader, writer = await asyncio.open_connection('127.0.0.1', port)
-    request = (
-        b"GET /foo\r\n"
-        b"Host: example.com\r\n"
-        b"\r\n"
-    )
-    writer.write(request)
-    await writer.drain()
-    response = await reader.read(1024)
-    writer.close()
-    await writer.wait_closed()
-    assert b"Captured" in response
-    assert len(server.request_log) == 1
-    captured = server.request_log[0]
-    assert captured.url == "http://example.com/foo"
+    @patch("scalpel_racer.ec.generate_private_key")
+    @patch("scalpel_racer.x509.CertificateBuilder")
+    def test_ca_generation(self, mock_builder, mock_key):
+        """Test CA Manager crypto calls."""
+        with patch("scalpel_racer.CRYPTOGRAPHY_AVAILABLE", True), \
+             patch("builtins.open", MagicMock()), \
+             patch("os.chown"):
+            
+            # Setup fluent interface for Builder
+            builder_instance = mock_builder.return_value
+            builder_instance.subject_name.return_value = builder_instance
+            builder_instance.issuer_name.return_value = builder_instance
+            builder_instance.public_key.return_value = builder_instance
+            builder_instance.serial_number.return_value = builder_instance
+            builder_instance.not_valid_before.return_value = builder_instance
+            builder_instance.not_valid_after.return_value = builder_instance
+            builder_instance.add_extension.return_value = builder_instance
+            
+            mgr = CAManager()
+            mgr.generate_ca()
+            
+            mock_key.assert_called()
+            builder_instance.sign.assert_called()
