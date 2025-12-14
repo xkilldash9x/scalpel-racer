@@ -98,6 +98,14 @@ To capture HTTPS traffic without browser warnings or connection errors, you must
 1.  Run Scalpel Racer once. It will generate `scalpel_ca.pem` and `scalpel_ca.key` in the current directory.
 2.  Import `scalpel_ca.pem` into your browser's "Trusted Root Certification Authorities" store (or your OS system store).
 
+**Verifying Certificates (Linux/Advanced Users):**
+Before adding the certificate to your system trust store (especially on Linux), you can use the included utility to verify that the generated key and certificate match:
+
+```bash
+python3 verify_certs.py
+```
+This ensures the `scalpel_ca.pem` and `scalpel_ca.key` in your directory are a valid pair before you proceed with system-wide installation (e.g., copying to `/usr/local/share/ca-certificates/` and running `update-ca-certificates`).
+
 ### 4. Command Line Arguments
 
 ```text
