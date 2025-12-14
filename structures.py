@@ -36,6 +36,14 @@ HOP_BY_HOP_HEADERS = [
 class ScanResult:
     """
     Represents the result of a single race attempt.
+
+    Attributes:
+        index (int): The index of the probe.
+        status_code (int): The HTTP status code received.
+        duration (float): The duration of the request in milliseconds.
+        body_hash (str, optional): SHA-256 hash of the response body.
+        body_snippet (str, optional): A snippet of the response body.
+        error (str, optional): Error message if the request failed.
     """
     def __init__(self, index: int, status_code: int, duration: float, body_hash: str = None,
                  body_snippet: str = None, error: str = None):
@@ -50,6 +58,14 @@ class ScanResult:
 class CapturedRequest:
     """
     Represents a captured HTTP request.
+
+    Attributes:
+        id (int): The unique identifier of the captured request.
+        method (str): The HTTP method (e.g., GET, POST).
+        url (str): The full URL of the request.
+        headers (Dict[str, str]): A dictionary of HTTP headers.
+        body (bytes): The request body.
+        edited_body (bytes, optional): The modified body for attack replay.
     """
     def __init__(self, id: int, method: str, url: str, headers: Dict[str, str], body: bytes):
         self.id = id
@@ -66,4 +82,8 @@ class CapturedRequest:
         return f"{self.id:<5} {self.method:<7} {display_url} ({body_len} bytes) {edited_flag}"
 
     def get_attack_payload(self) -> bytes:
+        """
+        Returns the payload to be used in an attack.
+        Returns the edited body if present, otherwise the original body.
+        """
         return self.edited_body if self.edited_body is not None else self.body

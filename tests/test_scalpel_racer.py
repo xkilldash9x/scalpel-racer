@@ -1,4 +1,9 @@
 # tests/test_scalpel_racer.py
+"""
+Tests for the main Scalpel Racer application logic and integration components.
+Includes unit tests for data structures and integration tests for the CaptureServer.
+"""
+
 import pytest
 import asyncio
 import httpx
@@ -15,10 +20,12 @@ async def a_next(gen):
 
 # --- Unit Tests ---
 def test_captured_request_str():
+    """Test string representation of captured requests."""
     req = CapturedRequest(1, "GET", "http://example.com/test", {}, b"payload")
     assert str(req) == "1     GET     http://example.com/test (7 bytes) "
 
 def test_captured_request_edited():
+    """Test modification of captured request body."""
     req = CapturedRequest(1, "POST", "http://example.com", {}, b"A")
     req.edited_body = b"B{{SYNC}}C"
     assert req.get_attack_payload() == b"B{{SYNC}}C"
@@ -26,6 +33,7 @@ def test_captured_request_edited():
 
 @pytest.mark.asyncio
 async def test_last_byte_stream_body_single_byte():
+    """Test Last-Byte Sync streaming behavior with a single byte payload."""
     payload = b"A"
     barrier = asyncio.Barrier(2)
 
@@ -45,6 +53,7 @@ async def test_last_byte_stream_body_single_byte():
 
 @pytest.mark.asyncio
 async def test_last_byte_stream_body_empty():
+    """Test Last-Byte Sync streaming behavior with an empty payload."""
     payload = b""
     barrier = asyncio.Barrier(2)
 
@@ -63,6 +72,7 @@ async def test_last_byte_stream_body_empty():
 
 @pytest_asyncio.fixture
 async def server_manager(unused_tcp_port_factory):
+    """Fixture to manage CaptureServer instances for integration tests."""
     servers = []
     async def _start_server(target_override=None, scope_regex=None, enable_tunneling=False):
         port = unused_tcp_port_factory()
@@ -95,6 +105,7 @@ async def server_manager(unused_tcp_port_factory):
 
 @pytest.mark.asyncio
 async def test_capture_server_urljoin_fix(server_manager):
+    """Test correct URL joining behavior with target override."""
     target_base = "http://upstream.com/api/v1"
     server, port = await server_manager(target_override=target_base)
     assert server.target_override == "http://upstream.com/api/v1/"
@@ -107,6 +118,7 @@ async def test_capture_server_urljoin_fix(server_manager):
 
 @pytest.mark.asyncio
 async def test_capture_server_absolute_uri_parsing_fix(server_manager):
+    """Test parsing of absolute URIs in requests."""
     target_base = "http://target.com/"
     server, port = await server_manager(target_override=target_base)
     reader, writer = await asyncio.open_connection('127.0.0.1', port)
@@ -128,6 +140,7 @@ async def test_capture_server_absolute_uri_parsing_fix(server_manager):
 
 @pytest.mark.asyncio
 async def test_capture_server_header_filtering(server_manager):
+    """Test removal of Hop-by-Hop headers."""
     server, port = await server_manager(target_override="http://target.com/")
     
     async with httpx.AsyncClient(proxy=f"http://127.0.0.1:{port}") as client:
@@ -149,6 +162,7 @@ async def test_capture_server_header_filtering(server_manager):
 
 @pytest.mark.asyncio
 async def test_capture_server_robust_parsing():
+    """Test robustness against malformed headers."""
     # [FIX] Added bind_addr="127.0.0.1"
     server = CaptureServer(port=8000, bind_addr="127.0.0.1", enable_tunneling=False)
     reader = AsyncMock(spec=asyncio.StreamReader)
@@ -182,6 +196,7 @@ async def test_capture_server_robust_parsing():
 
 @pytest.mark.asyncio
 async def test_capture_server_relaxed_parsing_version(server_manager):
+    """Test parsing of requests with missing version strings."""
     server, port = await server_manager()
     reader, writer = await asyncio.open_connection('127.0.0.1', port)
     request = (
