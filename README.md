@@ -16,13 +16,13 @@ Scalpel Racer is an advanced race condition testing tool designed to identify an
 
 ## Requirements
 
-* Python 3.7+
+* **Python 3.11+** (Required for `asyncio.TaskGroup` and modern TLS features)
 * **Core Dependencies**:
     * `httpx`: For standard HTTP requests and the 'auto' strategy.
     * `numpy`: For statistical analysis of timing data.
     * `cryptography`: For HTTPS interception (CA generation).
 * **Advanced Dependencies** (Required for SPA and First-Seq):
-    * `h2`: Required for HTTP/2 Single Packet Attacks and First-Seq.
+    * `h2` (>= 4.1.0): Required for HTTP/2 Single Packet Attacks and First-Seq.
     * `NetfilterQueue` & `scapy`: Required for the First-Seq strategy (Linux only, requires root).
 
 ### Installation
@@ -124,6 +124,7 @@ optional arguments:
                         spa: Use HTTP/2 Single Packet Attack (H2 engine).
                         first-seq: Use HTTP/2 First Sequence Sync (H2 engine, Linux root only).
   --http2               Force HTTP/2 for 'auto' strategy.
+  -v, --verbose         Enable verbose logging (DEBUG level).
 ```
 
 ## Advanced Strategies

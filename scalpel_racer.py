@@ -1,16 +1,13 @@
 # scalpel_racer.py
 """
 Scalpel Racer - Advanced Race Condition Testing Tool.
-This is the main entry point for the Scalpel Racer application.
-It orchestrates the entire workflow, from setting up the intercepting proxy server and capturing
-traffic to managing the Certificate Authority (CA) and executing various race
-condition attack strategies (Auto, SPA, First-Seq).
-[FIXED] Updated to use RSA-3072 for key generation (NIST SP 800-57).
-[FIXED] Replaced deprecated datetime.utcnow() with datetime.now(datetime.UTC).
-[FIXED] Secured Windows temporary file handling with TemporaryDirectory.
-[FIXED] Restricted default binding to localhost (127.0.0.1).
-[FIXED] Migrated to asyncio.TaskGroup for robust concurrency.
-[REFACTORED] Replaced print/traceback with logging for operational output.
+
+This is the main entry point for the Scalpel Racer application. It orchestrates the entire workflow,
+including:
+1. Setting up the intercepting proxy server (`CaptureServer`) to capture traffic.
+2. Managing the Certificate Authority (CA) for HTTPS interception (`CAManager`).
+3. Orchestrating various race condition attack strategies (Auto, SPA, First-Seq).
+4. Providing an interactive CLI for selecting and editing requests.
 """
 
 import asyncio
@@ -102,7 +99,10 @@ CA_MANAGER = None
 class CAManager:
     """
     Manages the Certificate Authority (CA) for HTTPS interception.
-    Updated to use RSA-3072 and UTC-aware datetimes.
+
+    This class handles the generation and loading of the Root CA certificate and key,
+    as well as the on-the-fly generation of leaf certificates for intercepted hostnames.
+    It uses RSA-3072 keys and UTC-aware timestamps for modern security compliance.
     """
     def __init__(self):
         self.ca_key = None
@@ -110,6 +110,9 @@ class CAManager:
         self.cert_cache = {}
 
     def initialize(self):
+        """
+        Initializes the CA Manager by loading an existing CA or generating a new one.
+        """
         if not CRYPTOGRAPHY_AVAILABLE:
             return
         if os.path.exists(CA_CERT_FILE) and os.path.exists(CA_KEY_FILE):
@@ -118,6 +121,9 @@ class CAManager:
             self.generate_ca()
 
     def load_ca(self):
+        """
+        Loads the Root CA certificate and private key from disk.
+        """
         logger.info(f"Loading Root CA from {CA_CERT_FILE}")
         try:
             with open(CA_KEY_FILE, "rb") as f:
@@ -129,7 +135,10 @@ class CAManager:
             self.generate_ca()
 
     def generate_ca(self):
-        # [FIX] NIST SP 800-57: Upgrade to RSA-3072 for post-2023 security
+        """
+        Generates a new Root CA certificate and private key (RSA-3072).
+        The generated files are saved to disk as `scalpel_ca.pem` and `scalpel_ca.key`.
+        """
         logger.info(f"Generating new Root CA (RSA-3072). Install '{CA_CERT_FILE}' in your browser/OS trust store.")
         self.ca_key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
 
@@ -138,11 +147,10 @@ class CAManager:
             x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"Scalpel Racer"),
         ])
         
-        # [FIX] Replace deprecated utcnow() with datetime.now(datetime.UTC)
         try:
             now = datetime.datetime.now(datetime.timezone.utc)
         except Exception:
-            # Fallback for very old python, though 3.11+ is required for other features
+            # Fallback for older python environments if necessary
             now = datetime.datetime.utcnow()
 
         builder = (
@@ -179,6 +187,15 @@ class CAManager:
             logger.error(f"Error saving CA files: {e}.")
 
     def get_ssl_context(self, hostname: str) -> ssl.SSLContext:
+        """
+        Retrieves or generates an SSLContext for the specified hostname.
+
+        Args:
+            hostname (str): The hostname to generate the certificate for.
+
+        Returns:
+            ssl.SSLContext: The SSL context configured with the generated certificate.
+        """
         if hostname in self.cert_cache:
             return self.cert_cache[hostname]
 
@@ -198,7 +215,7 @@ class CAManager:
         cert_pem = cert.public_bytes(Encoding.PEM)
         key_pem = key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption())
 
-        # [FIX] Use TemporaryDirectory to fix Windows file locking/squatting issues (CWE-377)
+        # Use TemporaryDirectory to safely handle certificate files
         with tempfile.TemporaryDirectory() as temp_dir:
             cert_path = os.path.join(temp_dir, "cert.pem")
             key_path = os.path.join(temp_dir, "key.pem")
@@ -214,7 +231,15 @@ class CAManager:
         return context
 
     def generate_host_cert(self, hostname: str):
-        # [FIX] RSA-3072
+        """
+        Generates a leaf certificate for the given hostname, signed by the Root CA.
+
+        Args:
+            hostname (str): The hostname for the certificate CN/SAN.
+
+        Returns:
+            Tuple: A tuple containing the certificate and private key objects.
+        """
         key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
         if isinstance(hostname, bytes):
             hostname = hostname.decode('utf-8', errors='ignore')
@@ -228,13 +253,12 @@ class CAManager:
             pass
 
         san = x509.SubjectAlternativeName(san_list)
-        # [FIX] UTC-aware datetime
         try:
             now = datetime.datetime.now(datetime.timezone.utc)
         except Exception:
             now = datetime.datetime.utcnow()
         
-        # Backdate 24h to avoid "Not Valid Yet" errors
+        # Backdate 24h to avoid "Not Valid Yet" errors due to clock skew
         not_before = now - datetime.timedelta(days=1)
         not_after = now + datetime.timedelta(days=30)
 
@@ -266,9 +290,18 @@ class CAManager:
 
 
 class CaptureServer:
+    """
+    An intercepting proxy server that captures HTTP/HTTPS requests.
+
+    It supports:
+    - HTTP/1.1 and HTTP/2 (via NativeProxyHandler) interception.
+    - Dynamic SSL certificate generation.
+    - Request filtering by scope.
+    - Target URL overriding.
+    """
     def __init__(self, port: int, bind_addr: str, target_override: str = None, scope_regex: str = None, enable_tunneling: bool = True):
         self.port = port
-        self.bind_addr = bind_addr # [Security] Configurable bind address
+        self.bind_addr = bind_addr
         self.target_override = target_override
         if self.target_override and not self.target_override.endswith('/'):
             self.target_override += '/'
@@ -280,10 +313,12 @@ class CaptureServer:
         self.enable_tunneling = enable_tunneling
         self.proxy_client = None
         self.capture_count = 0
-        # [FIX] Added ready_event for test synchronization
         self.ready_event = asyncio.Event()
 
     def construct_target_url(self, scheme: str, request_line_target: str, normalized_headers: Dict[str, str], explicit_host: Optional[str]) -> str:
+        """
+        Constructs the full target URL from the request data.
+        """
         try:
             parsed_target = urlparse(request_line_target)
         except ValueError:
@@ -331,6 +366,9 @@ class CaptureServer:
          ))
 
     def _ingest_captured_request(self, captured: CapturedRequest):
+        """
+        Logs a captured request and updates the UI counter.
+        """
         captured.id = len(self.request_log)
         self.request_log.append(captured)
         self.capture_count += 1
@@ -339,6 +377,9 @@ class CaptureServer:
              print(f"[*] Captured {self.capture_count} requests...", end='\r', flush=True)
 
     async def start(self):
+        """
+        Starts the proxy server and listens for incoming connections.
+        """
         if globals().get('CA_MANAGER'):
             try:
                 globals().get('CA_MANAGER').initialize()
@@ -359,7 +400,6 @@ class CaptureServer:
         if self.target_override:
             logger.info(f"Target Override Base: {self.target_override}")
         
-        # [FIX] Signal that server is ready
         self.ready_event.set()
 
         async with self.server:
@@ -371,6 +411,10 @@ class CaptureServer:
             await self.proxy_client.aclose()
 
     async def handle_client(self, reader, writer):
+        """
+        Handles an incoming client connection (TCP).
+        Determines if it's a standard HTTP request or a CONNECT tunnel request.
+        """
         try:
             try:
                 line = await asyncio.wait_for(reader.readline(), timeout=INITIAL_LINE_TIMEOUT)
@@ -399,7 +443,6 @@ class CaptureServer:
                 if globals().get('CA_MANAGER'):
                     await self.handle_connect(reader, writer, parts_strict[1])
                 else:
-                    # [FIX] Log warning if CA disabled (needed for test compliance)
                     print(f"[!] Received CONNECT request but TLS interception is disabled.")
                     return
             elif method in ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH"]:
@@ -422,10 +465,13 @@ class CaptureServer:
                     pass
 
     async def handle_connect(self, client_reader, client_writer, path):
+        """
+        Handles HTTP CONNECT requests (HTTPS tunneling).
+        Performs TLS MITM if CA is available, upgrading the connection to HTTP/2 if negotiated via ALPN.
+        """
         try:
             if ':' in path:
                 host, port_str = path.split(':', 1)
-                # [FIX] Validate port is numeric
                 if not port_str.isdigit():
                      raise ValueError("Invalid port")
             else:
@@ -445,8 +491,7 @@ class CaptureServer:
         client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await client_writer.drain()
 
-        # [Transport Safety] Use writer.start_tls (Python 3.11+) to prevent buffer loss
-        # [FIX] Robust fallback logic for missing/failing start_tls (test_b01 compliance)
+        # Perform TLS Handshake
         try:
             if hasattr(client_writer, 'start_tls'):
                 await client_writer.start_tls(ssl_context)
@@ -456,8 +501,6 @@ class CaptureServer:
             # Fallback for manual stream rebinding or when mock forces AttributeError
             if "start_tls" in str(e) or isinstance(e, AttributeError):
                  loop = asyncio.get_running_loop()
-                 # Access underlying transport/protocol for manual upgrade
-                 # Note: _protocol is an implementation detail but required here
                  transport = client_writer.transport
                  protocol = client_writer._protocol 
                  
@@ -499,6 +542,9 @@ class CaptureServer:
             except Exception: break
 
     async def process_http_request(self, reader, writer, method, request_target, version, initial_line, scheme, explicit_host=None):
+        """
+        Parses and processes an individual HTTP/1.1 request.
+        """
         normalized_headers: Dict[str, str] = {}
         original_headers_list: List[tuple[str, str]] = [] 
         content_length = 0
@@ -657,7 +703,7 @@ class CaptureServer:
                 writer.close()
             return
 
-        # [B04 FIX] Uses the consolidated HOP_BY_HOP_HEADERS imported from structures.
+        # Uses the consolidated HOP_BY_HOP_HEADERS imported from structures.
         safe_headers = {k: v for k, v in original_headers_dict.items()
                         if k.lower() not in HOP_BY_HOP_HEADERS}
 
@@ -724,6 +770,7 @@ class CaptureServer:
 async def Last_Byte_Stream_Body(payload: bytes, barrier: asyncio.Barrier, warmup_ms: int) -> AsyncIterator[bytes]:
     """
     Async generator that streams the request body, pausing before the last byte.
+    Used for Last-Byte Sync attacks.
     """
     if len(payload) <= 1:
         if warmup_ms > 0:
@@ -750,6 +797,7 @@ async def Last_Byte_Stream_Body(payload: bytes, barrier: asyncio.Barrier, warmup
 async def Staged_Stream_Body(payload: bytes, barriers: List[asyncio.Barrier]) -> AsyncIterator[bytes]:
     """
     Async generator that splits the payload by {{SYNC}} markers.
+    Used for Staged attacks.
     """
     parts = payload.split(SYNC_MARKER)
     barrier_idx = 0
@@ -769,9 +817,13 @@ async def Staged_Stream_Body(payload: bytes, barriers: List[asyncio.Barrier]) ->
 async def send_probe_advanced(client: httpx.AsyncClient, request: CapturedRequest, payload: bytes, barriers: List[asyncio.Barrier], warmup_ms: int, index: int, is_staged: bool) -> ScanResult:
     """
     Sends a single probe request using httpx with the specified synchronization strategy.
-    [FIX] Explicitly recalculates Content-Length to ensure valid headers during edits/streaming.
+
+    This function handles:
+    - Adding tracking headers.
+    - Streaming the body according to the chosen strategy (LBS or Staged).
+    - Capturing timing metrics and response data.
     """
-    start_time = time.perf_counter() # [Compliance] Monotonic clock
+    start_time = time.perf_counter()
     body_hash = None
     body_snippet = None
 
@@ -780,7 +832,7 @@ async def send_probe_advanced(client: httpx.AsyncClient, request: CapturedReques
         req_headers["User-Agent"] = "Scalpel-CLI/5.4-Optimized"
         req_headers["X-Scalpel-Probe"] = f"{index}_{int(time.time())}"
 
-        # [FIX] Recalculate Content-Length for correct handling of edited bodies/sync markers
+        # Recalculate Content-Length for correct handling of edited bodies/sync markers
         actual_length = len(payload)
         req_headers["Content-Length"] = str(actual_length)
 
@@ -820,7 +872,12 @@ async def send_probe_advanced(client: httpx.AsyncClient, request: CapturedReques
 
 async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warmup: int, strategy: str = "auto"):
     """
-    Orchestrates the race condition attack.
+    Orchestrates the race condition attack using the selected strategy.
+
+    Strategies:
+    - 'auto': Uses httpx with synchronization barriers (Last-Byte Sync or Staged).
+    - 'spa': Uses low-level H2 engine for Single Packet Attack.
+    - 'first-seq': Uses low-level H2 engine + PacketController for First Sequence Sync.
     """
     attack_payload = request.get_attack_payload()
     sync_markers_count = attack_payload.count(SYNC_MARKER)
@@ -889,7 +946,7 @@ async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warm
     limits = httpx.Limits(max_keepalive_connections=concurrency, max_connections=concurrency*2)
     timeout = httpx.Timeout(DEFAULT_TIMEOUT, connect=5.0)
 
-    # [REFACTORED] Use asyncio.TaskGroup for probe execution (Structured Concurrency)
+    # Use asyncio.TaskGroup for probe execution (Structured Concurrency)
     async with httpx.AsyncClient(http2=http2, limits=limits, timeout=timeout, verify=False) as client:
         if hasattr(asyncio, 'TaskGroup'):
             results = [None] * concurrency
@@ -998,6 +1055,7 @@ def analyze_results(results: List[ScanResult]):
 def edit_request_body(request: CapturedRequest):
     """
     Provides a CLI for editing the body of a captured request.
+    Allows insertion of {{SYNC}} markers for Staged attacks.
     """
     print(f"\nEditing Body for Request {request.id}")
     print("Instructions: Use {{SYNC}} to insert synchronization points for Staged Attacks.")
@@ -1046,7 +1104,8 @@ def edit_request_body(request: CapturedRequest):
 
 def main():
     """
-    Main entry point.
+    Main entry point for the application.
+    Parses arguments, initializes components, and starts the capture server or attack.
     """
     if platform.system() == "Windows":
         try:
@@ -1075,12 +1134,11 @@ def main():
     
     parser.add_argument("--http2", action="store_true", help="Force HTTP/2 for 'auto' strategy.")
     
-    # [REFACTORED] Added verbose flag
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging (DEBUG level).")
 
     args = parser.parse_args()
 
-    # [FIX] Initialize logging with configuration
+    # Initialize logging with configuration
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
         level=log_level,
