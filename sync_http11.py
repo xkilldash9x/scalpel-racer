@@ -1,5 +1,4 @@
 # sync_http11.py
-# FILE: ./sync_http11.py
 """
 Implements the Synchronous HTTP/1.1 Staged Attack engine.
 
@@ -17,7 +16,7 @@ import hashlib
 import sys
 import logging
 from urllib.parse import urlparse
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Union
 # Import HTTPResponse for robust parsing over raw sockets
 from http.client import HTTPResponse
 import io
@@ -215,8 +214,13 @@ class HTTP11SyncEngine:
         headers["Host"] = host_header
 
         # Add user-provided headers
+        # FIX: Handle headers being a list (structures.py) or dict (fallback)
+        req_headers_iter = self.request.headers
+        if isinstance(req_headers_iter, dict):
+            req_headers_iter = req_headers_iter.items()
+
         header_keys_lower = set()
-        for k, v in self.request.headers.items():
+        for k, v in req_headers_iter:
             k_lower = k.lower()
             header_keys_lower.add(k_lower)
             # Skip headers managed by this engine or connection protocols
