@@ -12,8 +12,6 @@ Dependencies:
     - NetfilterQueue (Python)
     - scapy (Python)
     - root privileges (for iptables and NFQueue binding)
-
-[REFACTORED] Switched from print/traceback to logging for operational output.
 """
 
 import os
@@ -128,7 +126,7 @@ class PacketController:
         """
         logger.info(f"PacketController: Starting interception for {self.target_ip}:{self.target_port} (Source Port: {self.source_port})")
 
-        # 1. Set up the iptables rule (PC1: Now idempotent)
+        # 1. Set up the iptables rule (Idempotent)
         self._manage_iptables(action='A')
 
         # 2. Initialize and bind NetfilterQueue
@@ -181,7 +179,7 @@ class PacketController:
             except Exception:
                 pass
 
-        # 2. Clean up iptables rule (PC1: Now idempotent)
+        # 2. Clean up iptables rule (Idempotent)
         self._manage_iptables(action='D')
 
         # 3. Ensure threads are finished
@@ -218,7 +216,7 @@ class PacketController:
         """
 
         # Base rule definition (excluding the action flag)
-        # Optimization: We specifically target packets with the PSH flag set,
+        # We specifically target packets with the PSH flag set,
         # which the OS typically sets when sending the application data burst from sendall().
         base_rule = [
             'iptables',

@@ -7,8 +7,6 @@ This module provides a specialized attack engine (`HTTP11SyncEngine`) that uses 
 threads and barriers to synchronize the sending of request payloads across multiple
 connections. It is designed to achieve higher precision than asyncio-based approaches
 by synchronizing threads immediately before the `socket.send` call.
-
-[REFACTORED] Switched from print/traceback to logging for operational output.
 """
 
 import socket
@@ -69,6 +67,10 @@ class HTTP11SyncEngine:
     def __init__(self, request: CapturedRequest, concurrency: int):
         """
         Initializes the HTTP11SyncEngine.
+
+        Args:
+            request (CapturedRequest): The request to attack with.
+            concurrency (int): The number of concurrent threads/requests.
         """
         self.request = request
         self.concurrency = concurrency
@@ -108,6 +110,7 @@ class HTTP11SyncEngine:
     def _prepare_payload(self):
         """
         Prepares the payload stages and initializes the synchronization barrier.
+        Splits the payload by the `{{SYNC}}` marker.
         """
         payload = self.request.get_attack_payload()
         # The actual length sent over the wire excludes the markers
@@ -162,7 +165,6 @@ class HTTP11SyncEngine:
         try:
             # Connect using the resolved IP
             sock = socket.create_connection((self.target_ip, self.target_port), timeout=CONNECTION_TIMEOUT)
-        # [E1 FIX] Catch socket.error and re-raise as ConnectionError
         except socket.error as e:
             raise ConnectionError(f"Connection failed: {type(e).__name__}: {e}")
 
@@ -271,7 +273,7 @@ class HTTP11SyncEngine:
                 try:
                     # Use a timeout on the barrier
                     self.barrier.wait(timeout=BARRIER_TIMEOUT)
-                # [E1/B14 FIX] Handle the case where another thread aborted the barrier
+                # Handle the case where another thread aborted the barrier
                 except threading.BrokenBarrierError:
                     # Raise an exception to be caught by the outer handler.
                     raise ConnectionError("Synchronization barrier broken (fail-fast).")
@@ -302,23 +304,21 @@ class HTTP11SyncEngine:
             body_snippet = None
             if body:
                 body_hash = hashlib.sha256(body).hexdigest()
-                # [B05 FIX] Removed unnecessary try/except block. 'ignore' strategy is robust.
                 body_snippet = body[:100].decode('utf-8', errors='ignore').replace('\n', ' ').replace('\r', '')
 
             self.results[index] = ScanResult(index, status_code, duration, body_hash, body_snippet)
 
-        # [E1 FIX] Catch ConnectionError and generic Exceptions
         except Exception as e:
             # Capture errors during connection, sending, or receiving
             duration = (time.perf_counter() - start_time) * 1000 if start_time > 0 else 0.0
             error_msg = f"{type(e).__name__}: {e}"
             
-            # [E1 FIX] Only update result if not already set
+            # Only update result if not already set
             if self.results[index] is None:
                 self.results[index] = ScanResult(index, 0, duration, error=error_msg)
 
         finally:
-            # [E1/B14 FIX] Fail-fast mechanism: Ensure the barrier is aborted if an error occurred in this thread
+            # Fail-fast mechanism: Ensure the barrier is aborted if an error occurred in this thread
             try:
                 # If this thread recorded an error and the barrier is still intact, abort it for others.
                 if self.results[index] and self.results[index].error and self.barrier and not self.barrier.broken:

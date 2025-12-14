@@ -7,15 +7,13 @@ of HTTP/2 connections between a client (downstream) and a target server (upstrea
 It implements a full-duplex proxy with support for flow control, state machine
 synchronization, and traffic interception/capture.
 
-REFACTORING REPORT (2025 Audit):
-- Enforced RFC 9113 Strictness (validate_inbound_headers=True, Fail-Fast).
-- Implemented RFC 8441 (Extended CONNECT) for WebSocket bootstrapping.
-- Migrated concurrency to asyncio.TaskGroup (Python 3.11+).
-- Implemented 'Drain-then-ACK' flow control with Bounded Queues to prevent deadlocks/OOM.
-- Added HPACK Bomb mitigation (max_header_list_size).
-- Hardened wait_closed() with timeouts.
-- [REFACTORED] Replaced print/traceback with logging calls.
-- [FIX] Restored Standard HTTP/2 Graceful Shutdown (Double GOAWAY).
+It handles:
+- RFC 9113 header strictness.
+- RFC 8441 (Extended CONNECT) for WebSocket bootstrapping.
+- Structured concurrency via `asyncio.TaskGroup`.
+- "Drain-then-ACK" flow control to prevent deadlocks and memory issues.
+- HPACK Bomb mitigation.
+- Graceful shutdown logic.
 """
 
 import asyncio
@@ -107,14 +105,14 @@ except ImportError:
 # Setup logging
 log = logging.getLogger("proxy_core")
 
-# Configuration Constants (PDF Requirement 7.2: Timeouts)
+# Configuration Constants
 UPSTREAM_CONNECT_TIMEOUT = 10.0
 IDLE_TIMEOUT = 60.0
-GRACEFUL_SHUTDOWN_TIMEOUT = 10.0 # Reduced from 30s for fail-fast
+GRACEFUL_SHUTDOWN_TIMEOUT = 10.0
 FLOW_CONTROL_TIMEOUT = 30.0  # Timeout for waiting on WINDOW_UPDATE
 SOCKET_CLOSE_TIMEOUT = 5.0 # Prevent wait_closed() hangs
 MAX_HEADER_LIST_SIZE = 65536  # 64KB (RFC 9113 Security: Prevent HPACK Bomb)
-QUEUE_MAX_SIZE = 1000 # Backpressure limit (Audit 5.3.1)
+QUEUE_MAX_SIZE = 1000 # Backpressure limit
 MAX_STREAM_ID = 2147483647 # 2^31 - 1 (RFC 7540)
 
 # Define TypedDict for captured header structure
@@ -131,11 +129,11 @@ class StreamContext:
         self.stream_id = stream_id
         self.scheme = scheme
         
-        # (PDF Requirement 4.2: Half-Closed State tracking)
+        # Half-Closed State tracking
         self.downstream_closed = False
         self.upstream_closed = False
         
-        # Synchronization for flow control (PDF Requirement 3.4)
+        # Synchronization for flow control
         self.flow_control_event = asyncio.Event()
         self.flow_control_event.set()  # Start open
 
@@ -145,7 +143,6 @@ class StreamContext:
         self.capture_finalized = False
 
 
-# (PDF Requirement 1: Sans-IO Architecture Implementation)
 class NativeProxyHandler:
     """
     Implements the core HTTP/2 proxy logic using Sans-IO principles (hyper-h2).
@@ -159,6 +156,15 @@ class NativeProxyHandler:
                  enable_tunneling: bool = True):
         """
         Initializes the NativeProxyHandler.
+
+        Args:
+            client_reader (asyncio.StreamReader): The reader for the client connection.
+            client_writer (asyncio.StreamWriter): The writer for the client connection.
+            explicit_host (str): The host/authority derived from the CONNECT request.
+            capture_callback (Callable): Callback to invoke when a request is captured.
+            target_override (Optional[str]): Base URL to override target (if any).
+            scope_pattern (Optional[Any]): Compiled regex pattern for scope filtering.
+            enable_tunneling (bool): Whether to forward requests upstream.
         """
         if not H2_AVAILABLE:
             # Allow initialization if in a mocked test environment
@@ -182,8 +188,8 @@ class NativeProxyHandler:
         
         self.upstream_scheme: str = "https"  # H2 interception is always over TLS (h2)
 
-        # H2 State Machines (PDF Requirement 1.2)
-        # [AUDIT FIX] Enforce strictness: validate=True, normalize=True (RFC 9113)
+        # H2 State Machines
+        # Enforce strictness: validate=True, normalize=True (RFC 9113)
         ds_config = H2Configuration(
             client_side=False, 
             header_encoding='utf-8', 
@@ -197,10 +203,10 @@ class NativeProxyHandler:
         try:
             self.downstream_conn = H2Connection(config=ds_config)
             
-            # [AUDIT FIX] HPACK Bomb Protection (Audit 4.3.1)
+            # HPACK Bomb Protection
             self.downstream_conn.local_settings.max_header_list_size = MAX_HEADER_LIST_SIZE
 
-            # (PDF Requirement 6.2: Enable Extended CONNECT (RFC 8441))
+            # Enable Extended CONNECT (RFC 8441)
             self.downstream_conn.local_settings.enable_connect_protocol = 1
         except Exception as e:
             if not H2_AVAILABLE:
@@ -216,7 +222,7 @@ class NativeProxyHandler:
         self.closed = asyncio.Event()
         self.tasks = []
 
-        # [DEADLOCK & MEMORY FIX] Bounded queues for outbound data.
+        # Bounded queues for outbound data.
         # Queue Items: (stream_id, data, end_stream, ack_target_connection, ack_length)
         # Bounded size applies backpressure to the read loop when the write loop (network) is slow.
         self.upstream_queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
@@ -240,7 +246,7 @@ class NativeProxyHandler:
                 await self.connect_upstream()
 
                 # 3. Initialize H2 on upstream side
-                # [AUDIT FIX] Enforce strictness for upstream too
+                # Enforce strictness for upstream too
                 us_config = H2Configuration(
                     client_side=True, 
                     header_encoding='utf-8', 
@@ -250,7 +256,7 @@ class NativeProxyHandler:
                     normalize_outbound_headers=True
                 )
                 self.upstream_conn = H2Connection(config=us_config)
-                # [AUDIT FIX] Security Settings
+                # Security Settings
                 self.upstream_conn.local_settings.max_header_list_size = MAX_HEADER_LIST_SIZE
                 self.upstream_conn.local_settings.enable_connect_protocol = 1
                 
@@ -262,7 +268,7 @@ class NativeProxyHandler:
             await self.flush(self.downstream_conn, self.client_writer)
 
             # 4. Start Concurrent Loops
-            # [AUDIT FIX] Use asyncio.TaskGroup for Structured Concurrency (Python 3.11+)
+            # Use asyncio.TaskGroup for Structured Concurrency (Python 3.11+)
             # This prevents zombie tasks and ensures exceptions propagate correctly.
             if hasattr(asyncio, 'TaskGroup'):
                 async with asyncio.TaskGroup() as tg:
@@ -308,7 +314,6 @@ class NativeProxyHandler:
                 log.error(f"Unexpected error in proxy handler ({self.upstream_host}): {type(e).__name__}: {e}", exc_info=True)
             await self.terminate(ErrorCodes.INTERNAL_ERROR)
         finally:
-            # (PDF Requirement 4.1: Cleanup in finally block)
             # Use shield to ensure cleanup runs even if cancelled
             await asyncio.shield(self.cleanup())
 
@@ -339,14 +344,12 @@ class NativeProxyHandler:
         """
         # log.debug(f"Connecting upstream to {self.upstream_host}:{self.upstream_port}")
 
-        # (PDF Requirement 5.1: Security Configuration)
         ssl_context = ssl.create_default_context()
         
         # For interception tools, verification is typically disabled.
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
-        # (PDF Requirement 5.2: ALPN)
         try:
             # We strictly require H2 upstream.
             ssl_context.set_alpn_protocols(["h2"])
@@ -354,7 +357,6 @@ class NativeProxyHandler:
             log.warning("ALPN not supported by the Python SSL implementation.")
 
         try:
-            # (PDF Requirement 7.2: Handshake/Connect Timeout)
             self.upstream_reader, self.upstream_writer = await asyncio.wait_for(
                 asyncio.open_connection(self.upstream_host, self.upstream_port, ssl=ssl_context),
                 timeout=UPSTREAM_CONNECT_TIMEOUT
@@ -364,7 +366,6 @@ class NativeProxyHandler:
             transport = self.upstream_writer.get_extra_info('ssl_object')
             negotiated_protocol = transport.selected_alpn_protocol() if transport else None
 
-            # [FIX] Strict ALPN check to avoid H1 fallback causing ProtocolError
             if negotiated_protocol != "h2":
                 raise ConnectionError(f"Upstream server did not negotiate HTTP/2 (ALPN: {negotiated_protocol}). Aborting to prevent protocol mismatch.")
 
@@ -387,7 +388,6 @@ class NativeProxyHandler:
         except (ConnectionResetError, ConnectionAbortedError, asyncio.IncompleteReadError, OSError) as e:
             # Handle common network disconnections gracefully
             if not self.closed.is_set():
-                # [FIX] Improve visibility of connection drops
                 log.warning(f"Connection closed unexpectedly (read loop): {type(e).__name__}: {e}")
                 self.closed.set()
         except Exception as e:
@@ -401,7 +401,6 @@ class NativeProxyHandler:
         Reads data from the network, feeds it to the H2 state machine, and processes events.
         """
         while not self.closed.is_set():
-            # (PDF Requirement 7.2: Idle Timeout)
             try:
                 data = await asyncio.wait_for(reader.read(65536), timeout=IDLE_TIMEOUT)
             except asyncio.TimeoutError:
@@ -414,18 +413,17 @@ class NativeProxyHandler:
                 self.closed.set()
                 break
 
-            # (PDF Requirement 1.2: Ingest and Process)
             try:
                 events = conn.receive_data(data)
             
-            # [FIX] Handle StreamClosedError gracefully (Race condition robustness)
+            # Handle StreamClosedError gracefully (Race condition robustness)
             except StreamClosedError as e:
                 # Typically happens if data arrives for a stream that was just reset/closed locally.
                 # We ignore this frame and continue, rather than killing the connection.
                 log.warning(f"Ignored frame for closed stream {e.stream_id}: {e}")
                 continue
 
-            # [AUDIT FIX] Fail-Fast on ProtocolError as per RFC 9113
+            # Fail-Fast on ProtocolError as per RFC 9113
             except ProtocolError as e:
                 msg = str(e)
                 if "ConnectionState.CLOSED" in msg:
@@ -440,7 +438,6 @@ class NativeProxyHandler:
                 await self.terminate(ErrorCodes.INTERNAL_ERROR)
                 break
 
-            # (PDF Requirement 1.2: Emit and React)
             for event in events:
                 # Process events
                 await event_handler(event)
@@ -451,7 +448,7 @@ class NativeProxyHandler:
     async def _sender_loop(self, queue: asyncio.Queue, conn: H2Connection, writer: asyncio.StreamWriter):
         """
         [Flow Control] Dequeues data, writes to socket, drains, and THEN acknowledges.
-        This "Drain-then-ACK" pattern prevents memory blooms and deadlocks (PDF 4.2).
+        This "Drain-then-ACK" pattern prevents memory blooms and deadlocks.
         """
         dead_streams = set()
 
@@ -518,7 +515,6 @@ class NativeProxyHandler:
         if self.closed.is_set() or writer is None or writer.is_closing():
             return
 
-        # (PDF Requirement 1.2: Flush)
         try:
             data_to_send = conn.data_to_send()
         except Exception as e:
@@ -530,7 +526,6 @@ class NativeProxyHandler:
         if data_to_send:
             try:
                 writer.write(data_to_send)
-                # (PDF Requirement 3.3: Backpressure implementation via drain)
                 await writer.drain()
             except (ConnectionResetError, ConnectionAbortedError, OSError):
                 # Handle common network write errors
@@ -556,7 +551,7 @@ class NativeProxyHandler:
                 if isinstance(v, bytes): v_str = v.decode('utf-8', errors='replace')
                 else: v_str = str(v)
                 
-                # [RFC 9113 8.2.1] Strict Field Validity
+                # Strict Field Validity
                 if '\r' in v_str or '\n' in v_str or '\0' in v_str:
                     log.warning(f"Rejected invalid header chars in {k_str}")
                     continue 
@@ -577,7 +572,6 @@ class NativeProxyHandler:
         """
         Processes events from the client (Downstream) and mediates them to the server (Upstream).
         """
-        # (PDF Requirement 1.3: State Machine Synchronization)
         if isinstance(event, RequestReceived):
             await self.handle_request_received(event)
         elif isinstance(event, DataReceived):
@@ -604,7 +598,6 @@ class NativeProxyHandler:
             await self.handle_window_updated(event)
         elif isinstance(event, ConnectionTerminated):
              await self.handle_connection_terminated(event)
-        # (PDF Requirement 6.3: gRPC Trailers)
         elif isinstance(event, TrailersReceived):
             if self.enable_tunneling:
                  try:
@@ -808,7 +801,7 @@ class NativeProxyHandler:
     async def forward_data_internal(self, destination_conn: H2Connection, writer: asyncio.StreamWriter, stream_id: int, data: bytes, end_stream: bool):
         """
         Forwards data between connections, respecting flow control.
-        [DEADLOCK FIX] Internal function called by sender loops to write data to the socket.
+        Internal function called by sender loops to write data to the socket.
         """
         
         if stream_id not in self.streams:
@@ -852,7 +845,6 @@ class NativeProxyHandler:
                 # Check if this is the final chunk of the entire message
                 is_last_chunk = (offset == data_len) and end_stream
 
-                # (PDF Requirement 3.3: Steps 1 & 2: Receive and Forward)
                 try:
                     destination_conn.send_data(stream_id, chunk, end_stream=is_last_chunk)
                 except ProtocolError as e:
@@ -862,11 +854,9 @@ class NativeProxyHandler:
                      await self.terminate(ErrorCodes.INTERNAL_ERROR)
                      return
 
-                # (PDF Requirement 3.3: Step 3: Wait for drain)
                 await self.flush(destination_conn, writer)
 
             else:
-                # (PDF Requirement 3.1/3.2: Deadlock prevention)
                 # Window is zero. Wait for a WINDOW_UPDATE.
                 context.flow_control_event.clear()
                 
@@ -899,7 +889,6 @@ class NativeProxyHandler:
         stream_id = event.stream_id
 
         if stream_id == 0:
-            # (PDF Requirement 3.4: Connection Window Update)
             # Notify all streams as the global window has opened.
             for context in self.streams.values():
                 context.flow_control_event.set()
@@ -918,7 +907,6 @@ class NativeProxyHandler:
         if stream_id not in self.streams:
             return
 
-        # (PDF Requirement 4.2: Half-Closed State Management)
         context = self.streams[stream_id]
         
         if source_conn == self.downstream_conn:
@@ -982,14 +970,15 @@ class NativeProxyHandler:
     async def handle_connection_terminated(self, event: ConnectionTerminated):
         await self.graceful_shutdown(last_stream_id=event.last_stream_id)
 
-    # (PDF Requirement 7.1: Graceful Shutdown - The GOAWAY Dance)
     async def graceful_shutdown(self, last_stream_id=None):
+        """
+        Performs a graceful shutdown (double GOAWAY).
+        """
         if self.closed.is_set():
             return
 
         # 1. Send initial GOAWAY (Max ID) to signal intent to stop accepting new streams.
         try:
-            # [FIX] Send Max Stream ID (2^31-1) to signal graceful shutdown start (RFC 7540)
             if self.downstream_conn and self.downstream_conn.state_machine.state != 'CLOSED':
                  self.downstream_conn.close_connection(error_code=ErrorCodes.NO_ERROR, last_stream_id=MAX_STREAM_ID)
                  await self.flush(self.downstream_conn, self.client_writer)
@@ -1056,7 +1045,6 @@ class NativeProxyHandler:
         await self.upstream_queue.put(None)
         await self.downstream_queue.put(None)
 
-        # (PDF Requirement 4.1: Mandatory wait_closed() with timeout)
         for w in [self.client_writer, self.upstream_writer]:
             if w and not w.is_closing():
                 try:

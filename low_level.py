@@ -9,9 +9,10 @@ Single Packet Attacks (SPA) and First Sequence Sync (First-Seq) attacks.
 It operates synchronously to ensure precise packet control, which is difficult to
 achieve with high-level asyncio libraries.
 
-[REFACTORING] Enforces RFC 9113 header strictness (no spaces/invalid chars).
-[REFACTORING] Enforces HPACK security limits.
-[REFACTORED] Replaced print statements with logging.
+It handles:
+- RFC 9113 header strictness.
+- HPACK security limits.
+- Precise packet timing for race conditions.
 """
 
 import socket
@@ -185,7 +186,6 @@ class HTTP2RaceEngine:
             raise ConnectionError(f"DNS resolution failed for {self.target_host}: {e}")
 
         # 2. Create Raw Socket and 3. Wrap with SSL
-        # [B01-LL FIX] Use temporary variables and try/finally for robust resource management.
         sock = None
         wrapped_sock = None
         try:
@@ -211,7 +211,6 @@ class HTTP2RaceEngine:
             wrapped_sock = context.wrap_socket(sock, server_hostname=self.target_host)
             
             # Verify H2 negotiation success
-            # This call might raise exceptions if the SSL state is bad (e.g. RuntimeError in older Python).
             negotiated_protocol = wrapped_sock.selected_alpn_protocol()
             if negotiated_protocol != "h2":
                 raise ConnectionError(f"Server did not negotiate HTTP/2 (ALPN returned: {negotiated_protocol}). Cannot proceed.")
@@ -221,19 +220,15 @@ class HTTP2RaceEngine:
             wrapped_sock = None
             sock = None
 
-        # [B01-LL FIX] Catch specific connection-related exceptions and any unexpected exceptions during setup.
         except Exception as e:
             # Map various errors (socket.error, ssl.SSLError, RuntimeError, etc.) to a unified ConnectionError.
             if isinstance(e, ConnectionError):
-                # If it's already a ConnectionError (e.g. ALPN failure), re-raise it directly
                 raise e
             
             error_type = type(e).__name__
             raise ConnectionError(f"Could not connect or establish SSL to {self.target_ip}:{self.target_port}: {error_type}: {e}")
         
         finally:
-            # [B01-LL FIX] Ensure the socket is closed if an error occurred before successful assignment to self.sock.
-            # Clean up wrapped socket first if it exists, as it owns the raw socket.
             if wrapped_sock:
                 try:
                     wrapped_sock.close()
@@ -243,11 +238,10 @@ class HTTP2RaceEngine:
                 try:
                     sock.close()
                 except (OSError, AttributeError):
-                    # Ignore errors during cleanup (e.g., socket already closed or mocked)
                     pass
 
         # 4. Initialize H2 Connection State Machine
-        # [REFACTORED] RFC 9113 Compliance and Security
+        # RFC 9113 Compliance and Security
         config = H2Configuration(
             client_side=True, 
             header_encoding='utf-8', 
@@ -255,7 +249,7 @@ class HTTP2RaceEngine:
             normalize_inbound_headers=True # Enforce RFC standards
         )
         self.conn = H2Connection(config=config)
-        # [REFACTORED] HPACK Limits (64KB)
+        # HPACK Limits (64KB)
         self.conn.local_settings.max_header_list_size = 65536
 
         self.conn.initiate_connection()
@@ -263,11 +257,9 @@ class HTTP2RaceEngine:
         try:
              self.sock.sendall(self.conn.data_to_send())
         except (socket.error, ssl.SSLError, OSError) as e:
-            # Handle errors during the initial send
             self.sock.close()
             self.sock = None
             raise ConnectionError(f"Failed to send H2 preface: {e}")
-        # Handle potential AttributeErrors if dependencies (like h2) are mocked incorrectly
         except AttributeError as e:
             if self.sock:
                  self.sock.close()
@@ -322,10 +314,8 @@ class HTTP2RaceEngine:
                 # Start interception (sets iptables rules and binds NFQueue)
                 packet_controller.start()
             except Exception as e:
-                # This catches PermissionError (if not root) or other initialization failures
                 if self.sock:
                     self.sock.close()
-                # We re-raise the exception to be handled by the caller (run_scan)
                 raise e
 
         # Start the background receiver thread to handle responses
@@ -517,7 +507,7 @@ class HTTP2RaceEngine:
         for k, v in self.request.headers.items():
             k_lower = k.lower()
             header_keys.add(k_lower)
-            # [CRITICAL FIX] Strictly filter Hop-by-Hop headers preventing ProtocolErrors
+            # Strictly filter Hop-by-Hop headers preventing ProtocolErrors
             if k_lower in HOP_BY_HOP_HEADERS:
                 continue
             headers.append((k_lower, v))
@@ -536,7 +526,6 @@ class HTTP2RaceEngine:
         
         return headers
 
-    # [N2/E3 FIX] Consolidated and robust receive loop
     def _receive_loop(self):
         """
         Background thread to read data from the socket and process H2 events.
@@ -545,7 +534,6 @@ class HTTP2RaceEngine:
         machine, and processes the resulting events. It exits when all streams
         are finished or a connection error occurs.
         """
-        # [B01-LL FIX] Add check if socket is None before entering the loop (Defense in Depth)
         if self.sock is None:
             self._handle_connection_closed("Receive loop started with closed socket.")
             return
@@ -553,14 +541,12 @@ class HTTP2RaceEngine:
         while not self.all_streams_finished.is_set():
             try:
                 # Use select for non-blocking read with a short timeout
-                # [B01-LL FIX] Ensure self.sock is still valid before calling select
                 if self.sock is None:
                      break
 
                 ready, _, _ = select.select([self.sock], [], [], 0.1)
                 
                 if ready:
-                    # [B01-LL FIX] Ensure self.sock is still valid before calling recv
                     if self.sock is None:
                         break
                     data = self.sock.recv(65536)
@@ -579,24 +565,19 @@ class HTTP2RaceEngine:
                         self._handle_connection_closed(f"HTTP/2 Protocol Error: {e}")
                         break
                         
-                # [N2 FIX] Move sendall outside 'if ready' to prevent flow control deadlocks.
-                # [E3 FIX] Keep inside the main try block for error handling.
                 # Send any data generated (e.g., ACKs, WINDOW_UPDATEs)
                 data_to_send = self.conn.data_to_send()
                 if data_to_send:
-                    # [B01-LL FIX] Ensure self.sock is still valid before calling sendall
                     if self.sock is None:
                         break
                     self.sock.sendall(data_to_send)
 
-            # [E2 FIX] Broaden exception handling to include OSError
             except (ssl.SSLError, socket.error, OSError) as e:
                 # Handle socket level errors (including ConnectionResetError which is an OSError)
                 # Check if the error occurred while the attack was still active before logging closure
                 if not self.all_streams_finished.is_set():
                    self._handle_connection_closed(f"Connection error: {e}")
                 break
-            # [B01-LL FIX] Catch potential issues during select or if self.sock becomes invalid unexpectedly
             except Exception as e:
                 if not self.all_streams_finished.is_set():
                     self._handle_connection_closed(f"Unexpected receive loop error: {e}")
@@ -627,7 +608,7 @@ class HTTP2RaceEngine:
                 if isinstance(event, ResponseReceived):
                     # Parse headers (H2 headers are typically bytes tuples)
                     for header, value in event.headers:
-                        # [FIX] Robust decoding: H2Configuration(header_encoding=None) returns bytes keys/values.
+                        # Robust decoding
                         if isinstance(header, bytes):
                             header_str = header.decode('utf-8', errors='replace')
                         else:
@@ -657,8 +638,6 @@ class HTTP2RaceEngine:
                     stream_data["error"] = f"Stream reset by server (Error code: {event.error_code})"
 
             # Check if all initiated streams have finished.
-            # B05 FIX: Ensure we check against the expected concurrency count.
-            # This prevents premature termination if _process_events is called before all streams are initialized in _prepare_requests.
             finished_count = sum(1 for s in self.streams.values() if s.get("finished"))
 
             if finished_count >= self.concurrency:
@@ -673,10 +652,8 @@ class HTTP2RaceEngine:
         Args:
             reason (str): The error message explaining the closure.
         """
-        # Defense in Depth: Improve visibility of unexpected connection closures.
         logger.warning(f"Low-Level Engine: Connection closed unexpectedly. Reason: {reason}")
         
-        # [B01-LL FIX] Ensure socket is closed and nulled out to prevent further use in _receive_loop
         if self.sock:
             try:
                 self.sock.close()
@@ -730,7 +707,6 @@ class HTTP2RaceEngine:
 
                     if body:
                         body_hash = hashlib.sha256(body).hexdigest()
-                        # [P6 FIX] Remove unnecessary try/except block.
                         # Decode using 'ignore' strategy for robustness against invalid sequences.
                         body_snippet = body[:100].decode('utf-8', errors='ignore').replace('\n', ' ').replace('\r', '')
                     
