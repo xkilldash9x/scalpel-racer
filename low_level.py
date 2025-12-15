@@ -35,8 +35,8 @@ except ImportError:
             self.error = error
 
     class CapturedRequest:
-        def __init__(self, method, url, headers, body):
-            self.id = 0
+        def __init__(self, id, method, url, headers, body):
+            self.id = id
             self.method = method
             self.url = url
             self.headers = headers
@@ -81,19 +81,53 @@ class HTTP2RaceEngine:
         self._parse_target()
 
     def _parse_target(self):
+        """
+        Parses the target host and port from the URL.
+        Falls back to the 'Host' or ':authority' header if the URL is relative.
+        """
         parsed = urlparse(self.request.url)
         self.target_host = parsed.hostname
-        # Default to 443 for https, 80 for http if port is not specified
-        self.target_port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+        self.target_port = parsed.port
+
+        # Fallback: If URL is relative (no hostname), try to find Host in headers
+        if not self.target_host:
+            host_header_val = None
+            headers_iter = self.request.headers
+            if isinstance(headers_iter, dict):
+                headers_iter = headers_iter.items()
+            
+            for k, v in headers_iter:
+                if k.lower() in ('host', ':authority'):
+                    host_header_val = v
+                    break
+            
+            if host_header_val:
+                # Use urlparse with dummy scheme to safely parse host:port and ipv6
+                # Prepending // forces urlparse to treat it as netloc
+                try:
+                    p2 = urlparse(f"//{host_header_val}")
+                    self.target_host = p2.hostname
+                    self.target_port = p2.port
+                except ValueError:
+                    pass
+        
+        # Default Port Logic
+        if not self.target_port:
+            self.target_port = 80 if parsed.scheme == 'http' else 443
 
     def _construct_h2_headers(self, content_length: int) -> List[Tuple[str, str]]:
         parsed = urlparse(self.request.url)
+        
+        # Ensure path starts with / (fixes relative URL issues)
         path = parsed.path or '/'
+        if not path.startswith('/'):
+            path = '/' + path
+            
         if parsed.query:
             path += '?' + parsed.query
         
         authority = self.target_host
-        if self.target_port not in (80, 443):
+        if self.target_port not in (80, 443) and self.target_port is not None:
             authority += f":{self.target_port}"
         
         headers = [
@@ -133,6 +167,10 @@ class HTTP2RaceEngine:
         ctx.verify_mode = ssl.CERT_NONE # Intentional: Tool is used against various targets
         ctx.set_alpn_protocols(["h2"])
         
+        # Safety Check: Prevent crash if host could not be determined
+        if not self.target_host:
+            raise ValueError(f"Target host could not be determined from URL ({self.request.url}) or Headers")
+
         try:
             self.target_ip = socket.gethostbyname(self.target_host)
         except socket.gaierror as e:

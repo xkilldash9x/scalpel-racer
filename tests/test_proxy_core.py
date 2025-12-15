@@ -18,6 +18,7 @@ from proxy_core import (
     H2_FORBIDDEN_HEADERS,
     StreamContext
 )
+
 # We define local dummy classes for patching to ensure isinstance works correctly
 class MockRequestReceived: pass
 class MockDataReceived: pass
@@ -161,8 +162,16 @@ class TestNativeProxyHandler:
         writer = MagicMock()
         writer.drain = AsyncMock()
         cb = MagicMock()
-        handler = NativeProxyHandler(reader, writer, "h2.target", cb, None, None, enable_tunneling=False)
-        return handler, reader, writer, cb
+        
+        # [FIX] Explicitly patch proxy_core.H2Connection inside fixture to ensure
+        # the handler receives a Mock object instead of the real library class.
+        with patch("proxy_core.H2Connection") as MockH2:
+            # We must configure the Mock to behave reasonably
+            mock_conn_instance = MockH2.return_value
+            mock_conn_instance.local_settings = MagicMock()
+            
+            handler = NativeProxyHandler(reader, writer, "h2.target", cb, None, None, enable_tunneling=False)
+            return handler, reader, writer, cb
 
     @pytest.mark.asyncio
     async def test_h2_request_capture(self, mock_h2_setup):
@@ -187,10 +196,16 @@ class TestNativeProxyHandler:
             data_evt.stream_id = 1
             data_evt.data = b"H2Body"
             data_evt.flow_controlled_length = 6
-            data_evt.stream_ended = True
+            # FIX: The h2 library sends a distinct StreamEnded event. 
+            # We must simulate this behavior accurately.
+            data_evt.stream_ended = False
             
             await handler.handle_downstream_event(data_evt)
-            handler.finalize_capture(handler.streams[1])
+
+            # After data, the stream end event follows
+            end_evt = MockStreamEnded()
+            end_evt.stream_id = 1
+            await handler.handle_downstream_event(end_evt)
         
         capture_calls = [call for call in cb.call_args_list if call[0][0] == "CAPTURE"]
         assert len(capture_calls) == 1
@@ -367,8 +382,11 @@ class TestH2ResourceCleanup:
         writer = MagicMock()
         writer.drain = AsyncMock()
         cb = MagicMock()
-        handler = NativeProxyHandler(reader, writer, "h2.target", cb, None, None, enable_tunneling=False)
-        return handler
+        
+        with patch("proxy_core.H2Connection") as MockH2:
+            MockH2.return_value.local_settings = MagicMock()
+            handler = NativeProxyHandler(reader, writer, "h2.target", cb, None, None, enable_tunneling=False)
+            return handler
 
     # [FIX] Patch ALL events in this scope to prevent type confusion
     @pytest.fixture(autouse=True)
@@ -437,7 +455,7 @@ class TestH2ResourceCleanup:
         # Use our own Exception class so we can catch it reliably
         with patch("proxy_core.ErrorCodes", MagicMock()):
             # Mock the conn so reset_stream doesn't fail
-            handler.downstream_conn = MagicMock()
+            # handler.downstream_conn is already a Mock from fixture
             handler.terminate = AsyncMock()
 
             try:
