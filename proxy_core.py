@@ -248,7 +248,7 @@ class Http11ProxyHandler(BaseProxyHandler):
                      self._buffer_offset = 0
 
                 try:
-                    data = await asyncio.wait_for(self.reader.read(4096), timeout=IDLE_TIMEOUT)
+                    data = await asyncio.wait_for(self.reader.read(65536), timeout=IDLE_TIMEOUT)
                 except asyncio.TimeoutError:
                     raise ProxyError("Read Timeout (Idle)")
                 
@@ -515,7 +515,7 @@ class Http11ProxyHandler(BaseProxyHandler):
     async def _read_bytes(self, n: int) -> bytes:
         while (len(self.buffer) - self._buffer_offset) < n:
             try:
-                data = await asyncio.wait_for(self.reader.read(4096), timeout=IDLE_TIMEOUT)
+                data = await asyncio.wait_for(self.reader.read(65536), timeout=IDLE_TIMEOUT)
             except asyncio.TimeoutError:
                 raise ProxyError("Read Timeout (Idle) in Body")
                 
@@ -999,41 +999,47 @@ class NativeProxyHandler(BaseProxyHandler):
              await self.flush(self.upstream_conn, self.upstream_writer, self.us_h2_lock, self.us_socket_lock)
 
     def _prepare_forwarded_headers(self, headers, is_upstream=True):
-        decoded_headers = []
+        out = []
+        pseudo_headers = {}
         method = None
         protocol = None
         host_header_value = None
+        seen_regular = False
         
+        # Single Pass Optimization
         for k, v in headers:
             k_s = k.decode('utf-8') if isinstance(k, bytes) else k
             v_s = v.decode('utf-8') if isinstance(v, bytes) else v
-            if '\n' in v_s or '\r' in v_s: raise ValueError(f"Illegal header value: {k_s}")
-            if k_s == ':method': method = v_s
-            elif k_s == ':protocol': protocol = v_s
-            elif k_s.lower() == 'host': host_header_value = v_s
-            decoded_headers.append((k_s, v_s))
 
-        out = []
-        seen_regular = False
-        is_connect = (method == 'CONNECT')
-        is_extended_connect = is_connect and (protocol is not None)
-        pseudo_headers = {}
+            if '\n' in v_s or '\r' in v_s:
+                raise ValueError(f"Illegal header value: {k_s}")
 
-        for k_s, v_s in decoded_headers:
-            k_lower = k_s.lower()
             if k_s.startswith(':'):
-                if seen_regular: raise ValueError("Pseudo-header found after regular header")
+                if seen_regular:
+                    raise ValueError("Pseudo-header found after regular header")
                 pseudo_headers[k_s] = v_s
-                continue
+                if k_s == ':method': method = v_s
+                elif k_s == ':protocol': protocol = v_s
             else:
                 seen_regular = True
+                k_lower = k_s.lower()
 
-            if k_lower in H2_FORBIDDEN_HEADERS: continue
-            if k_lower == 'te':
-                if v_s.lower() == 'trailers': out.append((k_s, v_s))
-                continue
-            if k_lower == 'host': continue
-            out.append((k_s, v_s))
+                if k_lower == 'host':
+                    host_header_value = v_s
+                    continue
+
+                if k_lower in H2_FORBIDDEN_HEADERS:
+                    continue
+
+                if k_lower == 'te':
+                    if v_s.lower() == 'trailers':
+                        out.append((k_s, v_s))
+                    continue
+
+                out.append((k_s, v_s))
+
+        is_connect = (method == 'CONNECT')
+        is_extended_connect = is_connect and (protocol is not None)
         
         final_headers = []
         if is_upstream:
