@@ -1,6 +1,7 @@
 # verify_certs.py
 """
 Script to generate, verify, and install the Scalpel Racer CA certificate.
+[Hardened] Now uses ECC NIST P-256 (SECP256R1) for compliance and security.
 
 Workflow:
 1. Checks if `scalpel_ca.key` and `scalpel_ca.pem` exist.
@@ -21,7 +22,7 @@ import subprocess
 import datetime
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 def run_cmd(cmd, description):
@@ -37,16 +38,27 @@ def run_cmd(cmd, description):
 
 def generate_ca():
     """Generates a new CA private key and self-signed certificate using local system info."""
-    print("\n[*] CA files missing. Generating new Scalpel Racer CA...")
+    print("\n[*] CA files missing. Generating new Scalpel Racer CA (ECC NIST P-256)...")
     print("    -> Detecting local machine identity...")
     
     # 1. Detect Local Info for OpSec (Avoid hardcoding location)
     hostname = socket.gethostname()
     
-    # Attempt to pull Country Code from system locale (e.g. 'en_US' -> 'US')
+    # Attempt to pull Country Code from system locale (Python 3.13 compliant)
     try:
-        sys_locale = locale.getdefaultlocale()
-        country_code = sys_locale[0].split('_')[-1] if sys_locale and sys_locale[0] else "US"
+        # Replaced deprecated getdefaultlocale() with getlocale()
+        # On Linux, getlocale() usually requires setlocale to be called first to be accurate,
+        # but for a simple country code heuristic, checking the environment or basic getlocale is sufficient.
+        sys_locale = locale.getlocale()
+        
+        # Fallback if getlocale returns (None, None)
+        if not sys_locale or not sys_locale[0]:
+            lang = os.environ.get('LANG', 'en_US')
+        else:
+            lang = sys_locale[0]
+
+        country_code = lang.split('_')[-1].split('.')[0] if '_' in lang else "US"
+        
         if len(country_code) != 2:
             country_code = "US"
     except Exception:
@@ -55,20 +67,20 @@ def generate_ca():
     print(f"    -> Using Hostname: {hostname}")
     print(f"    -> Using Country:  {country_code}")
 
-    # 2. Generate Private Key
-    private_key = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=2048,
-    )
+    # 2. Generate Private Key (ECC Upgrade)
+    # Using SECP256R1 (NIST P-256) provides 128-bit security, equivalent to RSA-3072
+    # but with much smaller keys and faster handshake performance.
+    private_key = ec.generate_private_key(ec.SECP256R1())
 
     # 3. Generate Self-Signed Certificate
     subject = issuer = x509.Name([
         x509.NameAttribute(NameOID.COUNTRY_NAME, country_code),
         x509.NameAttribute(NameOID.ORGANIZATION_NAME, f"Scalpel Racer ({hostname})"),
         x509.NameAttribute(NameOID.COMMON_NAME, f"Scalpel Racer CA - {hostname}"),
-        x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "Automated Testing"),
+        x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "Automated Security Testing"),
     ])
     
+    # Secure defaults: SHA256 signature
     cert = x509.CertificateBuilder().subject_name(
         subject
     ).issuer_name(
@@ -165,21 +177,21 @@ def check_pair():
         with open("scalpel_ca.pem", "rb") as f: # Open certificate file
             cert = x509.load_pem_x509_certificate(f.read()) # Load certificate
     except Exception as e: 
-        print(f"[!] FAILED to load Cert: {e}") # Handle cert load error
-        return # Handle key load error
+        print(f"[!] FAILED to load Cert: {e}") 
+        return 
 
     # Extract public numbers
-    pub_key_from_cert = cert.public_key() # Extract public key from cert
-    pub_numbers_cert = pub_key_from_cert.public_numbers() # Extract public numbers from cert
-    pub_numbers_key = private_key.public_key().public_numbers() # Extract public numbers from key
+    pub_key_from_cert = cert.public_key() 
+    pub_numbers_cert = pub_key_from_cert.public_numbers() 
+    pub_numbers_key = private_key.public_key().public_numbers() 
 
-    if pub_numbers_cert == pub_numbers_key: # Compare public numbers
-        print("\n[+] MATCH: These files are a valid pair.") # Valid pair
-        install_certs() # Offer installation if pair is valid
+    if pub_numbers_cert == pub_numbers_key: 
+        print("\n[+] MATCH: These files are a valid pair.") 
+        install_certs() 
     else: 
-        print("\n[!] MISMATCH: These files are NOT a pair.") # Mismatched pairs
-        print("    SOLUTION: Delete BOTH files and run this script again to regenerate them.") # Solution for mismatched pairs
+        print("\n[!] MISMATCH: These files are NOT a pair.") 
+        print("    SOLUTION: Delete BOTH files and run this script again to regenerate them.") 
 
-if __name__ == "__main__": # Entry point
-    check_pair() # Main function call
-    sys.exit(0) # Exit cleanly
+if __name__ == "__main__": 
+    check_pair() 
+    sys.exit(0)

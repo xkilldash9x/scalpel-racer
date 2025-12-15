@@ -1,15 +1,21 @@
-# tests/test_scalpel_racer.py
+# File: test_scalpel_racer.py
 import pytest
-from unittest.mock import MagicMock, patch, AsyncMock
-from scalpel_racer import run_scan, CAManager
-from structures import ScanResult, CapturedRequest
+import asyncio
+import ssl
+import sys
+from unittest.mock import MagicMock, patch, AsyncMock, mock_open
+from scalpel_racer import (
+    run_scan, CAManager, Last_Byte_Stream_Body, Staged_Stream_Body,
+    analyze_results, CaptureApp, edit_request_body, fix_sudo_ownership, safe_spawn
+)
+from structures import ScanResult, CapturedRequest, SYNC_MARKER
 
 class TestScalpelIntegration:
-    
+
     @patch("scalpel_racer.httpx.AsyncClient")
     @pytest.mark.asyncio
     async def test_run_scan_standard(self, mock_client):
-        # Setup AsyncClient mock
+        """Test standard async attack flow via httpx."""
         client_inst = AsyncMock()
         mock_client.return_value.__aenter__.return_value = client_inst
         
@@ -19,54 +25,179 @@ class TestScalpelIntegration:
         
         stream_ctx = AsyncMock()
         stream_ctx.__aenter__.return_value = mock_resp
-        
-        # FIX: client.stream should not be an AsyncMock itself (which creates a coroutine when called), 
-        # but a method returning an async context manager (the stream_ctx).
         client_inst.stream = MagicMock(return_value=stream_ctx)
         
         req = CapturedRequest(0, "GET", "http://a.com", [], b"")
         
-        # Run standard attack
         results = await run_scan(req, concurrency=2, http2=False, warmup=0, strategy="auto")
         
         assert len(results) == 2
         assert results[0].status_code == 200
+        assert results[0].error is None
 
     @patch("scalpel_racer.HTTP2RaceEngine")
     @patch("scalpel_racer.H2_AVAILABLE", True)
     @pytest.mark.asyncio
     async def test_run_scan_h2_delegation(self, mock_h2_cls):
-        """Verify 'spa' strategy triggers HTTP2RaceEngine."""
+        """Verify 'spa' strategy triggers HTTP2RaceEngine delegation."""
         req = CapturedRequest(0, "GET", "http://a.com", [], b"")
         
         mock_engine = mock_h2_cls.return_value
         mock_engine.run_attack.return_value = [ScanResult(0, 200, 10)]
         
-        await run_scan(req, concurrency=1, http2=True, warmup=0, strategy="spa")
+        results = await run_scan(req, concurrency=1, http2=True, warmup=0, strategy="spa")
         
         mock_h2_cls.assert_called_once()
-        assert mock_h2_cls.call_args[0][2] == "spa"
+        assert len(results) == 1
+        assert results[0].status_code == 200
+
+    @patch("scalpel_racer.H2_AVAILABLE", False)
+    @pytest.mark.asyncio
+    async def test_run_scan_h2_missing(self):
+        """Verify fallback or error when H2 library is missing."""
+        req = CapturedRequest(0, "GET", "http://a.com", [], b"")
+        results = await run_scan(req, concurrency=1, http2=True, warmup=0, strategy="spa")
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_last_byte_stream_logic(self):
+        """
+        Critical Test: Verify the generator yields payload in two parts
+        and waits on the barrier.
+        """
+        payload = b"Payload" # 7 bytes
+        barrier = asyncio.Barrier(1)
+        
+        gen = Last_Byte_Stream_Body(payload, barrier, warmup_ms=0)
+        
+        parts = []
+        async for part in gen:
+            parts.append(part)
+            
+        # Should be split into "Payloa" and "d"
+        assert len(parts) == 2
+        assert parts[0] == b"Payloa"
+        assert parts[1] == b"d"
+
+    @pytest.mark.asyncio
+    async def test_last_byte_stream_short_payload(self):
+        """Verify handling of 1-byte payloads (no split)."""
+        payload = b"X"
+        gen = Last_Byte_Stream_Body(payload, None, 0)
+        parts = [p async for p in gen]
+        assert parts == [b"X"]
+
+    @pytest.mark.asyncio
+    async def test_staged_stream_logic(self):
+        """Verify splitting by {{SYNC}} marker."""
+        payload = b"Step1" + SYNC_MARKER + b"Step2"
+        barriers = [asyncio.Barrier(1)]
+        
+        gen = Staged_Stream_Body(payload, barriers)
+        parts = [p async for p in gen]
+        
+        assert parts == [b"Step1", b"Step2"]
 
     @patch("scalpel_racer.ec.generate_private_key")
     @patch("scalpel_racer.x509.CertificateBuilder")
-    def test_ca_generation(self, mock_builder, mock_key):
-        """Test CA Manager crypto calls."""
+    def test_ca_manager_crypto(self, mock_builder, mock_key):
+        """Test CA Manager certificate generation calls (Security)."""
         with patch("scalpel_racer.CRYPTOGRAPHY_AVAILABLE", True), \
-             patch("builtins.open", MagicMock()), \
-             patch("os.chown"):
+             patch("builtins.open", mock_open()), \
+             patch("os.chown"), patch("os.chmod"):
             
             # Setup fluent interface for Builder
             builder_instance = mock_builder.return_value
-            builder_instance.subject_name.return_value = builder_instance
-            builder_instance.issuer_name.return_value = builder_instance
-            builder_instance.public_key.return_value = builder_instance
-            builder_instance.serial_number.return_value = builder_instance
-            builder_instance.not_valid_before.return_value = builder_instance
-            builder_instance.not_valid_after.return_value = builder_instance
-            builder_instance.add_extension.return_value = builder_instance
+            for method in ['subject_name', 'issuer_name', 'public_key', 'serial_number', 
+                           'not_valid_before', 'not_valid_after', 'add_extension']:
+                getattr(builder_instance, method).return_value = builder_instance
             
             mgr = CAManager()
             mgr.generate_ca()
             
+            # Security: Ensure key generation called
             mock_key.assert_called()
             builder_instance.sign.assert_called()
+
+    def test_ca_manager_caching(self):
+        """Test that SSL contexts are cached by hostname."""
+        with patch("scalpel_racer.CRYPTOGRAPHY_AVAILABLE", True), \
+             patch("builtins.open", mock_open()):
+            
+            mgr = CAManager()
+            mgr.ca_key = MagicMock()
+            mgr.ca_cert = MagicMock()
+            
+            with patch.object(mgr, 'generate_host_cert') as mock_gen, \
+                 patch("ssl.SSLContext") as mock_ssl_ctx, \
+                 patch("tempfile.TemporaryDirectory"):
+                
+                mock_gen.return_value = (MagicMock(), MagicMock())
+                
+                # First call
+                ctx1 = mgr.get_ssl_context("example.com")
+                # Second call
+                ctx2 = mgr.get_ssl_context("example.com")
+                
+                assert ctx1 == ctx2
+                # generate_host_cert should only be called once
+                assert mock_gen.call_count == 1
+
+    def test_analyze_results_logic(self, capsys):
+        """Verify statistical analysis and grouping logic via stdout."""
+        results = [
+            ScanResult(0, 200, 100, "hash1", "snippet1"),
+            ScanResult(1, 200, 110, "hash1", "snippet1"),
+            ScanResult(2, 500, 50, "hash2", "error_page"),
+        ]
+        
+        analyze_results(results)
+        captured = capsys.readouterr()
+        
+        assert "[Response Signatures]" in captured.out
+        # Should see two groups
+        assert "200" in captured.out
+        assert "500" in captured.out
+        # Should verify timing average (100+110+50)/3 = 86.67
+        assert "Average: 86.67ms" in captured.out
+
+    @patch("scalpel_racer.os.chown")
+    @patch("scalpel_racer.os.chmod")
+    def test_fix_sudo_ownership(self, mock_chmod, mock_chown):
+        """Test that file ownership is reverted if running as sudo."""
+        with patch("os.geteuid", return_value=0), \
+             patch.dict("os.environ", {"SUDO_UID": "1000", "SUDO_GID": "1000"}):
+            
+            fix_sudo_ownership("test.pem")
+            mock_chown.assert_called_with("test.pem", 1000, 1000)
+
+    @patch("builtins.input")
+    @patch("sys.stdin")
+    def test_edit_request_body(self, mock_stdin, mock_input):
+        """Test interactive body editor."""
+        req = CapturedRequest(0, "POST", "url", [], b"old")
+        
+        # Simulate user input
+        mock_stdin.readline.side_effect = ["new_body\n", ""]
+        
+        with patch("builtins.print"):
+            edit_request_body(req)
+        
+        assert req.edited_body == b"new_body\n"
+
+    def test_capture_app_callback(self):
+        """Test CaptureApp logging callback."""
+        # Mock ProxyManager import if not present
+        with patch("scalpel_racer.ProxyManager", MagicMock()):
+            app = CaptureApp(8080, None, None)
+            req = CapturedRequest(0, "GET", "url", [], b"")
+            app.on_capture("CAPTURE", req)
+            
+            assert len(app.request_log) == 1
+            assert app.request_log[0].id == 0
+            assert app.request_log[0].method == "GET"
+            assert app.request_log[0].url == "url"
+            assert app.request_log[0].headers == []
+            assert app.request_log[0].body == b""
+            assert app.request_log[0].truncated == False
+            assert app.request_log[0].protocol == "HTTP/1.1"

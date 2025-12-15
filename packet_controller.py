@@ -2,6 +2,7 @@
 """
 Implements the PacketController for the 'First Sequence Sync' strategy.
 Uses Linux NetfilterQueue to hold the first packet of a burst.
+Refined: High-performance raw packet parsing (no Scapy) and improved accuracy (no PSH flag reliance).
 """
 
 import os
@@ -9,9 +10,9 @@ import sys
 import threading
 import time
 import subprocess
-import socket
 import logging
-from typing import Optional, Tuple, List
+import struct
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +21,6 @@ NFQUEUE_AVAILABLE = False
 if sys.platform.startswith("linux"):
     try:
         from netfilterqueue import NetfilterQueue
-        from scapy.all import IP, TCP
         NFQUEUE_AVAILABLE = True
     except ImportError:
         pass
@@ -35,7 +35,7 @@ class PacketController:
     """
     def __init__(self, target_ip: str, target_port: int, source_port: int):
         # Validate dependencies unless we are in a test environment
-        if not NFQUEUE_AVAILABLE and 'unittest' not in sys.modules:
+        if not NFQUEUE_AVAILABLE and 'unittest' not in sys.modules and 'pytest' not in sys.modules:
              raise ImportError("NetfilterQueue is not available or supported on this system.")
 
         self.target_ip = target_ip
@@ -66,13 +66,15 @@ class PacketController:
         logger.info(f"PacketController: Starting interception for {self.target_ip}:{self.target_port}")
         
         # 1. Insert iptables rule
-        self._manage_iptables(action='A')
+        # Security: Use 'I' (Insert) to ensure this rule is at the top of the chain
+        self._manage_iptables(action='I')
         
         # 2. Bind NetfilterQueue
         self.nfqueue = NetfilterQueue()
         try:
             self.nfqueue.bind(self.queue_num, self._queue_callback)
         except OSError as e:
+            # Cleanup if bind fails to prevent stuck rules
             self._manage_iptables(action='D')
             raise RuntimeError(f"Failed to bind NFQueue: {e}")
 
@@ -88,12 +90,23 @@ class PacketController:
     def stop(self):
         """
         Stops the listener and cleans up.
+        Robustness: Explicitly releases held packets (fail-open) to avoid blackholing traffic.
         """
         if not self.active:
             return
             
         self.active = False
         
+        # Release any held packet
+        with self.lock:
+            if self.first_packet_info:
+                try:
+                    _, pkt = self.first_packet_info
+                    pkt.accept()
+                except Exception:
+                    pass
+                self.first_packet_info = None
+
         # Unbind queue
         if self.nfqueue:
             try:
@@ -117,7 +130,9 @@ class PacketController:
     def _manage_iptables(self, action: str):
         """
         Idempotent wrapper for iptables management.
-        Targets TCP packets with the PSH flag set.
+        Refined: Removes strict PSH flag filtering to ensure we catch all data segments.
+        Args:
+            action: 'I' for Insert, 'D' for Delete.
         """
         base_rule = [
             'iptables', 'OUTPUT',
@@ -125,7 +140,8 @@ class PacketController:
             '--dport', str(self.target_port),
             '--sport', str(self.source_port),
             '-d', self.target_ip,
-            '-m', 'tcp', '--tcp-flags', 'ALL', 'PSH',
+            # RISK FIX: Removed '-m tcp --tcp-flags ALL PSH'
+            # This ensures we catch the first packet even if TSO/GSO delayed the PSH flag.
             '-j', 'NFQUEUE', '--queue-num', str(self.queue_num)
         ]
         
@@ -139,10 +155,10 @@ class PacketController:
         except subprocess.CalledProcessError:
             rule_exists = False
         except FileNotFoundError:
-            # Handle systems without iptables gracefully-ish
+            # Handle systems without iptables gracefully
             return 
 
-        if action == 'A' and rule_exists:
+        if (action == 'I' or action == 'A') and rule_exists:
             return
         if action == 'D' and not rule_exists:
             return
@@ -169,29 +185,64 @@ class PacketController:
     def _queue_callback(self, pkt):
         """
         Process intercepted packets.
+        LATENCY FIX: Uses direct struct unpacking instead of Scapy.
         """
         if not self.active:
             pkt.accept()
             return
             
         try:
-            # Parse Packet
-            ip_packet = IP(pkt.get_payload())
+            # Optimization: Parse raw bytes directly
+            raw_data = pkt.get_payload()
             
-            # Filter non-TCP
-            if TCP not in ip_packet:
-                pkt.accept()
-                return
-                
-            tcp_segment = ip_packet[TCP]
-            seq = tcp_segment.seq
-            payload_len = len(tcp_segment.payload)
-
-            # Filter empty ACKs/SYN/FINs
-            if payload_len == 0:
+            # --- 1. Parse IPv4 Header ---
+            if len(raw_data) < 20:
                 pkt.accept()
                 return
 
+            # Byte 0: Version (4 bits) + IHL (4 bits)
+            ver_ihl = raw_data[0]
+            version = ver_ihl >> 4
+            
+            if version != 4:
+                # We only handle IPv4 for this specific attack logic
+                pkt.accept()
+                return
+
+            # IHL is in 32-bit words, so * 4 for bytes
+            ihl = (ver_ihl & 0x0F) * 4
+            
+            # Protocol is at Byte 9
+            protocol = raw_data[9]
+            if protocol != 6: # 6 = TCP
+                pkt.accept()
+                return
+
+            # Total Length is at Bytes 2-3
+            total_len = struct.unpack("!H", raw_data[2:4])[0]
+
+            # --- 2. Parse TCP Header ---
+            tcp_header_start = ihl
+            if len(raw_data) < tcp_header_start + 20:
+                pkt.accept()
+                return
+
+            # Sequence Number: Bytes 4-7 relative to TCP start
+            seq = struct.unpack("!I", raw_data[tcp_header_start + 4 : tcp_header_start + 8])[0]
+            
+            # Data Offset: Byte 12, high 4 bits (in 32-bit words)
+            data_offset_byte = raw_data[tcp_header_start + 12]
+            tcp_header_len = (data_offset_byte >> 4) * 4
+            
+            # --- 3. Calculate Payload Length ---
+            payload_len = total_len - ihl - tcp_header_len
+
+            # Filter empty ACKs/SYN/FINs (No Data)
+            if payload_len <= 0:
+                pkt.accept()
+                return
+
+            # --- 4. Packet Bunching Logic ---
             with self.lock:
                 if self.first_packet_info is None:
                     # Case 1: First Packet -> Hold it
@@ -246,3 +297,5 @@ class PacketController:
                 self.first_packet_info = None
                 self.first_packet_held.clear()
                 self.subsequent_packets_released.clear()
+                self.expected_next_seq = None
+                

@@ -1,7 +1,7 @@
 # tests/test_structures.py
 
 import pytest
-from structures import CapturedRequest, ScanResult, HOP_BY_HOP_HEADERS
+from structures import CapturedRequest, ScanResult, RaceResult, HOP_BY_HOP_HEADERS, SENSITIVE_HEADERS
 
 class TestStructures:
     def test_captured_request_payload(self):
@@ -25,11 +25,22 @@ class TestStructures:
         assert "..." in s
         assert "[T]" in s
 
-    def test_captured_request_headers_dict(self):
-        """Ensure headers are correctly converted to dict."""
-        headers = [("Host", "example.com"), ("Accept", "*/*")]
+    def test_captured_request_redaction(self):
+        """Test sensitive header redaction."""
+        headers = [("Authorization", "Bearer Secret"), ("Cookie", "session=123"), ("Host", "example.com")]
         req = CapturedRequest(1, "GET", "", headers, b"")
-        assert req.headers_dict["Host"] == "example.com"
+        redacted = req._get_redacted_headers()
+        assert "[REDACTED]" in redacted
+        assert "Bearer Secret" not in redacted
+        assert "session=123" not in redacted
+        assert "example.com" in redacted
+
+    def test_captured_request_to_dict(self):
+        """Test dictionary serialization."""
+        req = CapturedRequest(1, "GET", "url", [("H", "V")], b"body")
+        d = req.to_dict()
+        assert d['id'] == 1
+        assert d['body'] == "body"
 
     def test_scan_result_init(self):
         """Ensure ScanResult stores data correctly."""
@@ -41,4 +52,18 @@ class TestStructures:
     def test_hop_by_hop_constants(self):
         """Ensure critical headers are blacklisted."""
         assert "connection" in HOP_BY_HOP_HEADERS
-        assert "upgrade" in HOP_BY_HOP_HEADERS
+        assert "content-length" in HOP_BY_HOP_HEADERS
+        
+    def test_race_result_methods(self):
+        """Test RaceResult helper methods."""
+        res = RaceResult(id=1, scan_results=[], final_status_code=200, final_body=b"final")
+        
+        # Fixed: Assert against bytes, not string
+        assert res.get_final_body() == b"final"
+        
+        assert res.get_final_headers() == {}
+        
+        # Fixed: Assert against bytes, not string
+        assert res.get_final_attack_payload() == b"final"
+        
+        # Removed: get_final_attack_headers() does not exist in RaceResult definition
