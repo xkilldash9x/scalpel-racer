@@ -546,8 +546,9 @@ def analyze_results(results: List[ScanResult]):
                     if max_count > 0:
                         for i in range(len(counts)):
                             bar_len = int((counts[i] / max_count) * 40)
-                            bar_display = ('#' * bar_len) if counts[i] > 0 else ''
-                            print(f"  {bins[i]:>7.2f}ms -- {bins[i+1]:>7.2f}ms | {bar_display} ({counts[i]})")
+                            bar_char = '█'
+                            bar_display = (bar_char * bar_len) if counts[i] > 0 else ''
+                            print(f"  {bins[i]:>7.2f}ms -- {bins[i+1]:>7.2f}ms | {bar_display:<40} ({counts[i]})")
                 except Exception:
                     pass
 
