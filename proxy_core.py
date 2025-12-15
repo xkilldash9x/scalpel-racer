@@ -4,20 +4,23 @@
 Implements a RFC-Compliant Dual-Stack (HTTP/1.1 and HTTP/2) Proxy Handler.
 
 Refactored for Manager Integration and Scalpel Racer MITM capabilities.
-Includes full logic for recursive TLS upgrading and strict HTTP parsing.
+Includes full logic for recursive TLS upgrading, strict HTTP parsing,
+and defense-in-depth security measures against Request Smuggling and DoS.
 """
 
 import asyncio
 import ssl
 import re
 import time
-from typing import Dict, Optional, Callable, Tuple, List, Any, Set, TypedDict
+from typing import Dict, Optional, Callable, Tuple, List, Any, Set, TypedDict, TYPE_CHECKING
 from urllib.parse import urljoin, urlunparse, urlparse
 
+# --- Data Structures & Imports ---
 try:
-    from structures import CapturedRequest, HOP_BY_HOP_HEADERS, CapturedHeaders
+    from structures import CapturedRequest, CapturedHeaders
 except ImportError:
     from dataclasses import dataclass
+    
     @dataclass
     class CapturedRequest:
         id: int
@@ -33,8 +36,6 @@ except ImportError:
         pseudo: Dict[str, str]
         headers: List[Tuple[str, str]]
 
-    HOP_BY_HOP_HEADERS = ['connection', 'keep-alive', 'te', 'transfer-encoding', 'upgrade', 'proxy-connection']
-
 try:
     from h2.connection import H2Connection
     from h2.config import H2Configuration
@@ -47,35 +48,54 @@ try:
     from h2.exceptions import FlowControlError, ProtocolError, StreamClosedError
     from h2.settings import SettingCodes
 except ImportError:
-    raise ImportError("The 'h2' library is required. Install via: pip install h2")
+    # Allow import without h2 for testing/linting purposes
+    H2Connection = None
 
 try:
     import hpack
 except ImportError:
     hpack = None
 
-# Constants
-H2_FORBIDDEN_HEADERS: Set[str] = {
+# --- Constants ---
+
+# Headers that must be removed when forwarding (RFC 7230 / RFC 7540)
+HOP_BY_HOP_HEADERS = frozenset({
+    'connection', 'keep-alive', 'proxy-connection', 'te', 'transfer-encoding', 
+    'upgrade', 'proxy-authenticate', 'proxy-authorization', 'trailers'
+})
+
+# H2 Specific forbidden headers (RFC 7540)
+H2_FORBIDDEN_HEADERS = frozenset({
     'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade'
-}
+})
 
-SENSITIVE_HEADERS: Set[str] = {
+SENSITIVE_HEADERS = frozenset({
     'authorization', 'proxy-authorization', 'cookie', 'set-cookie', 'x-auth-token'
-}
+})
 
-STRICT_HEADER_PATTERN = re.compile(rb'^([^:\s]+):[ \t]*(.*)$')
+# Regex for strict header validation (No whitespace before colon, strict tokens)
+STRICT_HEADER_PATTERN = re.compile(rb'^([!#$%&\'*+\-.^_`|~0-9a-zA-Z]+):[ \t]*(.*)$')
 
+# Security & Performance Limits
 UPSTREAM_CONNECT_TIMEOUT = 10.0
 IDLE_TIMEOUT = 60.0
 KEEPALIVE_INTERVAL = 10.0
 FLOW_CONTROL_TIMEOUT = 30.0
-MAX_HEADER_LIST_SIZE = 262144
-MAX_CAPTURE_BODY_SIZE = 10 * 1024 * 1024
+MAX_HEADER_LIST_SIZE = 262144        # 256KB
+MAX_CAPTURE_BODY_SIZE = 10 * 1024 * 1024 # 10MB
 STREAM_QUEUE_SIZE = 100
 H2_PREFACE = b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
 GOAWAY_MAX_FRAME = b'\x00\x00\x08\x07\x00\x00\x00\x00\x00\x7f\xff\xff\xff\x00\x00\x00\x00'
 
 class StreamContext:
+    """Maintains state for a single HTTP/2 stream. Optimized for memory with __slots__."""
+    __slots__ = (
+        'stream_id', 'scheme', 'downstream_closed', 'upstream_closed',
+        'upstream_flow_event', 'downstream_flow_event',
+        'upstream_queue', 'downstream_queue', 'sender_tasks',
+        'captured_headers', 'request_body', 'capture_finalized', 'truncated'
+    )
+
     def __init__(self, stream_id: int, scheme: str):
         self.stream_id = stream_id
         self.scheme = scheme
@@ -93,12 +113,16 @@ class StreamContext:
         self.capture_finalized = False
         self.truncated = False
 
+    def __repr__(self):
+        return f"<StreamContext id={self.stream_id} scheme={self.scheme}>"
+
 class ProxyError(Exception):
     pass
 class PayloadTooLargeError(ProxyError):
     pass
 
 class BaseProxyHandler:
+    """Shared logic for Upstream Connection and Logging."""
     def __init__(self, explicit_host: str, upstream_verify_ssl: bool, 
                  upstream_ca_bundle: Optional[str], manager_callback: Callable,
                  ssl_context_factory: Optional[Callable] = None):
@@ -112,9 +136,16 @@ class BaseProxyHandler:
 
     def log(self, level: str, msg: Any):
         if self.callback:
-            self.callback(level, msg)
+            try:
+                self.callback(level, msg)
+            except Exception:
+                pass 
 
     def _parse_target(self, explicit_host: str) -> Tuple[str, int]:
+        """Robust parsing of host:port strings, handling IPv6 brackets."""
+        if not explicit_host:
+            return "", 0
+            
         if explicit_host.startswith('['):
             end_bracket = explicit_host.find(']')
             if end_bracket != -1:
@@ -124,10 +155,12 @@ class BaseProxyHandler:
                     try: return host, int(remaining[1:])
                     except ValueError: pass
                 else: return host, 443
+        
         if ':' in explicit_host:
             host, port_str = explicit_host.rsplit(':', 1)
             try: return host, int(port_str)
             except ValueError: pass
+            
         return explicit_host, 443
 
     async def _connect_upstream(self, host: str, port: int, alpn_protocols: List[str] = None) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
@@ -156,6 +189,15 @@ class BaseProxyHandler:
         return bool(scope_pattern.search(url))
 
 class Http11ProxyHandler(BaseProxyHandler):
+    """
+    HTTP/1.1 Proxy Handler.
+    
+    Features:
+    - Strict Request Line & Header Parsing (No Bare LF).
+    - Chunked Encoding support.
+    - CONNECT tunneling with optional MITM.
+    - Security checks for Request Smuggling (CL.TE conflicts).
+    """
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, 
                  explicit_host: str, manager_callback, target_override, scope_pattern,
                  upstream_verify_ssl=False, upstream_ca_bundle=None, initial_data=b"",
@@ -170,12 +212,18 @@ class Http11ProxyHandler(BaseProxyHandler):
         self._previous_byte_was_cr = False
 
     async def _read_strict_line(self) -> bytes:
+        """
+        Reads a line strictly terminated by CRLF. 
+        Rejects Bare LF to prevent smuggling.
+        """
         while True:
             try:
                 lf_index = self.buffer.index(b'\n')
             except ValueError:
+                # LF not found in current buffer
                 if self.buffer:
                     self._previous_byte_was_cr = (self.buffer[-1] == 0x0D)
+                
                 if len(self.buffer) > MAX_HEADER_LIST_SIZE:
                     raise ProxyError("Header Line Exceeded Max Length")
                 
@@ -190,6 +238,7 @@ class Http11ProxyHandler(BaseProxyHandler):
                 self.buffer.extend(data)
                 continue
             
+            # LF found
             if lf_index > MAX_HEADER_LIST_SIZE:
                 raise ProxyError("Header Line Exceeded Max Length")
 
@@ -204,12 +253,14 @@ class Http11ProxyHandler(BaseProxyHandler):
             if not is_crlf:
                 raise ProxyError("Bare LF detected or missing CR. Strict CRLF required")
             
+            # Extract line (excluding CR and LF)
             if lf_index > 0:
                 line = self.buffer[:lf_index - 1]
             else:
                 line = b"" 
             
-            self.buffer = self.buffer[lf_index + 1:] 
+            # Efficiently remove processed line from buffer
+            del self.buffer[:lf_index + 1]
             self._previous_byte_was_cr = False 
             return line
 
@@ -227,7 +278,9 @@ class Http11ProxyHandler(BaseProxyHandler):
                 if not line: break 
 
                 try:
-                    method_b, target_b, version_b = line.split(b' ', 2)
+                    parts = line.split(b' ', 2)
+                    if len(parts) != 3: raise ValueError
+                    method_b, target_b, version_b = parts
                     method = method_b.decode('ascii')
                     target = target_b.decode('ascii')
                     http_version = version_b.decode('ascii').upper()
@@ -238,15 +291,18 @@ class Http11ProxyHandler(BaseProxyHandler):
                 headers = []
                 headers_dict = {}
                 
+                # Header Parsing Loop
                 try:
                     while True:
                         h_line = await self._read_strict_line()
                         if not h_line: break 
                         if h_line[0] in (0x20, 0x09):
                             raise ProxyError("Obsolete Line Folding Rejected")
+                        
                         match = STRICT_HEADER_PATTERN.match(h_line)
                         if not match:
                             raise ProxyError("Invalid Header Syntax")
+                        
                         key = match.group(1).decode('ascii')
                         val = match.group(2).decode('ascii').strip() 
                         headers.append((key, val))
@@ -255,39 +311,34 @@ class Http11ProxyHandler(BaseProxyHandler):
                     await self._send_error(400, str(e))
                     return
 
-                # [FIXED] Proper H1 Validation: Ban Pseudo-headers, Allow TE/Connection
-                validation_rules = [
-                    (
-                        method == 'OPTIONS' and 'access-control-request-method' not in headers_dict,
-                        "OPTIONS requires Access-Control-Request-Method"
-                    ),
-                    (
-                        method == 'CONNECT' and 'host' not in headers_dict,
-                        "CONNECT requires Host header"
-                    ),
-                    (
-                        # Pseudo-headers (starting with :) are illegal in HTTP/1.x
-                        any(k.startswith(':') for k in headers_dict),
-                        "Pseudo-header in HTTP/1.1" 
-                    )
-                ]
+                # Validation & Security Checks
+                if not await self._validate_request(method, headers_dict):
+                    return
 
-                for is_invalid, error_msg in validation_rules:
-                    if is_invalid:
-                        await self._send_error(400, error_msg)
-                        return
-
+                # Transfer-Encoding & Content-Length Logic (Anti-Smuggling)
                 te_header = headers_dict.get('transfer-encoding')
                 cl_header = headers_dict.get('content-length')
+                
                 if te_header:
+                    # RFC 7230 Section 3.3.3: If both present, TE overrides. 
+                    # Security: Remove CL to avoid ambiguity downstream.
                     if cl_header:
+                        self.log("WARN", "Ambiguous Request: CL and TE both present. Stripping CL.")
                         headers = [h for h in headers if h[0].lower() != 'content-length']
                         if 'content-length' in headers_dict:
                              del headers_dict['content-length']
-                    encodings = [e.strip() for e in te_header.split(',')]
-                    # RFC 7230: 'chunked' must be the final encoding
-                    if 'chunked' in encodings and encodings[-1].lower() != 'chunked':
+                    
+                    encodings = [e.strip().lower() for e in te_header.split(',')]
+                    if 'chunked' in encodings and encodings[-1] != 'chunked':
                         await self._send_error(400, "Bad Transfer-Encoding")
+                        return
+                elif cl_header:
+                    # Validate CL is a non-negative integer
+                    try:
+                        cl_val = int(cl_header)
+                        if cl_val < 0: raise ValueError
+                    except ValueError:
+                        await self._send_error(400, "Invalid Content-Length")
                         return
 
                 conn_header = headers_dict.get('connection', '').lower()
@@ -310,9 +361,24 @@ class Http11ProxyHandler(BaseProxyHandler):
             if not self.writer.is_closing():
                 self.writer.close()
 
+    async def _validate_request(self, method: str, headers_dict: Dict[str, str]) -> bool:
+        """Validates specific protocol requirements."""
+        if method == 'OPTIONS' and 'access-control-request-method' not in headers_dict:
+             pass # Optional in some contexts
+        
+        if method == 'CONNECT' and 'host' not in headers_dict:
+            await self._send_error(400, "CONNECT requires Host header")
+            return False
+            
+        if any(k.startswith(':') for k in headers_dict):
+             await self._send_error(400, "Pseudo-header in HTTP/1.1")
+             return False
+        
+        return True
+
     async def _send_error(self, code, message):
         try:
-            self.writer.write(f"HTTP/1.1 {code} {message}\r\nConnection: close\r\n\r\n".encode())
+            self.writer.write(f"HTTP/1.1 {code} {message}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".encode())
             await self.writer.drain()
         except Exception: pass
 
@@ -325,6 +391,7 @@ class Http11ProxyHandler(BaseProxyHandler):
         
         scheme = "https" if self.upstream_verify_ssl else "http"
         
+        # URL Construction for Capture/Scope
         full_url = ""
         if self.target_override:
             full_url = urljoin(self.target_override, target.lstrip('/'))
@@ -339,6 +406,7 @@ class Http11ProxyHandler(BaseProxyHandler):
             await self._send_error(403, "Forbidden by Proxy Scope")
             return
 
+        # Body Reading
         body = b""
         transfer_encoding = headers_dict.get('transfer-encoding', '').lower()
         content_length = headers_dict.get('content-length')
@@ -360,6 +428,7 @@ class Http11ProxyHandler(BaseProxyHandler):
             await self.writer.drain()
             return
 
+        # Upstream Connection
         try:
             u_reader, u_writer = await self._connect_upstream(host, port)
         except asyncio.TimeoutError:
@@ -369,14 +438,15 @@ class Http11ProxyHandler(BaseProxyHandler):
             await self._send_error(502, "Bad Gateway")
             return
 
+        # Forwarding
         req_line = f"{method} {target} {version_b.decode()}\r\n".encode()
         u_writer.write(req_line)
-        hop_by_hop = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailers', 'upgrade'}
         
         final_headers = []
         for k, v in headers:
-            if k.lower() not in hop_by_hop:
+            if k.lower() not in HOP_BY_HOP_HEADERS:
                 final_headers.append((k, v))
+        
         final_headers.append(('Content-Length', str(len(body))))
         final_headers.append(('Connection', 'close')) 
 
@@ -396,10 +466,13 @@ class Http11ProxyHandler(BaseProxyHandler):
         while True:
             line = await self._read_strict_line()
             if b';' in line: line, _ = line.split(b';', 1)
-            try: chunk_size = int(line.strip(), 16)
-            except ValueError: raise ProxyError("Invalid chunk size")
+            try: 
+                chunk_size = int(line.strip(), 16)
+            except ValueError: 
+                raise ProxyError("Invalid chunk size")
             
             if chunk_size == 0:
+                # Read trailers
                 while True:
                     trailer = await self._read_strict_line()
                     if not trailer: break
@@ -407,7 +480,8 @@ class Http11ProxyHandler(BaseProxyHandler):
             
             data = await self._read_bytes(chunk_size)
             body_parts.append(data)
-            await self._read_strict_line()
+            # Consume CRLF after chunk
+            await self._read_strict_line() 
         return b"".join(body_parts)
     
     async def _read_bytes(self, n: int) -> bytes:
@@ -419,8 +493,9 @@ class Http11ProxyHandler(BaseProxyHandler):
                 
             if not data: raise ProxyError("Incomplete read")
             self.buffer.extend(data)
+        
         chunk = self.buffer[:n]
-        self.buffer = self.buffer[n:]
+        del self.buffer[:n]
         return bytes(chunk)
 
     async def _handle_connect(self, target: str):
@@ -433,6 +508,7 @@ class Http11ProxyHandler(BaseProxyHandler):
         host, port = self._parse_target(target)
         
         if self.ssl_context_factory:
+            # MITM Path
             try:
                 ssl_ctx = self.ssl_context_factory(host)
                 self.writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -457,6 +533,7 @@ class Http11ProxyHandler(BaseProxyHandler):
                 self.log("ERROR", f"MITM Handshake Failed for {target}: {e}")
                 return
 
+        # Blind Tunnel Path
         try:
             u_reader, u_writer = await asyncio.wait_for(
                 asyncio.open_connection(host, port), timeout=UPSTREAM_CONNECT_TIMEOUT
@@ -465,7 +542,8 @@ class Http11ProxyHandler(BaseProxyHandler):
             await self.writer.drain()
             await asyncio.gather(
                 self._pipe(self.reader, u_writer, flush_buffer=True),
-                self._pipe(u_reader, self.writer)
+                self._pipe(u_reader, self.writer),
+                return_exceptions=True
             )
         except Exception:
             await self._send_error(502, "Bad Gateway")
@@ -475,7 +553,7 @@ class Http11ProxyHandler(BaseProxyHandler):
             if flush_buffer and self.buffer:
                 w.write(self.buffer)
                 await w.drain()
-                self.buffer.clear()
+                del self.buffer[:]
             while not r.at_eof():
                 data = await r.read(65536)
                 if not data: break
@@ -502,6 +580,12 @@ class Http11ProxyHandler(BaseProxyHandler):
         self.log("CAPTURE", captured)
 
 class NativeProxyHandler(BaseProxyHandler):
+    """
+    Native HTTP/2 Proxy Handler.
+    
+    Manages complex state machinery for H2 frames, streams, and flow control.
+    Supports Tunneling, Capture, and MITM.
+    """
     def __init__(self, client_reader, client_writer, explicit_host, manager_callback, 
                  target_override, scope_pattern, enable_tunneling=True, 
                  upstream_verify_ssl=False, upstream_ca_bundle=None, initial_data=b"",
@@ -519,10 +603,15 @@ class NativeProxyHandler(BaseProxyHandler):
         self.upstream_writer: Optional[asyncio.StreamWriter] = None
         self.upstream_scheme: str = "https" 
 
+        # Locks for H2 State and Socket Access
         self.ds_h2_lock = asyncio.Lock()
         self.us_h2_lock = asyncio.Lock()
         self.ds_socket_lock = asyncio.Lock()
         self.us_socket_lock = asyncio.Lock()
+
+        # [SECURITY] Enforce max header list size to prevent HPACK bombs
+        if not H2Connection:
+            raise ImportError("h2 library not found")
 
         ds_config = H2Configuration(
             client_side=False, header_encoding='utf-8', 
@@ -534,7 +623,7 @@ class NativeProxyHandler(BaseProxyHandler):
         self.downstream_conn.local_settings.max_header_list_size = MAX_HEADER_LIST_SIZE
         self.downstream_conn.local_settings.enable_connect_protocol = 1
 
-        self.upstream_conn: Optional[H2Connection] = None
+        self.upstream_conn: Optional["H2Connection"] = None
         self.streams: Dict[int, StreamContext] = {}
         self.closed = asyncio.Event()
         self.draining = False
@@ -565,6 +654,8 @@ class NativeProxyHandler(BaseProxyHandler):
                     await self.flush(self.upstream_conn, self.upstream_writer, self.us_h2_lock, self.us_socket_lock)
                 except Exception as e:
                     self.log("ERROR", f"H2 Upstream Connection Failed: {e}")
+                    await self.terminate(ErrorCodes.CONNECT_ERROR)
+                    return
 
             self.downstream_conn.initiate_connection()
             await self.flush(self.downstream_conn, self.client_writer, self.ds_h2_lock, self.ds_socket_lock)
@@ -617,7 +708,8 @@ class NativeProxyHandler(BaseProxyHandler):
             try:
                 data = await asyncio.wait_for(reader.read(65536), timeout=IDLE_TIMEOUT)
             except asyncio.TimeoutError:
-                if not self.draining: asyncio.create_task(self.graceful_shutdown())
+                if not self.draining: 
+                    asyncio.create_task(self.graceful_shutdown())
                 continue
 
             if not data:
@@ -641,6 +733,10 @@ class NativeProxyHandler(BaseProxyHandler):
 
     async def _stream_sender(self, stream_id, conn, writer, queue, flow_event, h2_lock, socket_lock, 
                              ack_conn, ack_h2_lock, ack_writer, ack_socket_lock):
+        """
+        Consumes payloads from a queue and sends them to the respective connection.
+        Handles Flow Control Backpressure correctly.
+        """
         while not self.closed.is_set():
             try:
                 item = await queue.get()
@@ -649,15 +745,21 @@ class NativeProxyHandler(BaseProxyHandler):
                 payload, end_stream, ack_length = item
 
                 if isinstance(payload, list):
+                    # Headers
                     conn_data = None
                     async with h2_lock:
-                        conn.send_headers(stream_id, payload, end_stream=end_stream)
-                        conn_data = conn.data_to_send()
+                        try:
+                            conn.send_headers(stream_id, payload, end_stream=end_stream)
+                            conn_data = conn.data_to_send()
+                        except Exception: break
                     if conn_data:
                         async with socket_lock:
-                            writer.write(conn_data)
-                            await writer.drain()
+                            try:
+                                writer.write(conn_data)
+                                await writer.drain()
+                            except: break
                 else:
+                    # Data Body
                     data = payload
                     view = memoryview(data)
                     offset = 0
@@ -669,44 +771,54 @@ class NativeProxyHandler(BaseProxyHandler):
                         break_loop = False
                         
                         async with h2_lock:
-                            conn_window = conn.outbound_flow_control_window
-                            stream_window = conn.remote_flow_control_window(stream_id)
-                            available = min(conn_window, stream_window)
+                            try:
+                                conn_window = conn.outbound_flow_control_window
+                                stream_window = conn.remote_flow_control_window(stream_id)
+                                available = min(conn_window, stream_window)
 
-                            if available > 0 or (total_len == 0 and end_stream):
-                                chunk_size = min(total_len - offset, available)
-                                chunk = view[offset:offset+chunk_size]
-                                is_last = (offset + chunk_size == total_len) and end_stream
-                                conn.send_data(stream_id, chunk.tobytes(), end_stream=is_last)
-                                chunk_data = conn.data_to_send()
-                                offset += chunk_size
-                                if offset >= total_len: break_loop = True
-                            else:
-                                flow_event.clear()
+                                if available > 0 or (total_len == 0 and end_stream):
+                                    chunk_size = min(total_len - offset, available)
+                                    chunk = view[offset:offset+chunk_size]
+                                    is_last = (offset + chunk_size == total_len) and end_stream
+                                    conn.send_data(stream_id, chunk.tobytes(), end_stream=is_last)
+                                    chunk_data = conn.data_to_send()
+                                    offset += chunk_size
+                                    if offset >= total_len: break_loop = True
+                                else:
+                                    flow_event.clear()
+                            except Exception: break_loop = True
 
                         if chunk_data:
                             async with socket_lock:
-                                writer.write(chunk_data)
-                                await writer.drain()
+                                try:
+                                    writer.write(chunk_data)
+                                    await writer.drain()
+                                except: break
                         
                         if break_loop: break
                         
                         if not chunk_data and not break_loop:
-                            try: await asyncio.wait_for(flow_event.wait(), timeout=FLOW_CONTROL_TIMEOUT)
-                            except asyncio.TimeoutError:
+                            try: 
+                                await asyncio.wait_for(flow_event.wait(), timeout=FLOW_CONTROL_TIMEOUT)
+                            except (asyncio.TimeoutError, asyncio.CancelledError):
                                 async with h2_lock:
-                                    conn.reset_stream(stream_id, ErrorCodes.FLOW_CONTROL_ERROR)
+                                    try: conn.reset_stream(stream_id, ErrorCodes.FLOW_CONTROL_ERROR)
+                                    except: pass
                                 break
 
                 if ack_conn and ack_length > 0:
                     ack_bytes = None
                     async with ack_h2_lock:
-                        ack_conn.acknowledge_received_data(ack_length, stream_id)
-                        ack_bytes = ack_conn.data_to_send()
+                        try:
+                            ack_conn.acknowledge_received_data(ack_length, stream_id)
+                            ack_bytes = ack_conn.data_to_send()
+                        except: pass
                     if ack_bytes:
                         async with ack_socket_lock:
-                            ack_writer.write(ack_bytes)
-                            await ack_writer.drain()
+                            try:
+                                ack_writer.write(ack_bytes)
+                                await ack_writer.drain()
+                            except: pass
 
                 queue.task_done()
                 if end_stream: break
@@ -714,6 +826,9 @@ class NativeProxyHandler(BaseProxyHandler):
             except Exception as e:
                 self.log("ERROR", f"Stream sender error: {e}")
                 break
+        
+        try: queue.task_done()
+        except: pass
 
     async def handle_request_received(self, event: RequestReceived):
         stream_id = event.stream_id
@@ -777,7 +892,12 @@ class NativeProxyHandler(BaseProxyHandler):
             if event.stream_id in self.streams:
                 ctx = self.streams[event.stream_id]
                 if not ctx.truncated:
-                    ctx.request_body.extend(event.data)
+                    if len(ctx.request_body) + len(event.data) > MAX_CAPTURE_BODY_SIZE:
+                        ctx.request_body.extend(event.data[:MAX_CAPTURE_BODY_SIZE - len(ctx.request_body)])
+                        ctx.truncated = True
+                    else:
+                        ctx.request_body.extend(event.data)
+
                 async with self.ds_h2_lock:
                     self.downstream_conn.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
                 await self.flush(self.downstream_conn, self.client_writer, self.ds_h2_lock, self.ds_socket_lock)
@@ -796,10 +916,12 @@ class NativeProxyHandler(BaseProxyHandler):
                 self._cleanup_stream(event.stream_id, downstream_closed=True)
         elif isinstance(event, StreamReset):
             if event.stream_id in self.streams:
-                self.log("WARN", f"Stream {event.stream_id} Reset by Client. Code: {event.error_code}")
                 self._cleanup_stream(event.stream_id, force_close=True)
         elif isinstance(event, WindowUpdated):
             await self.handle_window_updated(event, 'downstream')
+        elif isinstance(event, RemoteSettingsChanged):
+            self.log("INFO", f"Downstream Settings Updated: {event.changed_settings}")
+            await self.flush(self.downstream_conn, self.client_writer, self.ds_h2_lock, self.ds_socket_lock)
 
     async def handle_upstream_event(self, event):
         if isinstance(event, ResponseReceived):
@@ -831,6 +953,9 @@ class NativeProxyHandler(BaseProxyHandler):
                 self._cleanup_stream(event.stream_id, upstream_closed=True)
         elif isinstance(event, WindowUpdated):
              await self.handle_window_updated(event, 'upstream')
+        elif isinstance(event, RemoteSettingsChanged):
+             self.log("INFO", f"Upstream Settings Updated: {event.changed_settings}")
+             await self.flush(self.upstream_conn, self.upstream_writer, self.us_h2_lock, self.us_socket_lock)
 
     def _prepare_forwarded_headers(self, headers, is_upstream=True):
         decoded_headers = []
@@ -964,11 +1089,11 @@ class NativeProxyHandler(BaseProxyHandler):
             await asyncio.sleep(KEEPALIVE_INTERVAL)
             if self.upstream_conn:
                 async with self.us_h2_lock:
-                    try: self.upstream_conn.ping(b'KEEPALLV')
+                    try: self.upstream_conn.ping(b'KeepAliv')
                     except Exception: break
                 await self.flush(self.upstream_conn, self.upstream_writer, self.us_h2_lock, self.us_socket_lock)
             async with self.ds_h2_lock:
-                try: self.downstream_conn.ping(b'KEEPALLV')
+                try: self.downstream_conn.ping(b'KeepAliv')
                 except Exception: break
             await self.flush(self.downstream_conn, self.client_writer, self.ds_h2_lock, self.ds_socket_lock)
 

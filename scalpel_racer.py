@@ -32,7 +32,14 @@ import threading
 import logging
 from typing import List, AsyncIterator, Optional, Dict, Union, Tuple
 from collections import defaultdict
-import numpy as np
+
+# [Refactor] Graceful degradation if numpy is missing
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except ImportError:
+    np = None
+    NUMPY_AVAILABLE = False
 
 # Updated imports
 from structures import (
@@ -529,7 +536,7 @@ def analyze_results(results: List[ScanResult]):
             print(f"  Min/Max: {min_t:.2f}ms / {max_t:.2f}ms")
             print(f"  Jitter (StdDev): {std_dev:.2f}ms")
             
-            if len(timings) > 1:
+            if len(timings) > 1 and NUMPY_AVAILABLE:
                 print("\n[Timing Distribution (Histogram)]")
                 try:
                     bins_count = min(int(len(timings) / 5) + 5, 20) 

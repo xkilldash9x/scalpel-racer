@@ -16,8 +16,6 @@ from urllib.parse import urlparse
 from typing import List, Dict, Tuple, Optional, Any
 
 # -- Dependency Management --
-
-# Attempt to import shared structures. If not found, define placeholders to prevent runtime crashes.
 try:
     from structures import ScanResult, CapturedRequest, MAX_RESPONSE_BODY_READ, HOP_BY_HOP_HEADERS
 except ImportError:
@@ -38,6 +36,7 @@ except ImportError:
 
     class CapturedRequest:
         def __init__(self, method, url, headers, body):
+            self.id = 0
             self.method = method
             self.url = url
             self.headers = headers
@@ -71,9 +70,12 @@ class HTTP2RaceEngine:
         self.warmup_ms = warmup_ms
         self.target_host = None
         self.target_port = 443
+        self.target_ip = None
         self.conn = None
         self.sock = None
         self.streams = {}
+        # Optimization: Track active streams to avoid O(N) check in _process
+        self.active_streams_count = 0 
         self.lock = threading.Lock()
         self.all_streams_finished = threading.Event()
         self._parse_target()
@@ -91,7 +93,7 @@ class HTTP2RaceEngine:
             path += '?' + parsed.query
         
         authority = self.target_host
-        if self.target_port != 443:
+        if self.target_port not in (80, 443):
             authority += f":{self.target_port}"
         
         headers = [
@@ -113,7 +115,7 @@ class HTTP2RaceEngine:
             header_keys.add(k_lower)
             headers.append((k_lower, v))
 
-        # Ensure content-type for methods with bodies
+        # Ensure content-type for methods with bodies if missing
         if 'content-type' not in header_keys and self.request.method in ["POST", "PUT", "PATCH"] and content_length > 0:
             headers.append(('content-type', 'application/x-www-form-urlencoded'))
         
@@ -128,11 +130,13 @@ class HTTP2RaceEngine:
     def connect(self):
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        ctx.verify_mode = ssl.CERT_NONE # Intentional: Tool is used against various targets
         ctx.set_alpn_protocols(["h2"])
         
-        # Resolve target IP to ensure consistency
-        self.target_ip = socket.gethostbyname(self.target_host)
+        try:
+            self.target_ip = socket.gethostbyname(self.target_host)
+        except socket.gaierror as e:
+            raise ConnectionError(f"DNS resolution failed for {self.target_host}: {e}")
 
         raw_sock = socket.create_connection((self.target_ip, self.target_port), timeout=10)
         # Disable Nagle's algorithm for precise timing
@@ -141,7 +145,7 @@ class HTTP2RaceEngine:
         self.sock = ctx.wrap_socket(raw_sock, server_hostname=self.target_host)
         
         if self.sock.selected_alpn_protocol() != "h2":
-            raise ConnectionError("ALPN Negotiation failed")
+            raise ConnectionError("ALPN Negotiation failed: Target does not support h2")
             
         config = H2Configuration(client_side=True, header_encoding='utf-8')
         self.conn = H2Connection(config=config)
@@ -153,7 +157,7 @@ class HTTP2RaceEngine:
         try:
             self.connect()
             
-            # Setup PacketController for First-Seq strategy if requested
+            # Setup PacketController for First-Seq strategy
             if self.strategy == "first-seq" and NFQUEUE_AVAILABLE and PacketController:
                 local_port = self.sock.getsockname()[1]
                 packet_controller = PacketController(self.target_ip, self.target_port, local_port)
@@ -164,13 +168,12 @@ class HTTP2RaceEngine:
             t.start()
             
             payload = self.request.get_attack_payload()
-            
-            # Calculate payload parts
             partial = payload[:-1] if payload else b""
             final = payload[-1:] if payload else b""
             
             # -- Prepare Phase --
-            # Send Headers + Partial Body for all streams
+            self.active_streams_count = 0
+            
             for i in range(self.concurrency):
                 sid = self.conn.get_next_available_stream_id()
                 headers = self._construct_h2_headers(len(payload))
@@ -187,8 +190,8 @@ class HTTP2RaceEngine:
                         "headers": {},
                         "error": None
                     }
+                    self.active_streams_count += 1
             
-            # Flush prepared data to the network
             self.sock.sendall(self.conn.data_to_send())
             
             # -- Warmup Phase --
@@ -196,14 +199,12 @@ class HTTP2RaceEngine:
                 time.sleep(self.warmup_ms / 1000.0)
             
             # -- Trigger Phase (SPA) --
-            # Send Final Byte
             start = time.perf_counter()
             for sid in list(self.streams.keys()):
                 self.conn.send_data(sid, final, end_stream=True)
                 with self.lock:
                     self.streams[sid]["start_time"] = start
             
-            # Flush trigger data
             self.sock.sendall(self.conn.data_to_send())
             
             # Wait for results
@@ -231,7 +232,6 @@ class HTTP2RaceEngine:
                 if not self.sock:
                     break
                 
-                # Check for readability
                 ready, _, _ = select.select([self.sock], [], [], 0.1)
                 if not ready:
                     continue
@@ -247,7 +247,6 @@ class HTTP2RaceEngine:
                 if to_send:
                     self.sock.sendall(to_send)
             except Exception:
-                # Any socket error breaks the loop
                 break
         
         self.all_streams_finished.set()
@@ -274,10 +273,12 @@ class HTTP2RaceEngine:
                     self.conn.acknowledge_received_data(e.flow_controlled_length, e.stream_id)
                 
                 elif isinstance(e, (StreamEnded, StreamReset)):
-                    s["finished"] = True
+                    if not s["finished"]:
+                        s["finished"] = True
+                        self.active_streams_count -= 1
             
-            # Check if all streams are finished
-            if all(s["finished"] for s in self.streams.values()):
+            # Check termination condition efficiently
+            if self.active_streams_count <= 0:
                 self.all_streams_finished.set()
 
     def _finalize_results(self):

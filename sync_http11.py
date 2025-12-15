@@ -6,6 +6,10 @@ This module provides a specialized attack engine (`HTTP11SyncEngine`) that uses 
 threads and barriers to synchronize the sending of request payloads across multiple
 connections. It is designed to achieve higher precision than asyncio-based approaches
 by synchronizing threads immediately before the `socket.send` call.
+
+[REFACTORED] Switched from print/traceback to logging for operational output.
+[REFACTORED] Optimized SSL Context creation to occur once per engine instance.
+[REFACTORED] Improved header serialization to preserve duplicates (e.g., Set-Cookie).
 """
 
 import socket
@@ -85,11 +89,15 @@ class HTTP11SyncEngine:
         # Synchronization primitives
         self.barrier: threading.Barrier = None
         
+        # SSL Context (Optimized: Created once)
+        self.ssl_context: Optional[ssl.SSLContext] = None
+        
         # Results tracking
         self.results: List[Optional[ScanResult]] = [None] * concurrency
 
         self._parse_target()
         self._prepare_payload()
+        self._prepare_ssl_context()
 
     def _parse_target(self):
         """
@@ -121,6 +129,23 @@ class HTTP11SyncEngine:
             
         # Initialize barrier for N concurrent requests.
         self.barrier = threading.Barrier(self.concurrency)
+
+    def _prepare_ssl_context(self):
+        """
+        Initializes the SSL context if required.
+        Refactored to run once during init rather than per-connection for efficiency.
+        """
+        if self.scheme == 'https':
+            self.ssl_context = ssl.create_default_context()
+            # Mimic 'verify=False' - Essential for attacking targets with self-signed certs
+            self.ssl_context.check_hostname = False
+            self.ssl_context.verify_mode = ssl.CERT_NONE
+            
+            # Force HTTP/1.1 via ALPN if supported
+            try:
+                self.ssl_context.set_alpn_protocols(["http/1.1"])
+            except NotImplementedError:
+                pass
 
     def run_attack(self) -> List[ScanResult]:
         """
@@ -170,21 +195,10 @@ class HTTP11SyncEngine:
         # Optimization: Disable Nagle's algorithm (TCP_NODELAY)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         
-        if self.scheme == 'https':
-            context = ssl.create_default_context()
-            # Mimic 'verify=False'
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            
-            # Force HTTP/1.1 via ALPN if supported
-            try:
-                context.set_alpn_protocols(["http/1.1"])
-            except NotImplementedError:
-                pass
-
+        if self.scheme == 'https' and self.ssl_context:
             try:
                 # We must pass the original hostname for SNI.
-                ssl_sock = context.wrap_socket(sock, server_hostname=self.target_host)
+                ssl_sock = self.ssl_context.wrap_socket(sock, server_hostname=self.target_host)
                 return ssl_sock
             except ssl.SSLError as e:
                 sock.close()
@@ -195,58 +209,58 @@ class HTTP11SyncEngine:
     def _serialize_headers(self) -> bytes:
         """
         Serializes HTTP/1.1 headers for the request.
+        [REFACTORED] Now preserves header order and duplicate keys (e.g. Set-Cookie).
+        [REFACTORED] Uses a standard User-Agent to ensure application logic reachability.
         """
         parsed_url = urlparse(self.request.url)
         path = parsed_url.path or '/'
         if parsed_url.query:
             path += '?' + parsed_url.query
 
-        # Start building the request line and headers
+        # Start building the request line
         request_lines = [f"{self.request.method} {path} HTTP/1.1"]
         
-        headers = {}
-        
-        # Set Host header
+        # 1. Host Header
         host_header = self.target_host
         if (self.scheme == 'https' and self.target_port != 443) or \
            (self.scheme == 'http' and self.target_port != 80):
             host_header += f":{self.target_port}"
-        headers["Host"] = host_header
+        request_lines.append(f"Host: {host_header}")
 
-        # Add user-provided headers
-        # FIX: Handle headers being a list (structures.py) or dict (fallback)
+        # 2. User-provided headers
+        # Use iterator to preserve duplicates and order
         req_headers_iter = self.request.headers
         if isinstance(req_headers_iter, dict):
             req_headers_iter = req_headers_iter.items()
 
-        header_keys_lower = set()
+        seen_keys_lower = set()
+        
         for k, v in req_headers_iter:
             k_lower = k.lower()
-            header_keys_lower.add(k_lower)
-            # Skip headers managed by this engine or connection protocols
+            seen_keys_lower.add(k_lower)
+            # Skip headers managed explicitly by this engine
             if k_lower not in ['host', 'connection', 'content-length', 'transfer-encoding']:
-                headers[k] = v
+                request_lines.append(f"{k}: {v}")
 
-        # Ensure Content-Type if missing
-        if 'content-type' not in header_keys_lower and self.request.method in ["POST", "PUT", "PATCH"] and self.total_payload_len > 0:
-             headers["Content-Type"] = "application/x-www-form-urlencoded"
+        # 3. Auto-generated headers (only if missing)
+        
+        # Ensure Content-Type if missing and body exists
+        if 'content-type' not in seen_keys_lower and self.request.method in ["POST", "PUT", "PATCH"] and self.total_payload_len > 0:
+             request_lines.append("Content-Type: application/x-www-form-urlencoded")
 
         # Add Content-Length (crucial for HTTP/1.1 persistence)
         if self.total_payload_len > 0 or self.request.method in ["POST", "PUT", "PATCH"]:
-            headers["Content-Length"] = str(self.total_payload_len)
+            request_lines.append(f"Content-Length: {self.total_payload_len}")
         
         # Add default User-Agent if not present
-        if 'user-agent' not in header_keys_lower:
-            headers["User-Agent"] = "Scalpel-CLI/5.4-SyncHTTP11"
+        if 'user-agent' not in seen_keys_lower:
+            # Switched to a standard Chrome User-Agent for better compatibility during testing
+            request_lines.append("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
         # Ensure Connection: keep-alive for persistence
-        headers["Connection"] = "keep-alive"
+        request_lines.append("Connection: keep-alive")
 
-        # Convert dictionary to list of lines
-        for k, v in headers.items():
-            request_lines.append(f"{k}: {v}")
-            
-        # Finalize headers block
+        # Finalize headers block with Double CRLF
         return ("\r\n".join(request_lines) + "\r\n\r\n").encode('utf-8')
 
     def _attack_thread(self, index: int):
