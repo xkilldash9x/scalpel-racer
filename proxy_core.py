@@ -163,8 +163,11 @@ class BaseProxyHandler:
             except Exception:
                 pass 
 
-    def _parse_target(self, explicit_host: str) -> Tuple[str, int]:
-        """Robust parsing of host:port strings, handling IPv6 brackets."""
+    def _parse_target(self, explicit_host: str, default_port: int = 443) -> Tuple[str, int]:
+        """
+        Robust parsing of host:port strings, handling IPv6 brackets.
+        Now accepts a dynamic default_port based on scheme (80 vs 443).
+        """
         if not explicit_host:
             return "", 0
             
@@ -176,14 +179,14 @@ class BaseProxyHandler:
                 if remaining.startswith(':'):
                     try: return host, int(remaining[1:])
                     except ValueError: pass
-                else: return host, 443
+                else: return host, default_port
         
         if ':' in explicit_host:
             host, port_str = explicit_host.rsplit(':', 1)
             try: return host, int(port_str)
             except ValueError: pass
             
-        return explicit_host, 443
+        return explicit_host, default_port
 
     async def _connect_upstream(self, host: str, port: int, alpn_protocols: List[str] = None) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         ctx = ssl.create_default_context()
@@ -251,8 +254,7 @@ class Http11ProxyHandler(BaseProxyHandler):
 
     async def _read_strict_line(self) -> bytes:
         """
-        Reads a line strictly terminated by CRLF. 
-        Rejects Bare LF to prevent smuggling.
+        Reads a line strictly terminated by CRLF, but allows lenient fallback for Bare LF.
         Optimization: Uses smart compaction to avoid O(N^2) buffer resizing on large streams.
         """
         while True:
@@ -269,7 +271,6 @@ class Http11ProxyHandler(BaseProxyHandler):
                 
                 # Optimization: Lazy In-Place Compaction
                 # Only compact if wasted space > 16KB AND represents > 50% of the buffer.
-                # 'del' on bytearray is an in-place memmove in CPython, avoiding allocation.
                 if self._buffer_offset > COMPACTION_THRESHOLD and self._buffer_offset > (len(self.buffer) // 2):
                      del self.buffer[:self._buffer_offset]
                      self._buffer_offset = 0
@@ -302,12 +303,19 @@ class Http11ProxyHandler(BaseProxyHandler):
                 if self._previous_byte_was_cr:
                     is_crlf = True
             
-            if not is_crlf:
-                raise ProxyError("Bare LF detected or missing CR. Strict CRLF required")
+            # --- LENIENT FIX START ---
+            # Instead of raising ProxyError for Bare LF, we handle it gracefully.
+            if is_crlf:
+                # Standard HTTP: Strip the CR (last char before LF)
+                line_end = lf_index - 1
+            else:
+                # Lenient Mode: Bare LF detected. Keep content up to the LF.
+                line_end = lf_index
+            # --- LENIENT FIX END ---
             
-            # Extract line (excluding CR and LF)
-            if lf_index > self._buffer_offset:
-                line = self.buffer[self._buffer_offset:lf_index - 1]
+            # Extract line (excluding the terminator)
+            if line_end > self._buffer_offset:
+                line = self.buffer[self._buffer_offset:line_end]
             else:
                 line = b"" 
             
@@ -453,9 +461,11 @@ class Http11ProxyHandler(BaseProxyHandler):
              parsed = urlparse(target)
              req_host = parsed.netloc
 
-        host, port = self._parse_target(req_host)
-        
         scheme = "https" if self.upstream_verify_ssl else "http"
+        default_port = 443 if scheme == "https" else 80
+
+        # Pass the context-aware default port to the parser
+        host, port = self._parse_target(req_host, default_port=default_port)
         
         # URL Construction for Capture/Scope
         full_url = ""
