@@ -220,6 +220,7 @@ class Http11ProxyHandler(BaseProxyHandler):
         self.target_override = target_override
         self.scope_pattern = scope_pattern
         self.buffer = bytearray(initial_data)
+        self._buffer_offset = 0 # Offset for consumed bytes
         self.enable_tunneling = enable_tunneling
         self._previous_byte_was_cr = False
 
@@ -227,38 +228,49 @@ class Http11ProxyHandler(BaseProxyHandler):
         """
         Reads a line strictly terminated by CRLF. 
         Rejects Bare LF to prevent smuggling.
+        Optimization: Uses _buffer_offset to avoid O(N) buffer resizing.
         """
         while True:
             try:
-                lf_index = self.buffer.index(b'\n')
+                # Search for LF starting from the current offset
+                lf_index = self.buffer.index(b'\n', self._buffer_offset)
             except ValueError:
                 # LF not found in current buffer
-                if self.buffer:
+                if len(self.buffer) - self._buffer_offset > 0:
                     self._previous_byte_was_cr = (self.buffer[-1] == 0x0D)
                 
-                if len(self.buffer) > MAX_HEADER_LIST_SIZE:
+                if (len(self.buffer) - self._buffer_offset) > MAX_HEADER_LIST_SIZE:
                     raise ProxyError("Header Line Exceeded Max Length")
                 
+                # Compact buffer if needed before reading more
+                if self._buffer_offset > 4096:
+                     self.buffer = self.buffer[self._buffer_offset:]
+                     self._buffer_offset = 0
+
                 try:
                     data = await asyncio.wait_for(self.reader.read(4096), timeout=IDLE_TIMEOUT)
                 except asyncio.TimeoutError:
                     raise ProxyError("Read Timeout (Idle)")
                 
                 if not data:
-                    if self.buffer: raise ProxyError("Incomplete message")
+                    if len(self.buffer) - self._buffer_offset > 0:
+                        raise ProxyError("Incomplete message")
                     return b""
                 self.buffer.extend(data)
                 continue
             
-            # LF found
-            if lf_index > MAX_HEADER_LIST_SIZE:
+            # LF found. The index is absolute.
+            line_len = lf_index - self._buffer_offset
+
+            if line_len > MAX_HEADER_LIST_SIZE:
                 raise ProxyError("Header Line Exceeded Max Length")
 
             is_crlf = False
-            if lf_index > 0:
+            # Check byte before LF
+            if lf_index > self._buffer_offset:
                 if self.buffer[lf_index - 1] == 0x0D:
                     is_crlf = True
-            elif lf_index == 0:
+            elif lf_index == self._buffer_offset:
                 if self._previous_byte_was_cr:
                     is_crlf = True
             
@@ -266,14 +278,18 @@ class Http11ProxyHandler(BaseProxyHandler):
                 raise ProxyError("Bare LF detected or missing CR. Strict CRLF required")
             
             # Extract line (excluding CR and LF)
-            if lf_index > 0:
-                line = self.buffer[:lf_index - 1]
+            # If lf_index > self._buffer_offset, then line is self.buffer[self._buffer_offset : lf_index - 1]
+            # If lf_index == self._buffer_offset (rare, immediate newline after CR from prev read), empty string.
+
+            if lf_index > self._buffer_offset:
+                line = self.buffer[self._buffer_offset:lf_index - 1]
             else:
                 line = b"" 
             
-            # Efficiently remove processed line from buffer
-            del self.buffer[:lf_index + 1]
+            # Advance offset past LF
+            self._buffer_offset = lf_index + 1
             self._previous_byte_was_cr = False 
+
             return line
 
     async def run(self):
@@ -497,17 +513,29 @@ class Http11ProxyHandler(BaseProxyHandler):
         return b"".join(body_parts)
     
     async def _read_bytes(self, n: int) -> bytes:
-        while len(self.buffer) < n:
+        while (len(self.buffer) - self._buffer_offset) < n:
             try:
                 data = await asyncio.wait_for(self.reader.read(4096), timeout=IDLE_TIMEOUT)
             except asyncio.TimeoutError:
                 raise ProxyError("Read Timeout (Idle) in Body")
                 
             if not data: raise ProxyError("Incomplete read")
+
+            # Compact if offset is large before extending
+            if self._buffer_offset > 4096:
+                 self.buffer = self.buffer[self._buffer_offset:]
+                 self._buffer_offset = 0
+
             self.buffer.extend(data)
         
-        chunk = self.buffer[:n]
-        del self.buffer[:n]
+        chunk = self.buffer[self._buffer_offset : self._buffer_offset + n]
+        self._buffer_offset += n
+
+        # Periodic compaction for memory safety
+        if self._buffer_offset > 4096 and len(self.buffer) > 8192:
+             self.buffer = self.buffer[self._buffer_offset:]
+             self._buffer_offset = 0
+
         return bytes(chunk)
 
     async def _handle_connect(self, target: str):
@@ -562,9 +590,10 @@ class Http11ProxyHandler(BaseProxyHandler):
 
     async def _pipe(self, r, w, flush_buffer=False):
         try:
-            if flush_buffer and self.buffer:
-                w.write(self.buffer)
+            if flush_buffer and (len(self.buffer) - self._buffer_offset) > 0:
+                w.write(self.buffer[self._buffer_offset:])
                 await w.drain()
+                self._buffer_offset = 0
                 del self.buffer[:]
             while not r.at_eof():
                 data = await r.read(65536)
