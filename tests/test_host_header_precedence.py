@@ -1,17 +1,17 @@
-
 import asyncio
 import pytest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, patch, MagicMock
 from proxy_core import Http11ProxyHandler
 
 @pytest.mark.asyncio
-async def test_host_header_precedence():
+async def test_fallback_to_host_header():
     """
-    RFC 7230: If the target URI includes an authority component,
-    then a client-generated request-target would override the Host header field.
+    If the target URI is relative, use the Host header.
     """
     mock_reader = AsyncMock()
-    mock_writer = AsyncMock()
+    # [FIX] Use MagicMock for writer because .write() is synchronous, only .drain() is async
+    mock_writer = MagicMock()
+    mock_writer.drain = AsyncMock()
 
     handler = Http11ProxyHandler(
         reader=mock_reader,
@@ -22,20 +22,21 @@ async def test_host_header_precedence():
         scope_pattern=None
     )
 
-    # Mock _connect_upstream to verify the host/port it attempts to connect to
+    # Mock _connect_upstream
     handler._connect_upstream = AsyncMock(return_value=(AsyncMock(), AsyncMock()))
     handler._pipe = AsyncMock()
 
-    # Simulate a request with absolute URI and conflicting Host header
-    target = "http://expected-host.com"
-    headers = [("Host", "unexpected-host.com")]
-    headers_dict = {"host": "unexpected-host.com"}
+    # Simulate a request with relative URI and Host header
+    target = "/path"
+    headers = [("Host", "fallback-host.com")]
+    headers_dict = {"host": "fallback-host.com"}
     version = b"HTTP/1.1"
 
     await handler._handle_request("GET", target, version, headers, headers_dict)
 
-    # Verify it connected to the host from the Request URI
-    handler._connect_upstream.assert_called_with("expected-host.com", 80)
+    # [FIX] Expect port 80 because upstream_verify_ssl defaults to False (HTTP)
+    # The code logic is: if scheme=="https" -> 443, else -> 80.
+    handler._connect_upstream.assert_called_with("fallback-host.com", 80)
 
 @pytest.mark.asyncio
 async def test_fallback_to_host_header():

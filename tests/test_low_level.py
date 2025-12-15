@@ -129,7 +129,8 @@ class TestHTTP2RaceEngine:
             engine.connect()
             
         # 1. TCP_NODELAY
-        mock_raw_sock.setsockopt.assert_called_with(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # [FIX] Use assert_any_call because setsockopt is called multiple times (NODELAY and SNDBUF)
+        mock_raw_sock.setsockopt.assert_any_call(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         
         # 2. ALPN
         context_instance.set_alpn_protocols.assert_called_with(["h2"])
@@ -171,12 +172,12 @@ class TestHTTP2RaceEngine:
              patch.object(engine, "_receive_loop"), \
              patch.object(engine.all_streams_finished, "wait"):
             
-            engine.run_attack()
+             engine.run_attack()
             
             # Verify PacketController Lifecycle
-            mock_pc_cls.assert_called()
-            mock_pc_instance.start.assert_called_once()
-            mock_pc_instance.stop.assert_called_once()
+             mock_pc_cls.assert_called()
+             mock_pc_instance.start.assert_called_once()
+             mock_pc_instance.stop.assert_called_once()
 
     def test_process_stream_accounting(self, sample_req):
         """
@@ -230,8 +231,14 @@ class TestHTTP2RaceEngine:
         engine = HTTP2RaceEngine(sample_req, concurrency=1)
         engine.sock = MagicMock()
         
-        # Mock select: Ready to read
-        with patch("low_level.select.select", return_value=([engine.sock], [], [])):
+        # [FIX] Mock selectors.DefaultSelector instead of select.select
+        with patch("low_level.selectors.DefaultSelector") as MockSelector:
+            mock_sel_instance = MockSelector.return_value
+            # select returns a list of (key, events). key.fileobj is the socket.
+            mock_key = MagicMock()
+            mock_key.fileobj = engine.sock
+            mock_sel_instance.select.return_value = [(mock_key, "EVENT_READ")]
+            
             # Mock recv: Returns empty bytes immediately
             engine.sock.recv.return_value = b""
             

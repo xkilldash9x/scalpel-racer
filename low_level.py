@@ -284,7 +284,7 @@ class HTTP2RaceEngine:
                     self.sock.close()
                 except (OSError, AttributeError):
                     pass
-
+            self.all_streams_finished.set()
     def _receive_loop(self):
         """
         Continuously reads from the socket and updates h2 state.
