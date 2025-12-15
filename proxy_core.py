@@ -419,10 +419,23 @@ class Http11ProxyHandler(BaseProxyHandler):
         except Exception: pass
 
     async def _handle_request(self, method, target, version_b, headers, headers_dict):
-        req_host = self.explicit_host or headers_dict.get('host')
+        req_host = self.explicit_host
+
+        # RFC 7230 Section 5.4: If the target URI includes an authority component,
+        # then a client-generated request-target would override the Host header field.
         if not req_host:
             parsed = urlparse(target)
-            req_host = parsed.netloc
+            if parsed.scheme and parsed.netloc:
+                req_host = parsed.netloc
+
+        if not req_host:
+            req_host = headers_dict.get('host')
+
+        # Fallback if both missing (technically 400 Bad Request if HTTP/1.1)
+        if not req_host:
+             parsed = urlparse(target)
+             req_host = parsed.netloc
+
         host, port = self._parse_target(req_host)
         
         scheme = "https" if self.upstream_verify_ssl else "http"
