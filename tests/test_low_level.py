@@ -4,14 +4,16 @@ import socket
 import ssl
 import time
 from unittest.mock import MagicMock, patch, ANY
-from low_level import HTTP2RaceEngine, ScanResult
-from structures import CapturedRequest
+
+# Import from low_level to ensure we use the class 
+# explicitly being used by the engine (handling the fallback logic correctly)
+from low_level import HTTP2RaceEngine, ScanResult, CapturedRequest
 
 class TestHTTP2RaceEngine:
     @pytest.fixture
     def sample_req(self):
         return CapturedRequest(
-            id=1,
+            1, # ID added here
             method="POST",
             url="https://target.com/api",
             headers=[("User-Agent", "Test"), ("Content-Type", "application/json")],
@@ -34,6 +36,41 @@ class TestHTTP2RaceEngine:
         req_port = CapturedRequest(1, "GET", "https://target.com:8443", [], b"")
         engine_port = HTTP2RaceEngine(req_port, concurrency=1)
         assert engine_port.target_port == 8443
+
+    def test_initialization_relative_url_fallback(self):
+        """
+        Fix Regression: Test handling of relative URLs (e.g., 'v1/metrics').
+        Engine should resolve target from the Host header.
+        """
+        # Case 1: Relative URL, Host header present
+        req = CapturedRequest(
+            1, # ID added
+            method="GET",
+            url="v1/metrics",
+            headers=[("Host", "example.com")],
+            body=b""
+        )
+        engine = HTTP2RaceEngine(req, concurrency=1)
+        assert engine.target_host == "example.com"
+        assert engine.target_port == 443 # Default H2/SSL
+        
+        # Case 2: Relative URL, Host header with port
+        req_port = CapturedRequest(
+            2, # ID added
+            method="GET",
+            url="v1/metrics",
+            headers=[("Host", "example.com:8080")],
+            body=b""
+        )
+        engine_port = HTTP2RaceEngine(req_port, concurrency=1)
+        assert engine_port.target_host == "example.com"
+        assert engine_port.target_port == 8080
+
+        # Verify :path construction includes leading slash
+        headers = engine_port._construct_h2_headers(0)
+        h_dict = dict(headers)
+        assert h_dict[':path'] == "/v1/metrics"
+        assert h_dict[':authority'] == "example.com:8080"
 
     def test_construct_h2_headers_compliance(self, sample_req):
         """
@@ -101,6 +138,22 @@ class TestHTTP2RaceEngine:
         assert context_instance.check_hostname is False
         assert context_instance.verify_mode == ssl.CERT_NONE
 
+    def test_run_attack_missing_host_error(self):
+        """
+        Test that run_attack handles cases where Host cannot be determined
+        without crashing the tool (returns an error ScanResult instead).
+        """
+        # Request with relative URL and NO Host header
+        req = CapturedRequest(99, "GET", "v1/metrics", [], b"") # ID added
+        engine = HTTP2RaceEngine(req, concurrency=1)
+        
+        # Should return a result with error, NOT raise exception
+        results = engine.run_attack()
+        
+        assert len(results) == 1
+        assert results[0].error is not None
+        assert "Target host could not be determined" in results[0].error
+
     @patch("low_level.PacketController")
     @patch("low_level.socket.create_connection")
     @patch("low_level.ssl.create_default_context")
@@ -138,8 +191,7 @@ class TestHTTP2RaceEngine:
         engine.active_streams_count = 2 # Manually set for test
         engine.conn = MagicMock()
         
-        # -- FIX: Mock H2 Event classes as Real Classes --
-        # The 'isinstance' check in low_level.py requires these to be types, not Mock objects.
+        # -- Mock H2 Event classes as Real Classes --
         class MockStreamEnded:
             pass
         class MockResponseReceived:
@@ -190,19 +242,61 @@ class TestHTTP2RaceEngine:
     def test_cleanup_on_exception(self, sample_req):
         """Test that sockets are closed even if attack fails."""
         engine = HTTP2RaceEngine(sample_req, concurrency=1)
-        engine.sock = MagicMock()
         
         # Force an error in connect
         with patch("low_level.socket.create_connection", side_effect=Exception("Network fail")):
              with patch("low_level.socket.gethostbyname"):
                  engine.run_attack()
         
-        # Mock sock created then error occurs
+        # Mock sock created then error occurs during preparation
         mock_sock = MagicMock()
         engine.sock = mock_sock
-        with patch("low_level.HTTP2RaceEngine.connect", return_value=None):
+        
+        # IMPORTANT: Patch connect so it returns None instead of running and creating a REAL socket
+        # which would overwrite our MagicMock and cause .assert_called() to fail
+        with patch.object(engine, 'connect', return_value=None):
             # Fail during prepare
             with patch.object(engine, "_construct_h2_headers", side_effect=ValueError("Header Error")):
                 engine.run_attack()
         
+        # Verify close was called.
         mock_sock.close.assert_called()
+        assert engine.all_streams_finished.is_set()
+        
+    def test_cleanup_on_timeout(self, sample_req):
+        """Test that sockets are closed even if attack times out."""
+        engine = HTTP2RaceEngine(sample_req, concurrency=1)
+        engine.sock = MagicMock()
+        # Fix: We must mock self.conn, otherwise the loop crashes with AttributeError
+        # before it reaches the time.sleep line.
+        engine.conn = MagicMock()
+        
+        # Patch connect to prevent it from overwriting engine.sock/engine.conn
+        with patch.object(engine, 'connect', return_value=None):
+            # Mock time.sleep to simulate a timeout
+            with patch("low_level.time.sleep", side_effect=TimeoutError):
+                engine.run_attack()
+        
+        engine.sock.close.assert_called()
+        assert engine.all_streams_finished.is_set()
+        
+    def test_cleanup_on_interrupt(self, sample_req):
+        """
+        Test that sockets are closed even if attack is interrupted by User (Ctrl+C).
+        KeyboardInterrupt is NOT caught by 'except Exception', so it must propagate.
+        """
+        engine = HTTP2RaceEngine(sample_req, concurrency=1)
+        engine.sock = MagicMock()
+        # Fix: Mock self.conn so we survive the prep loop and reach the sleep
+        engine.conn = MagicMock()
+        
+        # Patch connect to prevent overwriting
+        with patch.object(engine, 'connect', return_value=None):
+            # Mock a KeyboardInterrupt
+            with patch("low_level.time.sleep", side_effect=KeyboardInterrupt):
+                with pytest.raises(KeyboardInterrupt):
+                    engine.run_attack()
+        
+        # Even though it crashed, the 'finally' block must run
+        engine.sock.close.assert_called()
+        assert engine.all_streams_finished.is_set()

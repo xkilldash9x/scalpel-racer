@@ -36,6 +36,18 @@ except ImportError:
         pseudo: Dict[str, str]
         headers: List[Tuple[str, str]]
 
+if TYPE_CHECKING:
+    from h2.connection import H2Connection
+    from h2.config import H2Configuration
+    from h2.events import (
+        RequestReceived, DataReceived, StreamEnded, StreamReset, WindowUpdated,
+        SettingsAcknowledged, ConnectionTerminated, TrailersReceived,
+        ResponseReceived, RemoteSettingsChanged, PingReceived, PriorityUpdated
+    )
+    from h2.errors import ErrorCodes
+    from h2.exceptions import FlowControlError, ProtocolError, StreamClosedError
+    from h2.settings import SettingCodes
+
 try:
     from h2.connection import H2Connection
     from h2.config import H2Configuration
@@ -623,7 +635,7 @@ class NativeProxyHandler(BaseProxyHandler):
         self.downstream_conn.local_settings.max_header_list_size = MAX_HEADER_LIST_SIZE
         self.downstream_conn.local_settings.enable_connect_protocol = 1
 
-        self.upstream_conn: Optional["H2Connection"] = None
+        self.upstream_conn: Optional[Any] = None
         self.streams: Dict[int, StreamContext] = {}
         self.closed = asyncio.Event()
         self.draining = False

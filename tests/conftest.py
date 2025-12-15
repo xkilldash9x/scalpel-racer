@@ -7,56 +7,69 @@ from unittest.mock import MagicMock
 # 1. Add project root to path to ensure imports work correctly
 sys.path.append(os.getcwd())
 
-# 2. Mock system dependencies GLOBALLY.
-# This must happen before tests import production modules to prevent ImportErrors
-# and to ensure that tests run in isolation without side effects.
+# 2. Mock system dependencies CONDITIONALLY.
+# Best Practice: Only mock globally if the environment is missing the dependency.
+# This allows Integration tests to use the real libraries if installed,
+# while Unit tests can still use @patch for isolation.
+
+def conditional_mock(module_name):
+    """
+    Attempts to import a module. If it fails, mocks it in sys.modules.
+    Returns True if mocked, False if real.
+    """
+    try:
+        __import__(module_name)
+    except ImportError:
+        sys.modules[module_name] = MagicMock()
+        return True
+    return False
 
 # -- Mock 'h2' library --
-mock_h2 = MagicMock()
-sys.modules["h2"] = mock_h2
-sys.modules["h2.connection"] = MagicMock()
-sys.modules["h2.config"] = MagicMock()
-sys.modules["h2.events"] = MagicMock()
-sys.modules["h2.errors"] = MagicMock()
-sys.modules["h2.exceptions"] = MagicMock()
-sys.modules["h2.settings"] = MagicMock()
+if conditional_mock("h2"):
+    sys.modules["h2.connection"] = MagicMock()
+    sys.modules["h2.config"] = MagicMock()
+    sys.modules["h2.events"] = MagicMock()
+    sys.modules["h2.errors"] = MagicMock()
+    sys.modules["h2.exceptions"] = MagicMock()
+    sys.modules["h2.settings"] = MagicMock()
 
-# -- Mock hpack for proxy_core --
-sys.modules["hpack"] = MagicMock()
+# -- Mock hpack --
+conditional_mock("hpack")
 
 # -- Mock 'netfilterqueue' (Linux only) --
-sys.modules["netfilterqueue"] = MagicMock()
+conditional_mock("netfilterqueue")
 
 # -- Mock 'scapy' --
-mock_scapy = MagicMock()
-sys.modules["scapy"] = mock_scapy
-sys.modules["scapy.all"] = mock_scapy
+if conditional_mock("scapy"):
+    sys.modules["scapy.all"] = MagicMock()
 
 # -- Mock 'cryptography' --
-mock_crypto = MagicMock()
-sys.modules["cryptography"] = mock_crypto
-sys.modules["cryptography.x509"] = MagicMock()
-sys.modules["cryptography.hazmat"] = MagicMock()
-sys.modules["cryptography.hazmat.primitives"] = MagicMock()
-sys.modules["cryptography.hazmat.primitives.asymmetric"] = MagicMock()
-sys.modules["cryptography.hazmat.primitives.serialization"] = MagicMock()
-sys.modules["cryptography.x509.oid"] = MagicMock()
+# Critical for test_generate_host_cert_integration: 
+# We must allow the REAL cryptography module to load if present.
+if conditional_mock("cryptography"):
+    sys.modules["cryptography.x509"] = MagicMock()
+    sys.modules["cryptography.hazmat"] = MagicMock()
+    sys.modules["cryptography.hazmat.primitives"] = MagicMock()
+    sys.modules["cryptography.hazmat.primitives.asymmetric"] = MagicMock()
+    sys.modules["cryptography.hazmat.primitives.serialization"] = MagicMock()
+    sys.modules["cryptography.x509.oid"] = MagicMock()
 
 # -- Mock 'httpx' --
-# Critical: Mocked to prevent import errors if the library is missing in the test env
-mock_httpx = MagicMock()
-sys.modules["httpx"] = mock_httpx
+# If installed, let it load so integration tests can use real clients.
+# Unit tests should use @patch("scalpel_racer.httpx") explicitly.
+conditional_mock("httpx")
 
 # -- Mock 'numpy' --
-mock_numpy = MagicMock()
-
-# Configure histogram to return usable dummy data (counts, bins) for analyze_results tests
-mock_numpy.histogram.return_value = ([10, 5], [0, 50, 100])
-sys.modules["numpy"] = mock_numpy
-
-# -- Mock 'proxy_manager' --
-# REMOVED: We are testing this module, so we must not mock it.
-# If CaptureApp checks for it, we rely on the real import now.
+# We keep the explicit mock configuration for numpy to ensure 
+# predictable histogram data during analysis tests, unless you want
+# real numpy math in integration tests.
+try:
+    import numpy
+except ImportError:
+    mock_numpy = MagicMock()
+    # Configure histogram to return usable dummy data (counts, bins)
+    mock_numpy.histogram.return_value = ([10, 5], [0, 50, 100])
+    sys.modules["numpy"] = mock_numpy
 
 @pytest.fixture
 def mock_socket():

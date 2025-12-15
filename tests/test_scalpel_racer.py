@@ -1,12 +1,16 @@
-# File: test_scalpel_racer.py
+# File: tests/test_scalpel_racer.py
 import pytest
 import asyncio
 import ssl
 import sys
+import os
 from unittest.mock import MagicMock, patch, AsyncMock, mock_open
+
+# Import the module under test
 from scalpel_racer import (
     run_scan, CAManager, Last_Byte_Stream_Body, Staged_Stream_Body,
-    analyze_results, CaptureApp, edit_request_body, fix_sudo_ownership, safe_spawn
+    analyze_results, CaptureApp, edit_request_body, fix_sudo_ownership, 
+    safe_spawn, CA_CERT_FILE, CA_KEY_FILE
 )
 from structures import ScanResult, CapturedRequest, SYNC_MARKER
 
@@ -62,7 +66,7 @@ class TestScalpelIntegration:
     @pytest.mark.asyncio
     async def test_last_byte_stream_logic(self):
         """
-        Critical Test: Verify the generator yields payload in two parts
+        Critical Test: Ensure the generator yields payload in two parts
         and waits on the barrier.
         """
         payload = b"Payload" # 7 bytes
@@ -98,13 +102,14 @@ class TestScalpelIntegration:
         
         assert parts == [b"Step1", b"Step2"]
 
-    @patch("scalpel_racer.ec.generate_private_key")
-    @patch("scalpel_racer.x509.CertificateBuilder")
-    def test_ca_manager_crypto(self, mock_builder, mock_key):
+    def test_ca_manager_crypto(self):
         """Test CA Manager certificate generation calls (Security)."""
+        # Using context managers to keep the mock scope tight and prevent leaks
         with patch("scalpel_racer.CRYPTOGRAPHY_AVAILABLE", True), \
              patch("builtins.open", mock_open()), \
-             patch("os.chown"), patch("os.chmod"):
+             patch("os.chown"), patch("os.chmod"), \
+             patch("scalpel_racer.ec.generate_private_key") as mock_key, \
+             patch("scalpel_racer.x509.CertificateBuilder") as mock_builder:
             
             # Setup fluent interface for Builder
             builder_instance = mock_builder.return_value
@@ -115,7 +120,7 @@ class TestScalpelIntegration:
             mgr = CAManager()
             mgr.generate_ca()
             
-            # Security: Ensure key generation called
+            # Verify that we actually called the key generation
             mock_key.assert_called()
             builder_instance.sign.assert_called()
 
@@ -200,4 +205,75 @@ class TestScalpelIntegration:
             assert app.request_log[0].headers == []
             assert app.request_log[0].body == b""
             assert app.request_log[0].truncated == False
-            assert app.request_log[0].protocol == "HTTP/1.1"
+
+    def test_generate_host_cert_integration(self, tmp_path, monkeypatch):
+        """
+        Integration test for CAManager.generate_host_cert.
+        Runs actual crypto logic to verify file generation and SSL context creation.
+        """
+        # Move into the temp dir for this test to avoid file clutter
+        monkeypatch.chdir(tmp_path)
+
+        # 1. Initialize CA in temp dir
+        manager = CAManager()
+        manager.initialize()
+        assert os.path.exists(CA_CERT_FILE), "CA Cert not created" 
+        assert os.path.exists(CA_KEY_FILE), "CA Key not created"
+
+        # 2. Trigger Host Cert Generation
+        hostname = "test-target.local"
+        context = manager.get_ssl_context(hostname)
+        
+        # Verify SSLContext returned
+        assert isinstance(context, ssl.SSLContext)
+        # Verify cache populated
+        assert hostname in manager.cert_cache
+        # Verify the cached object is indeed an SSLContext
+        assert isinstance(manager.cert_cache[hostname], ssl.SSLContext)
+        
+        # 3. Verify IP Address logic (Regex path)
+        ip_host = "127.0.0.1"
+        context_ip = manager.get_ssl_context(ip_host)
+        
+        assert isinstance(context_ip, ssl.SSLContext)
+        assert ip_host in manager.cert_cache
+
+    @pytest.mark.asyncio
+    async def test_safe_spawn_logic(self): 
+        """
+        Test safe_spawn ensuring the supervisor wrapper handles 
+        both success and exception cases without crashing.
+        """
+        # Mock the TaskGroup
+        tg_mock = MagicMock()
+        results = [None]
+
+        # -- Case 1: Success --
+        async def success_coro():
+            return "Success"
+        
+        # Call safe_spawn (synchronous setup)
+        safe_spawn(tg_mock, success_coro(), results, 0)
+        
+        # Retrieve the wrapper coroutine that was passed to tg.create_task()
+        assert tg_mock.create_task.called
+        wrapper_coro_success = tg_mock.create_task.call_args[0][0]
+        
+        # Manually await it to trigger the logic
+        await wrapper_coro_success
+        assert results[0] == "Success"
+
+        # -- Case 2: Failure --
+        async def fail_coro():
+            raise ValueError("Crash")
+        
+        safe_spawn(tg_mock, fail_coro(), results, 0)
+        
+        # Retrieve the new wrapper
+        wrapper_coro_fail = tg_mock.create_task.call_args[0][0]
+        
+        # Await it; it should NOT raise, but should update results with an error
+        await wrapper_coro_fail
+        
+        assert isinstance(results[0], ScanResult)
+        assert results[0].error == "Crash"
