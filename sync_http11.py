@@ -7,9 +7,8 @@ threads and barriers to synchronize the sending of request payloads across multi
 connections. It is designed to achieve higher precision than asyncio-based approaches
 by synchronizing threads immediately before the `socket.send` call.
 
-[REFACTORED] Switched from print/traceback to logging for operational output.
-[REFACTORED] Optimized SSL Context creation to occur once per engine instance.
-[REFACTORED] Improved header serialization to preserve duplicates (e.g., Set-Cookie).
+[OPTIMIZED] - Header pre-serialization
+            - SO_SNDBUF tuning
 """
 
 import socket
@@ -92,12 +91,18 @@ class HTTP11SyncEngine:
         # SSL Context (Optimized: Created once)
         self.ssl_context: Optional[ssl.SSLContext] = None
         
+        # Cache serialized headers
+        self.serialized_headers: Optional[bytes] = None
+        
         # Results tracking
         self.results: List[Optional[ScanResult]] = [None] * concurrency
 
         self._parse_target()
         self._prepare_payload()
         self._prepare_ssl_context()
+        
+        # Pre-serialize
+        self.serialized_headers = self._serialize_headers()
 
     def _parse_target(self):
         """
@@ -195,6 +200,12 @@ class HTTP11SyncEngine:
         # Optimization: Disable Nagle's algorithm (TCP_NODELAY)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         
+        # Expand Send Buffer to 128KB to prevent blocking during burst
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
+        except OSError:
+            pass
+
         if self.scheme == 'https' and self.ssl_context:
             try:
                 # We must pass the original hostname for SNI.
@@ -209,8 +220,6 @@ class HTTP11SyncEngine:
     def _serialize_headers(self) -> bytes:
         """
         Serializes HTTP/1.1 headers for the request.
-        [REFACTORED] Now preserves header order and duplicate keys (e.g. Set-Cookie).
-        [REFACTORED] Uses a standard User-Agent to ensure application logic reachability.
         """
         parsed_url = urlparse(self.request.url)
         path = parsed_url.path or '/'
@@ -276,7 +285,8 @@ class HTTP11SyncEngine:
             sock = self._connect()
             
             # 2. Prepare Headers
-            headers_bytes = self._serialize_headers()
+            # Use pre-serialized headers
+            headers_bytes = self.serialized_headers
 
             # Record start time just before the first send
             start_time = time.perf_counter()
