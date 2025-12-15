@@ -102,6 +102,28 @@ except ImportError:
 # Global Logger
 logger = logging.getLogger(__name__)
 
+class Colors:
+    """ANSI Color Helper for CLI UX"""
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    MAGENTA = "\033[95m"
+    CYAN = "\033[96m"
+    WHITE = "\033[97m"
+
+    @staticmethod
+    def style(text, color=RESET, bold=False):
+        """Applies color and bold style to text if stdout is a TTY."""
+        if not sys.stdout.isatty():
+            return text
+        prefix = color
+        if bold:
+            prefix += Colors.BOLD
+        return f"{prefix}{text}{Colors.RESET}"
+
 DEFAULT_CONCURRENCY = 15
 DEFAULT_TIMEOUT = 10.0
 DEFAULT_WARMUP = 100 
@@ -520,14 +542,14 @@ def analyze_results(results: List[ScanResult]):
         
     successful = [r for r in results if r.error is None]
     
-    print("\n-- Analysis Summary --")
+    print(Colors.style("\n-- Analysis Summary --", Colors.BOLD))
 
     signatures = defaultdict(list)
     for r in successful:
         key = (r.status_code, r.status_code//100, r.body_hash) 
         signatures[key].append(r)
 
-    print("\n[Response Signatures]")
+    print(Colors.style("\n[Response Signatures]", Colors.CYAN))
     
     if not signatures:
         print("  (No successful responses)")
@@ -543,13 +565,20 @@ def analyze_results(results: List[ScanResult]):
             snippet = group[0].body_snippet if group and group[0].body_snippet else ""
             hash_short = body_hash[:16] if body_hash else "N/A (Empty)"
             
-            print(f"  {count:<6} {status_code:<6} {hash_short:<16} {snippet}")
+            # Colorize status code
+            sc_color = Colors.GREEN # Default 2xx
+            if 300 <= status_code < 400: sc_color = Colors.YELLOW
+            elif status_code >= 400: sc_color = Colors.RED
+
+            sc_str = Colors.style(f"{status_code:<6}", sc_color, bold=True)
+
+            print(f"  {count:<6} {sc_str} {hash_short:<16} {snippet}")
         
         print("  " + "-" * 90)
 
         if len(signatures) > 1:
             logging.warning("Multiple response signatures detected! Indicates potential race condition.")
-            print("\n  [!] WARNING: Multiple response signatures detected!")
+            print(Colors.style("\n  [!] WARNING: Multiple response signatures detected!", Colors.RED, bold=True))
 
     if successful:
         timings = [r.duration for r in successful]
@@ -563,13 +592,13 @@ def analyze_results(results: List[ScanResult]):
             else:
                 std_dev = 0.0
             
-            print("\n[Timing Metrics]")
+            print(Colors.style("\n[Timing Metrics]", Colors.CYAN))
             print(f"  Average: {avg:.2f}ms")
             print(f"  Min/Max: {min_t:.2f}ms / {max_t:.2f}ms")
             print(f"  Jitter (StdDev): {std_dev:.2f}ms")
             
             if len(timings) > 1 and NUMPY_AVAILABLE:
-                print("\n[Timing Distribution (Histogram)]")
+                print(Colors.style("\n[Timing Distribution (Histogram)]", Colors.CYAN))
                 try:
                     bins_count = min(int(len(timings) / 5) + 5, 20) 
                     counts, bins = np.histogram(timings, bins=bins_count)
@@ -579,14 +608,15 @@ def analyze_results(results: List[ScanResult]):
                         for i in range(len(counts)):
                             bar_len = int((counts[i] / max_count) * 40)
                             bar_char = '█'
-                            bar_display = (bar_char * bar_len) if counts[i] > 0 else ''
+                            # Colorize bar
+                            bar_display = Colors.style((bar_char * bar_len), Colors.BLUE) if counts[i] > 0 else ''
                             print(f"  {bins[i]:>7.2f}ms -- {bins[i+1]:>7.2f}ms | {bar_display:<40} ({counts[i]})")
                 except Exception:
                     pass
 
     errors = [r for r in results if r.error is not None]
     if errors:
-        print("\n[Errors]")
+        print(Colors.style("\n[Errors]", Colors.RED))
         for err in errors:
             print(f"  Probe {err.index}: {err.error} ({err.duration:.2f}ms)")
 
@@ -695,7 +725,7 @@ def main():
 
     # Interactive Menu
     while True:
-        print("\n\n-- Captured Requests --")
+        print(Colors.style("\n\n-- Captured Requests --", Colors.BOLD))
         print(f"{'ID':<5} {'Method':<7} {'URL (Size) [Status]'} ")
         print("-" * 100)
         
@@ -704,7 +734,22 @@ def main():
              print(f"  ... (Showing last 50 of {len(app.request_log)} requests) ...")
 
         for req in display_log:
-            print(f"{str(req)}")
+            # Colorize Method
+            m_color = Colors.GREEN
+            if req.method == "POST": m_color = Colors.BLUE
+            elif req.method in ["PUT", "PATCH"]: m_color = Colors.YELLOW
+            elif req.method == "DELETE": m_color = Colors.RED
+
+            method_str = Colors.style(f"{req.method:<7}", m_color)
+
+            # Manually construct string to inject color (bypassing __str__)
+            body_len = len(req.get_attack_payload())
+            edited_flag = Colors.style("[E]", Colors.YELLOW) if req.edited_body is not None else ""
+
+            display_url = req.url if len(req.url) < 70 else req.url[:67] + "..."
+            trunc_flag = " [T]" if req.truncated else ""
+
+            print(f"{req.id:<5} {req.protocol:<8} {method_str} {display_url} ({body_len} bytes){edited_flag}{trunc_flag}")
     
         print("-" * 100)
         print("Commands: [ID] to race | 'e [ID]' to edit body | 'q' to quit")
