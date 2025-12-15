@@ -5,13 +5,14 @@ Uses raw sockets and hyper-h2 for frame-level control (SPA).
 [OPTIMIZED] Batch frame generation for true Single Packet Attack (SPA) behavior.
 [OPTIMIZED] Header pre-computation to reduce CPU load during preparation.
 [CORRECTED] Added thread safety for shared H2Connection state.
+[VECTOR OPTIMIZED] Tuned SO_SNDBUF and trigger precision logic.
 """
 
 import socket
 import ssl
 import time
 import threading
-import select
+import selectors
 import hashlib
 import sys
 import logging
@@ -30,23 +31,29 @@ except ImportError:
     ]
 
     class ScanResult:
+        __slots__ = ('index', 'status_code', 'duration', 'body_hash', 'body_snippet', 'error')
         def __init__(self, index, status_code, duration, body_hash=None, body_snippet=None, error=None):
             self.index = index
             self.status_code = status_code
             self.duration = duration
             self.body_hash = body_hash
+            self.body_snippet = body_snippet
             self.error = error
 
     class CapturedRequest:
-        def __init__(self, id, method, url, headers, body):
+        __slots__ = ('id', 'method', 'url', 'headers', 'body', 'truncated', 'protocol', 'edited_body')
+        def __init__(self, id, method, url, headers, body, truncated=False, protocol="HTTP/1.1", edited_body=None):
             self.id = id
             self.method = method
             self.url = url
             self.headers = headers
             self.body = body
+            self.truncated = truncated
+            self.protocol = protocol
+            self.edited_body = edited_body
 
         def get_attack_payload(self):
-            return self.body if isinstance(self.body, bytes) else self.body.encode('utf-8')
+            return self.edited_body if self.edited_body is not None else self.body
 
 try:
     from h2.connection import H2Connection
@@ -183,6 +190,14 @@ class HTTP2RaceEngine:
         # Disable Nagle's algorithm for precise timing
         raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         
+        # [Vector Optimization] Explicitly set Send Buffer to hold the entire burst.
+        # This prevents syscall blocking when sending the compiled H2 frames.
+        # 256KB is generally sufficient for most race payloads.
+        try:
+            raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
+        except OSError:
+            pass
+
         self.sock = ctx.wrap_socket(raw_sock, server_hostname=self.target_host)
         
         if self.sock.selected_alpn_protocol() != "h2":
@@ -243,14 +258,12 @@ class HTTP2RaceEngine:
             
             # -- Trigger Phase (SPA) --
             start = time.perf_counter()
-            #  Batch state updates and frame generation.
-            # Sending one large blob minimizes TCP packet spacing (SPA).
+            # [VECTOR OPTIMIZATION] Separate H2 frame generation (CPU bound) from sending (IO bound)
+            # This ensures 'start' time is as close to network egress as possible.
             trigger_data = b""
             with self.lock:
                 for sid in self.streams:
                     self.conn.send_data(sid, final, end_stream=True)
-                    self.streams[sid]["start_time"] = start
-                
                 trigger_data = self.conn.data_to_send()
             
             if trigger_data:
@@ -275,16 +288,21 @@ class HTTP2RaceEngine:
     def _receive_loop(self):
         """
         Continuously reads from the socket and updates h2 state.
+        OPTIMIZATION: Uses selectors for efficient I/O waiting.
         """
+        sel = selectors.DefaultSelector()
+        sel.register(self.sock, selectors.EVENT_READ)
+
         while not self.all_streams_finished.is_set():
             try:
                 if not self.sock:
                     break
                 
-                ready, _, _ = select.select([self.sock], [], [], 0.1)
-                if not ready:
+                events = sel.select(timeout=0.1)
+                if not events:
                     continue
                 
+                # We know there's only one socket, no need to loop events map
                 data = self.sock.recv(65536)
                 if not data:
                     break
@@ -293,8 +311,8 @@ class HTTP2RaceEngine:
                 # to prevent race conditions with the attack thread. 
                 to_send = None
                 with self.lock:
-                    events = self.conn.receive_data(data)
-                    self._process(events)
+                    h2_events = self.conn.receive_data(data)
+                    self._process(h2_events)
                     to_send = self.conn.data_to_send()
                 
                 if to_send:
@@ -302,6 +320,7 @@ class HTTP2RaceEngine:
             except Exception:
                 break
         
+        sel.close()
         self.all_streams_finished.set()
 
     def _process(self, events):
@@ -326,6 +345,7 @@ class HTTP2RaceEngine:
                     s["headers"][key] = val
             
             elif isinstance(e, DataReceived):
+                # Optimization: bytearray.extend is efficient
                 s["body"].extend(e.data)
                 self.conn.acknowledge_received_data(e.flow_controlled_length, e.stream_id)
             

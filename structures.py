@@ -3,9 +3,9 @@
 Data structures and constants for the Scalpel Racer application.
 Standardized for integration across the Proxy Manager, Core, and Race Engines.
 [Security] Includes sensitive header redaction for log sanitization.
+[VECTOR OPTIMIZED] Uses __slots__ for memory efficiency in high-volume objects.
 """
 
-from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Any, TypedDict
 
 class CapturedHeaders(TypedDict):
@@ -50,17 +50,21 @@ SENSITIVE_HEADERS = {
 }
 
 # --- Data Structures ---
-@dataclass
+
 class ScanResult:
     """
     Represents the result of a single race attempt (probe).
+    [VECTOR] Optimized: __slots__ reduces memory usage by avoiding __dict__.
     """
-    index: int
-    status_code: int
-    duration: float
-    body_hash: Optional[str] = None
-    body_snippet: Optional[str] = None
-    error: Optional[str] = None
+    __slots__ = ('index', 'status_code', 'duration', 'body_hash', 'body_snippet', 'error')
+    
+    def __init__(self, index: int, status_code: int, duration: float, body_hash: Optional[str] = None, body_snippet: Optional[str] = None, error: Optional[str] = None):
+        self.index = index
+        self.status_code = status_code
+        self.duration = duration
+        self.body_hash = body_hash
+        self.body_snippet = body_snippet
+        self.error = error
 
     def to_dict(self) -> Dict[str, Any]:
         """Converts the scan result to a dictionary for logging/storage."""
@@ -73,20 +77,23 @@ class ScanResult:
             'error': self.error
         }
 
-@dataclass
 class CapturedRequest:
     """
     Represents a captured HTTP request.
-    Shared definition for proxy_core and scalpel_racer. 
+    Shared definition for proxy_core and scalpel_racer.
+    [VECTOR] Optimized: __slots__ significantly lowers instantiation overhead.
     """
-    id: int
-    method: str
-    url: str
-    headers: List[Tuple[str, str]] # Stored as list of tuples for H2/Order preservation
-    body: bytes
-    truncated: bool = False
-    protocol: str = "HTTP/1.1"
-    edited_body: Optional[bytes] = None
+    __slots__ = ('id', 'method', 'url', 'headers', 'body', 'truncated', 'protocol', 'edited_body')
+    
+    def __init__(self, id: int, method: str, url: str, headers: List[Tuple[str, str]], body: bytes, truncated: bool = False, protocol: str = "HTTP/1.1", edited_body: Optional[bytes] = None):
+        self.id = id
+        self.method = method
+        self.url = url
+        self.headers = headers
+        self.body = body
+        self.truncated = truncated
+        self.protocol = protocol
+        self.edited_body = edited_body
 
     def get_attack_payload(self) -> bytes:
         """Returns the edited body if available, otherwise the original captured body."""
@@ -136,23 +143,28 @@ class CapturedRequest:
             'edited_body': self.edited_body.decode('utf-8', 'ignore') if self.edited_body else None
         }
 
-@dataclass
 class RaceResult:
     """
     Represents the result of a complete race (multiple probes).
     """
-    id: int
-    scan_results: List[ScanResult]
-    final_status_code: int
-    final_body_hash: Optional[str] = None
-    final_body_snippet: Optional[str] = None
-    final_error: Optional[str] = None
-    final_duration: Optional[float] = None
-    final_protocol: Optional[str] = None
-    final_headers: Optional[Dict[str, str]] = None
-    final_body: Optional[bytes] = None
-    final_truncated: bool = False
-    final_edited_body: Optional[bytes] = None
+    __slots__ = ('id', 'scan_results', 'final_status_code', 'final_body_hash', 
+                 'final_body_snippet', 'final_error', 'final_duration', 
+                 'final_protocol', 'final_headers', 'final_body', 
+                 'final_truncated', 'final_edited_body')
+    
+    def __init__(self, id: int, scan_results: List[ScanResult], final_status_code: int, final_body_hash: Optional[str] = None, final_body_snippet: Optional[str] = None, final_error: Optional[str] = None, final_duration: Optional[float] = None, final_protocol: Optional[str] = None, final_headers: Optional[Dict[str, str]] = None, final_body: Optional[bytes] = None, final_truncated: bool = False, final_edited_body: Optional[bytes] = None):
+        self.id = id
+        self.scan_results = scan_results
+        self.final_status_code = final_status_code
+        self.final_body_hash = final_body_hash
+        self.final_body_snippet = final_body_snippet
+        self.final_error = final_error
+        self.final_duration = final_duration
+        self.final_protocol = final_protocol
+        self.final_headers = final_headers
+        self.final_body = final_body
+        self.final_truncated = final_truncated
+        self.final_edited_body = final_edited_body
 
     def get_final_body(self) -> bytes:
         """Returns the final body if available, otherwise an empty byte string."""
@@ -170,7 +182,7 @@ class RaceResult:
         """Converts the race result to a dictionary format for logging or storage."""
         return {
             'id': self.id,
-            'scan_results': [r.__dict__ for r in self.scan_results],
+            'scan_results': [r.to_dict() for r in self.scan_results],
             'final_status_code': self.final_status_code,
             'final_body_hash': self.final_body_hash,
             'final_body_snippet': self.final_body_snippet,
@@ -183,20 +195,23 @@ class RaceResult:
             'error': self.final_error
         }
 
-@dataclass
 class RaceConfiguration:
     """
     Represents the configuration for a race.
     """
-    id: int
-    target_url: str
-    method: str
-    headers: List[Tuple[str, str]]
-    body: bytes
-    num_probes: int
-    timeout: float
-    protocol: str = "HTTP/1.1"
-    edited_body: Optional[bytes] = None
+    __slots__ = ('id', 'target_url', 'method', 'headers', 'body', 'num_probes', 
+                 'timeout', 'protocol', 'edited_body')
+    
+    def __init__(self, id: int, target_url: str, method: str, headers: List[Tuple[str, str]], body: bytes, num_probes: int, timeout: float, protocol: str = "HTTP/1.1", edited_body: Optional[bytes] = None):
+        self.id = id
+        self.target_url = target_url
+        self.method = method
+        self.headers = headers
+        self.body = body
+        self.num_probes = num_probes
+        self.timeout = timeout
+        self.protocol = protocol
+        self.edited_body = edited_body
 
     def to_dict(self) -> Dict[str, Any]:
         """Converts the race configuration to a dictionary format for logging or storage."""
@@ -212,16 +227,18 @@ class RaceConfiguration:
             'edited_body': self.edited_body.decode('utf-8', 'ignore') if self.edited_body else None
         }
 
-@dataclass
 class ProxyManagerConfig:
     """
     Represents the configuration for the Proxy Manager.
     """
-    listen_port: int
-    upstream_proxy: Optional[str] = None
-    max_connections: int = 100
-    log_level: str = "INFO"
-    sensitive_headers: List[str] = field(default_factory=lambda: list(SENSITIVE_HEADERS))
+    __slots__ = ('listen_port', 'upstream_proxy', 'max_connections', 'log_level', 'sensitive_headers')
+    
+    def __init__(self, listen_port: int, upstream_proxy: Optional[str] = None, max_connections: int = 100, log_level: str = "INFO", sensitive_headers: List[str] = None):
+        self.listen_port = listen_port
+        self.upstream_proxy = upstream_proxy
+        self.max_connections = max_connections
+        self.log_level = log_level
+        self.sensitive_headers = sensitive_headers if sensitive_headers else list(SENSITIVE_HEADERS)
 
     def to_dict(self) -> Dict[str, Any]:
         """Converts the Proxy Manager configuration to a dictionary format for logging or storage."""

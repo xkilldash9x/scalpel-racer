@@ -7,8 +7,9 @@ threads and barriers to synchronize the sending of request payloads across multi
 connections. It is designed to achieve higher precision than asyncio-based approaches
 by synchronizing threads immediately before the `socket.send` call.
 
-[OPTIMIZED] - Header pre-serialization
-            - SO_SNDBUF tuning
+[OPTIMIZED] - Header pre-serialization and pre-concatenation
+            - SO_SNDBUF tuning to 256KB
+            - Local variable caching in hot loop
 """
 
 import socket
@@ -26,35 +27,23 @@ import io
 
 logger = logging.getLogger(__name__)
 
-# Define placeholders for data structures (similar to low_level.py)
-class ScanResult:
-    """
-    Represents the result of a single race attempt (one probe).
-    """
-    def __init__(self, index: int, status_code: int, duration: float, body_hash: str = None, body_snippet: str = None, error: str = None):
-        self.index = index; self.status_code = status_code; self.duration = duration
-        self.body_hash = body_hash; self.body_snippet = body_snippet; self.error = error
-
-class CapturedRequest:
-    """
-    Represents a captured HTTP request.
-    """
-    # Add attributes expected by the engine
-    def __init__(self, id=0, method="GET", url="", headers=None, body=b""):
-        self.id = id; self.method = method; self.url = url; self.headers = headers or {}; self.body = body; self.edited_body = None
-
-    def get_attack_payload(self) -> bytes:
-        return self.edited_body if self.edited_body is not None else self.body
-
-MAX_RESPONSE_BODY_READ = 1024 * 1024
-SYNC_MARKER = b"{{SYNC}}"
-
+# Fallback structures for standalone testing
 try:
-    # Attempt to import the actual definitions when running via scalpel_racer.py
     from structures import ScanResult, CapturedRequest, MAX_RESPONSE_BODY_READ, SYNC_MARKER
 except ImportError:
-    # This is expected if running independently or during tests
-    pass
+    class ScanResult:
+        __slots__ = ('index', 'status_code', 'duration', 'body_hash', 'body_snippet', 'error')
+        def __init__(self, index, status_code, duration, body_hash=None, body_snippet=None, error=None):
+            self.index = index; self.status_code = status_code; self.duration = duration
+            self.body_hash = body_hash; self.body_snippet = body_snippet; self.error = error
+    class CapturedRequest:
+        __slots__ = ('id', 'method', 'url', 'headers', 'body', 'edited_body')
+        def __init__(self, id=0, method="GET", url="", headers=None, body=b""):
+            self.id = id; self.method = method; self.url = url; self.headers = headers or {}; self.body = body; self.edited_body = None
+        def get_attack_payload(self) -> bytes:
+            return self.edited_body if self.edited_body is not None else self.body
+    MAX_RESPONSE_BODY_READ = 1024 * 1024
+    SYNC_MARKER = b"{{SYNC}}"
 
 # Configuration Constants
 CONNECTION_TIMEOUT = 10.0
@@ -65,6 +54,11 @@ class HTTP11SyncEngine:
     """
     Implements high-precision Synchronous Staged Attacks over HTTP/1.1 using threads and barriers.
     """
+    __slots__ = (
+        'request', 'concurrency', 'target_host', 'target_port', 'scheme', 'target_ip',
+        'stages', 'total_payload_len', 'barrier', 'ssl_context', 'serialized_headers',
+        'results', 'initial_payload'
+    )
 
     def __init__(self, request: CapturedRequest, concurrency: int):
         """
@@ -93,6 +87,7 @@ class HTTP11SyncEngine:
         
         # Cache serialized headers
         self.serialized_headers: Optional[bytes] = None
+        self.initial_payload: Optional[bytes] = None
         
         # Results tracking
         self.results: List[Optional[ScanResult]] = [None] * concurrency
@@ -103,6 +98,13 @@ class HTTP11SyncEngine:
         
         # Pre-serialize
         self.serialized_headers = self._serialize_headers()
+        
+        # VECTOR OPTIMIZATION: Pre-calculate the initial payload (Headers + Stage 1)
+        # to avoid concatenation in the thread's hot path.
+        if self.stages:
+            self.initial_payload = self.serialized_headers + self.stages[0]
+        else:
+            self.initial_payload = self.serialized_headers
 
     def _parse_target(self):
         """
@@ -197,12 +199,13 @@ class HTTP11SyncEngine:
         except socket.error as e:
             raise ConnectionError(f"Connection failed: {type(e).__name__}: {e}")
 
-        # Optimization: Disable Nagle's algorithm (TCP_NODELAY)
+        # Optimization: Disable Nagle's algorithm (TCP_NODELAY) explicitly
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         
-        # Expand Send Buffer to 128KB to prevent blocking during burst
+        # Optimization: Expand Send Buffer to 256KB to prevent blocking in userspace during the burst
+        # This reduces the chance of 'sendall' partially blocking when dumping the payload.
         try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
         except OSError:
             pass
 
@@ -284,30 +287,33 @@ class HTTP11SyncEngine:
             # 1. Connect
             sock = self._connect()
             
-            # 2. Prepare Headers
-            # Use pre-serialized headers
-            headers_bytes = self.serialized_headers
+            # [VECTOR OPTIMIZATION] Local variable caching for hot loop
+            # Avoids LOAD_ATTR opcodes during the critical sync moment
+            sock_sendall = sock.sendall
+            barrier_wait = self.barrier.wait
+            initial_payload = self.initial_payload
+            stages = self.stages
 
             # Record start time just before the first send
             start_time = time.perf_counter()
 
-            # 3. Send Headers + First Stage
-            initial_payload = headers_bytes + self.stages[0]
-            sock.sendall(initial_payload)
+            # 3. Send Headers + First Stage (Optimized: Single send call)
+            # Using pre-calculated payload avoids concatenation overhead in this hot thread
+            sock_sendall(initial_payload)
 
             # 4. Synchronized subsequent stages
-            for stage_index in range(1, len(self.stages)):
+            for stage_index in range(1, len(stages)):
                 # Wait for all threads to reach this point
                 try:
                     # Use a timeout on the barrier
-                    self.barrier.wait(timeout=BARRIER_TIMEOUT)
+                    barrier_wait(timeout=BARRIER_TIMEOUT)
                 # Handle the case where another thread aborted the barrier
                 except threading.BrokenBarrierError:
                     # Raise an exception to be caught by the outer handler.
                     raise ConnectionError("Synchronization barrier broken (fail-fast).")
                 
                 # Send immediately
-                sock.sendall(self.stages[stage_index])
+                sock_sendall(stages[stage_index])
             
             # 5. Receive response
             # Set timeout for response reading

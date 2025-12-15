@@ -13,6 +13,9 @@ Features:
 - Frame Inspection (STREAM, ACK, CRYPTO, HTTP/3 Frames)
 - Robust Error Handling for Malformed Frames
 - Using int.from_bytes and struct.unpack_from for high-speed parsing.
+
+VECTOR OPTIMIZATIONS:
+- IO: 4MB UDP Receive Buffer for QUIC.
 """
 
 import asyncio
@@ -111,6 +114,10 @@ class QuicFrameParser:
     
     @staticmethod
     def parse_frames(payload):
+        # [Vector Optimization] Use memoryview to avoid zero-copy
+        if not isinstance(payload, memoryview):
+            payload = memoryview(payload)
+
         frames = []
         offset = 0
         limit = len(payload)
@@ -243,7 +250,7 @@ class QuicFrameParser:
                          
                     reason = payload[offset : offset + reason_len]
                     offset += reason_len
-                    frames.append({"type": "CONNECTION_CLOSE", "code": error_code, "reason": reason})
+                    frames.append({"type": "CONNECTION_CLOSE", "code": error_code, "reason": bytes(reason)})
                     continue
 
                 frames.append({"type": f"UNKNOWN_FRAME_0x{ftype:02x}"})
@@ -264,8 +271,10 @@ class H3FrameParser:
     """Parses HTTP/3 Frames from a STREAM frame's data."""
     @staticmethod
     def parse(stream_data):
-        # memoryview for high-speed slicing 
-        stream_data = memoryview(stream_data)
+        # Optimization: Use memoryview for high-speed slicing 
+        if not isinstance(stream_data, memoryview):
+            stream_data = memoryview(stream_data)
+
         h3_frames = []
         offset = 0
         limit = len(stream_data)
@@ -359,7 +368,9 @@ class QuicPacketParser:
     
     def parse_packet(self, data):
         # memoryview 
-        data = memoryview(data)
+        if not isinstance(data, memoryview):
+            data = memoryview(data)
+
         if len(data) < 1: return {"error": "Empty"}
         
         first = data[0]
@@ -434,6 +445,13 @@ class QuicServer:
         
         def connection_made(self, transport):
             self.server.transport = transport
+            # [OPTIMIZATION] Set 4MB receive buffer for high-throughput QUIC
+            sock = transport.get_extra_info('socket')
+            if sock:
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+                except Exception:
+                    pass
             
         def datagram_received(self, data, addr):
             # Parse RFC 9000 Packet
