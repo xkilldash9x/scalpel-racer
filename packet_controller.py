@@ -4,7 +4,7 @@ Implements the PacketController for the 'First Sequence Sync' strategy.
 Uses Linux NetfilterQueue to hold the first packet of a burst.
 Refined: High-performance raw packet parsing (no Scapy) and improved accuracy (no PSH flag reliance).
 [OPTIMIZED] - Pre-compiled structs
-            - unpack_from
+            - unpack_from for zero-copy parsing
 """
 
 import os
@@ -31,7 +31,7 @@ if sys.platform.startswith("linux"):
 REORDER_DELAY = 0.010  # 10ms
 QUEUE_NUM = 99
 
-# Pre-compile struct formats
+# Optimization: Pre-compile struct formats for zero-copy parsing
 _STRUCT_H = struct.Struct("!H")
 _STRUCT_I = struct.Struct("!I")
 

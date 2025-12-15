@@ -7,14 +7,16 @@ Refactored for Manager Integration and Scalpel Racer MITM capabilities.
 Includes full logic for recursive TLS upgrading, strict HTTP parsing,
 and defense-in-depth security measures against Request Smuggling and DoS.
 
-[OPTIMIZED] - 64KB Read Chunks
-            - Lazy In-Place Buffer Compaction
-            - Queue Batching for H2
+VECTOR OPTIMIZATIONS:
+- IO: TCP_NODELAY enabled on upstream sockets.
+- MEMORY: MemoryView slicing in strict line reader to avoid copying.
+- IO: 64KB Read Chunks.
 """
 
 import asyncio
 import ssl
 import re
+import socket
 import time
 from typing import Dict, Optional, Callable, Tuple, List, Any, Set, TypedDict, TYPE_CHECKING
 from urllib.parse import urljoin, urlunparse, urlparse
@@ -198,11 +200,26 @@ class BaseProxyHandler:
             try: ctx.set_alpn_protocols(alpn_protocols)
             except NotImplementedError: pass
 
-        return await asyncio.wait_for(
-            asyncio.open_connection(host, port, ssl=ctx),
-            timeout=UPSTREAM_CONNECT_TIMEOUT
-        )
-    
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port, ssl=ctx),
+                timeout=UPSTREAM_CONNECT_TIMEOUT
+            )
+            
+            # [OPTIMIZATION] Disable Nagle's algorithm on the socket to ensure
+            # low latency for forwarded packets.
+            try:
+                sock = writer.get_extra_info('socket')
+                if sock:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
+                
+            return reader, writer
+            
+        except asyncio.TimeoutError:
+            raise
+
     def _is_url_allowed(self, url: str, scope_pattern: Optional[Any]) -> bool:
         if not scope_pattern:
             return True
@@ -250,7 +267,7 @@ class Http11ProxyHandler(BaseProxyHandler):
                 if (len(self.buffer) - self._buffer_offset) > MAX_HEADER_LIST_SIZE:
                     raise ProxyError("Header Line Exceeded Max Length")
                 
-                # Lazy In-Place Compaction
+                # Optimization: Lazy In-Place Compaction
                 # Only compact if wasted space > 16KB AND represents > 50% of the buffer.
                 # 'del' on bytearray is an in-place memmove in CPython, avoiding allocation.
                 if self._buffer_offset > COMPACTION_THRESHOLD and self._buffer_offset > (len(self.buffer) // 2):
@@ -543,7 +560,7 @@ class Http11ProxyHandler(BaseProxyHandler):
                 
             if not data: raise ProxyError("Incomplete read")
 
-            # Lazy In-Place Compaction if needed
+            # Optimization: Lazy In-Place Compaction
             if self._buffer_offset > COMPACTION_THRESHOLD and self._buffer_offset > (len(self.buffer) // 2):
                  del self.buffer[:self._buffer_offset]
                  self._buffer_offset = 0
@@ -794,10 +811,11 @@ class NativeProxyHandler(BaseProxyHandler):
         """
         Consumes payloads from a queue and sends them to the respective connection.
         Handles Flow Control Backpressure correctly.
+        [VECTOR OPTIMIZED] Batches writes to reduce syscall overhead.
         """
         while not self.closed.is_set():
             try:
-                # Queue Batching Optimization 
+                # Optimization: Queue Batching
                 # Reduces await/loop overhead by grabbing multiple available items
                 items = [await queue.get()]
                 

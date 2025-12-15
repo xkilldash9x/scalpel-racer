@@ -9,6 +9,8 @@ REPORT (2025 Audit - Refactored):
 - SECURITY: Enforced TLS 1.2+ and Perfect Forward Secrecy (ECDHE).
 - ARCHITECTURE: Implemented Supervisor Pattern for asyncio.TaskGroup.
 - ARCHITECTURE: Migrated to ProxyManager for modular interception.
+- OPTIMIZATION: Integrated uvloop for high-performance event loop policy.
+- OPTIMIZATION: Shared Ephemeral Keys for MITM certificates to reduce CPU load.
 - FIXED: Replaced deprecated datetime.utcnow() with datetime.now(datetime.UTC).
 - FIXED: Secured Windows temporary file handling with TemporaryDirectory.
 """
@@ -32,6 +34,14 @@ import threading
 import logging
 from typing import List, AsyncIterator, Optional, Dict, Union, Tuple
 from collections import defaultdict
+
+# VECTOR OPTIMIZATION: Try importing uvloop for significant performance boost on Unix
+try:
+    import uvloop
+    UVLOOP_AVAILABLE = True
+except ImportError:
+    uvloop = None
+    UVLOOP_AVAILABLE = False
 
 # [Refactor] Graceful degradation if numpy is missing
 try:
@@ -138,9 +148,16 @@ class CAManager:
         self.ca_key = None
         self.ca_cert = None
         self.cert_cache = {}
+        # Optimization: Reuse one ephemeral key for all host certificates to save CPU
+        self.shared_leaf_key = None
 
     def initialize(self):
         if not CRYPTOGRAPHY_AVAILABLE: return
+        
+        # [Vector Optimization] Generate shared key once
+        if not self.shared_leaf_key:
+            self.shared_leaf_key = ec.generate_private_key(ec.SECP256R1())
+
         if os.path.exists(CA_CERT_FILE) and os.path.exists(CA_KEY_FILE):
             self.load_ca()
         else:
@@ -236,7 +253,9 @@ class CAManager:
         return context
 
     def generate_host_cert(self, hostname: str):
-        key = ec.generate_private_key(ec.SECP256R1())
+        # [Vector Optimization] Reuse the shared private key
+        key = self.shared_leaf_key if self.shared_leaf_key else ec.generate_private_key(ec.SECP256R1())
+        
         if isinstance(hostname, bytes):
             hostname = hostname.decode('utf-8', errors='ignore')
 
@@ -309,10 +328,13 @@ class CaptureApp:
             scope_regex=self.scope_regex
         )
 
-# -- RACE CONDITION LOGIC (Restored Full Version) --
+# -- RACE CONDITION LOGIC (Optimized) --
 
 async def Last_Byte_Stream_Body(payload: bytes, barrier: asyncio.Barrier, warmup_ms: int) -> AsyncIterator[bytes]:
-    """Streams request body, pausing before the last byte for synchronization."""
+    """
+    Streams request body, pausing before the last byte for synchronization.
+    Vector Optimization: Uses memoryview to zero-copy slice the payload.
+    """
     if len(payload) <= 1:
         if warmup_ms > 0:
             await asyncio.sleep(warmup_ms / 1000.0)
@@ -323,7 +345,9 @@ async def Last_Byte_Stream_Body(payload: bytes, barrier: asyncio.Barrier, warmup
         yield payload
         return
 
-    yield payload[:-1] 
+    # Zero-copy slicing
+    mv = memoryview(payload)
+    yield mv[:-1] 
 
     if warmup_ms > 0:
         await asyncio.sleep(warmup_ms / 1000.0)
@@ -333,10 +357,12 @@ async def Last_Byte_Stream_Body(payload: bytes, barrier: asyncio.Barrier, warmup
     except asyncio.BrokenBarrierError:
         pass
 
-    yield payload[-1:]
+    yield mv[-1:]
 
 async def Staged_Stream_Body(payload: bytes, barriers: List[asyncio.Barrier]) -> AsyncIterator[bytes]:
-    """Splits payload by {{SYNC}} markers for multi-step synchronization."""
+    """
+    Splits payload by {{SYNC}} markers for multi-step synchronization.
+    """
     parts = payload.split(SYNC_MARKER)
     barrier_idx = 0
     
@@ -351,18 +377,20 @@ async def Staged_Stream_Body(payload: bytes, barriers: List[asyncio.Barrier]) ->
         if part:
             yield part
 
-async def send_probe_advanced(client: httpx.AsyncClient, request: CapturedRequest, payload: bytes, barriers: List[asyncio.Barrier], warmup_ms: int, index: int, is_staged: bool) -> ScanResult:
+async def send_probe_advanced(client: httpx.AsyncClient, request: CapturedRequest, payload: bytes, barriers: List[asyncio.Barrier], warmup_ms: int, index: int, is_staged: bool, base_headers: httpx.Headers) -> ScanResult:
     """
     Sends a single probe request using httpx with the specified synchronization strategy.
     Recalculates Content-Length to ensure valid headers during edits/streaming.
+    [VECTOR] Uses pre-calculated base_headers to reduce overhead.
     """
     start_time = time.perf_counter()
     body_hash = None
     body_snippet = None
 
     try:
-        req_headers = httpx.Headers(request.headers)
-        req_headers["User-Agent"] = "Scalpel-CLI/5.4-Optimized"
+        # [VECTOR] Efficient Header Construction
+        # Reuse parsed headers to save CPU time per probe
+        req_headers = base_headers.copy()
         req_headers["X-Scalpel-Probe"] = f"{index}_{int(time.time())}"
 
         # Fix Content-Length
@@ -452,6 +480,10 @@ async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warm
 
     limits = httpx.Limits(max_keepalive_connections=concurrency, max_connections=concurrency*2)
     timeout = httpx.Timeout(DEFAULT_TIMEOUT, connect=5.0)
+    
+    # [VECTOR] Pre-calculate base headers object to avoid repetitive parsing overhead
+    base_headers = httpx.Headers(request.headers)
+    base_headers["User-Agent"] = "Scalpel-CLI/5.4-Optimized"
 
     async with httpx.AsyncClient(http2=http2, limits=limits, timeout=timeout, verify=False) as client:
         results = [None] * concurrency
@@ -462,7 +494,7 @@ async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warm
                     safe_spawn(
                         tg, 
                         send_probe_advanced(
-                            client, request, attack_payload, barriers, warmup, i, sync_markers_count > 0
+                            client, request, attack_payload, barriers, warmup, i, sync_markers_count > 0, base_headers
                         ), 
                         results, 
                         i
@@ -470,7 +502,7 @@ async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warm
         else:
             # Fallback
             tasks = [
-                send_probe_advanced(client, request, attack_payload, barriers, warmup, i, sync_markers_count > 0) 
+                send_probe_advanced(client, request, attack_payload, barriers, warmup, i, sync_markers_count > 0, base_headers) 
                 for i in range(concurrency)
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -613,8 +645,11 @@ def main():
                 asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         except Exception:
             pass
+    elif UVLOOP_AVAILABLE:
+        # [Vector Optimization] Use uvloop if available on non-Windows systems
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
-    parser = argparse.ArgumentParser(description="Scalpel Racer v6.0 (Refactored) -- ProxyManager Integrated")
+    parser = argparse.ArgumentParser(description="Scalpel Racer v6.0 (Optimized) -- ProxyManager Integrated")
     
     parser.add_argument("-l", "--listen", type=int, default=8080, help="Listening port (default: 8080)")
     parser.add_argument("-c", "--concurrency", type=int, default=DEFAULT_CONCURRENCY, help=f"Concurrency (default: {DEFAULT_CONCURRENCY})")
