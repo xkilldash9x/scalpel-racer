@@ -48,6 +48,7 @@ class TestHttp11Proxy:
         
         reader.read.side_effect = [b"Header: Val\n", b""]
         handler.buffer = bytearray(b"")
+        handler._buffer_offset = 0 # Explicit reset for test stability
         with pytest.raises(ProxyError):
             await handler._read_strict_line()
 
