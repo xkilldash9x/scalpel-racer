@@ -2,6 +2,9 @@
 """
 Implements the Low-Level HTTP/2 Race Engine.
 Uses raw sockets and hyper-h2 for frame-level control (SPA).
+[OPTIMIZED] Batch frame generation for true Single Packet Attack (SPA) behavior.
+[OPTIMIZED] Header pre-computation to reduce CPU load during preparation.
+[CORRECTED] Added thread safety for shared H2Connection state.
 """
 
 import socket
@@ -212,11 +215,13 @@ class HTTP2RaceEngine:
             # -- Prepare Phase --
             self.active_streams_count = 0
             
+            #   Hoist header construction out of loop
+            common_headers = self._construct_h2_headers(len(payload))
+
             for i in range(self.concurrency):
                 sid = self.conn.get_next_available_stream_id()
-                headers = self._construct_h2_headers(len(payload))
                 
-                self.conn.send_headers(sid, headers, end_stream=False)
+                self.conn.send_headers(sid, common_headers, end_stream=False)
                 if partial:
                     self.conn.send_data(sid, partial, end_stream=False)
                 
@@ -238,12 +243,18 @@ class HTTP2RaceEngine:
             
             # -- Trigger Phase (SPA) --
             start = time.perf_counter()
-            for sid in list(self.streams.keys()):
-                self.conn.send_data(sid, final, end_stream=True)
-                with self.lock:
+            #  Batch state updates and frame generation.
+            # Sending one large blob minimizes TCP packet spacing (SPA).
+            trigger_data = b""
+            with self.lock:
+                for sid in self.streams:
+                    self.conn.send_data(sid, final, end_stream=True)
                     self.streams[sid]["start_time"] = start
+                
+                trigger_data = self.conn.data_to_send()
             
-            self.sock.sendall(self.conn.data_to_send())
+            if trigger_data:
+                self.sock.sendall(trigger_data)
             
             # Wait for results
             self.all_streams_finished.wait(timeout=10)
@@ -278,10 +289,14 @@ class HTTP2RaceEngine:
                 if not data:
                     break
                 
-                events = self.conn.receive_data(data)
-                self._process(events)
+                # Lock the connection while processing incoming data 
+                # to prevent race conditions with the attack thread. 
+                to_send = None
+                with self.lock:
+                    events = self.conn.receive_data(data)
+                    self._process(events)
+                    to_send = self.conn.data_to_send()
                 
-                to_send = self.conn.data_to_send()
                 if to_send:
                     self.sock.sendall(to_send)
             except Exception:
@@ -292,32 +307,36 @@ class HTTP2RaceEngine:
     def _process(self, events):
         """
         Process H2 events and update stream state.
+        Caller MUST hold self.lock.
         """
-        with self.lock:
-            for e in events:
-                if not hasattr(e, 'stream_id') or e.stream_id not in self.streams:
-                    continue
-                
-                s = self.streams[e.stream_id]
-                
-                if isinstance(e, ResponseReceived):
-                    for k, v in e.headers:
-                        key = k.decode('utf-8') if isinstance(k, bytes) else k
-                        val = v.decode('utf-8') if isinstance(v, bytes) else v
-                        s["headers"][key] = val
-                
-                elif isinstance(e, DataReceived):
-                    s["body"].extend(e.data)
-                    self.conn.acknowledge_received_data(e.flow_controlled_length, e.stream_id)
-                
-                elif isinstance(e, (StreamEnded, StreamReset)):
-                    if not s["finished"]:
-                        s["finished"] = True
-                        self.active_streams_count -= 1
+        # Early return to avoid lock overhead if no events
+        if not events:
+            return
+
+        for e in events:
+            if not hasattr(e, 'stream_id') or e.stream_id not in self.streams:
+                continue
             
-            # Check termination condition efficiently
-            if self.active_streams_count <= 0:
-                self.all_streams_finished.set()
+            s = self.streams[e.stream_id]
+            
+            if isinstance(e, ResponseReceived):
+                for k, v in e.headers:
+                    key = k.decode('utf-8') if isinstance(k, bytes) else k
+                    val = v.decode('utf-8') if isinstance(v, bytes) else v
+                    s["headers"][key] = val
+            
+            elif isinstance(e, DataReceived):
+                s["body"].extend(e.data)
+                self.conn.acknowledge_received_data(e.flow_controlled_length, e.stream_id)
+            
+            elif isinstance(e, (StreamEnded, StreamReset)):
+                if not s["finished"]:
+                    s["finished"] = True
+                    self.active_streams_count -= 1
+        
+        # Check termination condition efficiently
+        if self.active_streams_count <= 0:
+            self.all_streams_finished.set()
 
     def _finalize_results(self):
         res = []
@@ -325,8 +344,9 @@ class HTTP2RaceEngine:
             for sid, data in self.streams.items():
                 dur = (time.perf_counter() - data.get("start_time", 0)) * 1000
                 sc = int(data["headers"].get(":status", 0))
-                b = bytes(data["body"])
-                h = hashlib.sha256(b).hexdigest() if b else None
+                # Zero-copy hashing by passing bytearray directly to hashlib
+                body_ref = data["body"]
+                h = hashlib.sha256(body_ref).hexdigest() if body_ref else None
                 
                 res.append(ScanResult(data["index"], sc, dur, h))
         

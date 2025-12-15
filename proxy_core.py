@@ -6,6 +6,10 @@ Implements a RFC-Compliant Dual-Stack (HTTP/1.1 and HTTP/2) Proxy Handler.
 Refactored for Manager Integration and Scalpel Racer MITM capabilities.
 Includes full logic for recursive TLS upgrading, strict HTTP parsing,
 and defense-in-depth security measures against Request Smuggling and DoS.
+
+[OPTIMIZED] - 64KB Read Chunks
+            - Lazy In-Place Buffer Compaction
+            - Queue Batching for H2
 """
 
 import asyncio
@@ -98,6 +102,10 @@ MAX_CAPTURE_BODY_SIZE = 10 * 1024 * 1024 # 10MB
 STREAM_QUEUE_SIZE = 100
 H2_PREFACE = b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
 GOAWAY_MAX_FRAME = b'\x00\x00\x08\x07\x00\x00\x00\x00\x00\x7f\xff\xff\xff\x00\x00\x00\x00'
+
+#  IO Tuning - Read Chunks
+READ_CHUNK_SIZE = 65536        # 64KB Read Buffer (vs 4KB)
+COMPACTION_THRESHOLD = 16384   # 16KB Threshold for lazy compaction
 
 class StreamContext:
     """Maintains state for a single HTTP/2 stream. Optimized for memory with __slots__."""
@@ -228,7 +236,7 @@ class Http11ProxyHandler(BaseProxyHandler):
         """
         Reads a line strictly terminated by CRLF. 
         Rejects Bare LF to prevent smuggling.
-        Optimization: Uses _buffer_offset to avoid O(N) buffer resizing.
+        Optimization: Uses smart compaction to avoid O(N^2) buffer resizing on large streams.
         """
         while True:
             try:
@@ -242,13 +250,16 @@ class Http11ProxyHandler(BaseProxyHandler):
                 if (len(self.buffer) - self._buffer_offset) > MAX_HEADER_LIST_SIZE:
                     raise ProxyError("Header Line Exceeded Max Length")
                 
-                # Compact buffer if needed before reading more
-                if self._buffer_offset > 4096:
-                     self.buffer = self.buffer[self._buffer_offset:]
+                # Lazy In-Place Compaction
+                # Only compact if wasted space > 16KB AND represents > 50% of the buffer.
+                # 'del' on bytearray is an in-place memmove in CPython, avoiding allocation.
+                if self._buffer_offset > COMPACTION_THRESHOLD and self._buffer_offset > (len(self.buffer) // 2):
+                     del self.buffer[:self._buffer_offset]
                      self._buffer_offset = 0
 
                 try:
-                    data = await asyncio.wait_for(self.reader.read(4096), timeout=IDLE_TIMEOUT)
+                    # Larger chunk size for fewer syscalls
+                    data = await asyncio.wait_for(self.reader.read(READ_CHUNK_SIZE), timeout=IDLE_TIMEOUT)
                 except asyncio.TimeoutError:
                     raise ProxyError("Read Timeout (Idle)")
                 
@@ -278,9 +289,6 @@ class Http11ProxyHandler(BaseProxyHandler):
                 raise ProxyError("Bare LF detected or missing CR. Strict CRLF required")
             
             # Extract line (excluding CR and LF)
-            # If lf_index > self._buffer_offset, then line is self.buffer[self._buffer_offset : lf_index - 1]
-            # If lf_index == self._buffer_offset (rare, immediate newline after CR from prev read), empty string.
-
             if lf_index > self._buffer_offset:
                 line = self.buffer[self._buffer_offset:lf_index - 1]
             else:
@@ -515,26 +523,22 @@ class Http11ProxyHandler(BaseProxyHandler):
     async def _read_bytes(self, n: int) -> bytes:
         while (len(self.buffer) - self._buffer_offset) < n:
             try:
-                data = await asyncio.wait_for(self.reader.read(4096), timeout=IDLE_TIMEOUT)
+                # Larger chunk size for fewer syscalls for performance
+                data = await asyncio.wait_for(self.reader.read(READ_CHUNK_SIZE), timeout=IDLE_TIMEOUT)
             except asyncio.TimeoutError:
                 raise ProxyError("Read Timeout (Idle) in Body")
                 
             if not data: raise ProxyError("Incomplete read")
 
-            # Compact if offset is large before extending
-            if self._buffer_offset > 4096:
-                 self.buffer = self.buffer[self._buffer_offset:]
+            # Lazy In-Place Compaction if needed
+            if self._buffer_offset > COMPACTION_THRESHOLD and self._buffer_offset > (len(self.buffer) // 2):
+                 del self.buffer[:self._buffer_offset]
                  self._buffer_offset = 0
 
             self.buffer.extend(data)
         
         chunk = self.buffer[self._buffer_offset : self._buffer_offset + n]
         self._buffer_offset += n
-
-        # Periodic compaction for memory safety
-        if self._buffer_offset > 4096 and len(self.buffer) > 8192:
-             self.buffer = self.buffer[self._buffer_offset:]
-             self._buffer_offset = 0
 
         return bytes(chunk)
 
@@ -780,89 +784,103 @@ class NativeProxyHandler(BaseProxyHandler):
         """
         while not self.closed.is_set():
             try:
-                item = await queue.get()
-                if item is None: break
+                # Queue Batching Optimization 
+                # Reduces await/loop overhead by grabbing multiple available items
+                items = [await queue.get()]
+                
+                # Drain up to 10 more items if immediately available
+                try:
+                    for _ in range(10):
+                        items.append(queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    pass
 
-                payload, end_stream, ack_length = item
+                for item in items:
+                    if item is None:
+                        # Termination signal received
+                        queue.task_done()
+                        return
 
-                if isinstance(payload, list):
-                    # Headers
-                    conn_data = None
-                    async with h2_lock:
-                        try:
-                            conn.send_headers(stream_id, payload, end_stream=end_stream)
-                            conn_data = conn.data_to_send()
-                        except Exception: break
-                    if conn_data:
-                        async with socket_lock:
-                            try:
-                                writer.write(conn_data)
-                                await writer.drain()
-                            except: break
-                else:
-                    # Data Body
-                    data = payload
-                    view = memoryview(data)
-                    offset = 0
-                    total_len = len(data)
+                    payload, end_stream, ack_length = item
 
-                    while offset < total_len or (total_len == 0 and end_stream):
-                        if self.closed.is_set(): break
-                        chunk_data = None
-                        break_loop = False
-                        
+                    if isinstance(payload, list):
+                        # Headers
+                        conn_data = None
                         async with h2_lock:
                             try:
-                                conn_window = conn.outbound_flow_control_window
-                                stream_window = conn.remote_flow_control_window(stream_id)
-                                available = min(conn_window, stream_window)
-
-                                if available > 0 or (total_len == 0 and end_stream):
-                                    chunk_size = min(total_len - offset, available)
-                                    chunk = view[offset:offset+chunk_size]
-                                    is_last = (offset + chunk_size == total_len) and end_stream
-                                    conn.send_data(stream_id, chunk.tobytes(), end_stream=is_last)
-                                    chunk_data = conn.data_to_send()
-                                    offset += chunk_size
-                                    if offset >= total_len: break_loop = True
-                                else:
-                                    flow_event.clear()
-                            except Exception: break_loop = True
-
-                        if chunk_data:
+                                conn.send_headers(stream_id, payload, end_stream=end_stream)
+                                conn_data = conn.data_to_send()
+                            except Exception: break
+                        if conn_data:
                             async with socket_lock:
                                 try:
-                                    writer.write(chunk_data)
+                                    writer.write(conn_data)
                                     await writer.drain()
                                 except: break
-                        
-                        if break_loop: break
-                        
-                        if not chunk_data and not break_loop:
-                            try: 
-                                await asyncio.wait_for(flow_event.wait(), timeout=FLOW_CONTROL_TIMEOUT)
-                            except (asyncio.TimeoutError, asyncio.CancelledError):
-                                async with h2_lock:
-                                    try: conn.reset_stream(stream_id, ErrorCodes.FLOW_CONTROL_ERROR)
-                                    except: pass
-                                break
+                    else:
+                        # Data Body
+                        data = payload
+                        view = memoryview(data)
+                        offset = 0
+                        total_len = len(data)
 
-                if ack_conn and ack_length > 0:
-                    ack_bytes = None
-                    async with ack_h2_lock:
-                        try:
-                            ack_conn.acknowledge_received_data(ack_length, stream_id)
-                            ack_bytes = ack_conn.data_to_send()
-                        except: pass
-                    if ack_bytes:
-                        async with ack_socket_lock:
+                        while offset < total_len or (total_len == 0 and end_stream):
+                            if self.closed.is_set(): break
+                            chunk_data = None
+                            break_loop = False
+                            
+                            async with h2_lock:
+                                try:
+                                    conn_window = conn.outbound_flow_control_window
+                                    stream_window = conn.remote_flow_control_window(stream_id)
+                                    available = min(conn_window, stream_window)
+
+                                    if available > 0 or (total_len == 0 and end_stream):
+                                        chunk_size = min(total_len - offset, available)
+                                        chunk = view[offset:offset+chunk_size]
+                                        is_last = (offset + chunk_size == total_len) and end_stream
+                                        conn.send_data(stream_id, chunk.tobytes(), end_stream=is_last)
+                                        chunk_data = conn.data_to_send()
+                                        offset += chunk_size
+                                        if offset >= total_len: break_loop = True
+                                    else:
+                                        flow_event.clear()
+                                except Exception: break_loop = True
+
+                            if chunk_data:
+                                async with socket_lock:
+                                    try:
+                                        writer.write(chunk_data)
+                                        await writer.drain()
+                                    except: break
+                            
+                            if break_loop: break
+                            
+                            if not chunk_data and not break_loop:
+                                try: 
+                                    await asyncio.wait_for(flow_event.wait(), timeout=FLOW_CONTROL_TIMEOUT)
+                                except (asyncio.TimeoutError, asyncio.CancelledError):
+                                    async with h2_lock:
+                                        try: conn.reset_stream(stream_id, ErrorCodes.FLOW_CONTROL_ERROR)
+                                        except: pass
+                                    break
+
+                    if ack_conn and ack_length > 0:
+                        ack_bytes = None
+                        async with ack_h2_lock:
                             try:
-                                ack_writer.write(ack_bytes)
-                                await ack_writer.drain()
+                                ack_conn.acknowledge_received_data(ack_length, stream_id)
+                                ack_bytes = ack_conn.data_to_send()
                             except: pass
+                        if ack_bytes:
+                            async with ack_socket_lock:
+                                try:
+                                    ack_writer.write(ack_bytes)
+                                    await ack_writer.drain()
+                                except: pass
 
-                queue.task_done()
-                if end_stream: break
+                    queue.task_done()
+                    if end_stream: return
 
             except Exception as e:
                 self.log("ERROR", f"Stream sender error: {e}")

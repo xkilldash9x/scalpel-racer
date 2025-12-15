@@ -12,6 +12,7 @@ Features:
 - VarInt Decoding
 - Frame Inspection (STREAM, ACK, CRYPTO, HTTP/3 Frames)
 - Robust Error Handling for Malformed Frames
+- Using int.from_bytes and struct.unpack_from for high-speed parsing.
 """
 
 import asyncio
@@ -90,9 +91,11 @@ def decode_varint(data, offset):
     
     if offset + length > len(data): return None, offset
     
-    val = first & 0x3f
-    for i in range(1, length):
-        val = (val << 8) + data[offset + i]
+    # C-speed int.from_bytes instead of a loop
+    # Reads 1, 2, 4, or 8 bytes
+    val = int.from_bytes(data[offset:offset+length], 'big')
+    # Mask out the length prefix bits
+    val &= (1 << (length * 8 - 2)) - 1
     
     return val, offset + length
 
@@ -193,7 +196,7 @@ class QuicFrameParser:
                     
                     frames.append({
                         "type": "STREAM", "id": stream_id, 
-                        "fin": bool(fin_bit), "len": length, "data": stream_data
+                        "fin": bool(fin_bit), "len": length, "data": bytes(stream_data)
                     })
                     continue
                 
@@ -261,6 +264,8 @@ class H3FrameParser:
     """Parses HTTP/3 Frames from a STREAM frame's data."""
     @staticmethod
     def parse(stream_data):
+        # memoryview for high-speed slicing 
+        stream_data = memoryview(stream_data)
         h3_frames = []
         offset = 0
         limit = len(stream_data)
@@ -299,7 +304,7 @@ class H3FrameParser:
                     if error_code is not None:
                         info["error_code"] = error_code
                         # Rest of payload is the reason string
-                        info["reason"] = payload[p_off:].decode('utf-8', errors='replace')
+                        info["reason"] = bytes(payload[p_off:]).decode('utf-8', errors='replace')
 
             elif ftype == H3_FRAME_MAX_PUSH_ID:
                 info["type"] = "MAX_PUSH_ID"
@@ -313,7 +318,7 @@ class H3FrameParser:
 
             elif ftype == H3_FRAME_DATA:
                 info["type"] = "DATA"
-                info["snippet"] = payload[:20]
+                info["snippet"] = bytes(payload[:20])
 
             elif ftype == H3_FRAME_SETTINGS:
                 info["type"] = "SETTINGS"
@@ -353,6 +358,8 @@ class QuicPacketParser:
     """
     
     def parse_packet(self, data):
+        # memoryview 
+        data = memoryview(data)
         if len(data) < 1: return {"error": "Empty"}
         
         first = data[0]
@@ -373,7 +380,8 @@ class QuicPacketParser:
             info["type"] = type_map.get(p_type, "Unknown")
             
             offset += 1
-            version = struct.unpack("!I", data[offset:offset+4])[0]
+            # unpack_from avoids string slicing for headers > 2 bytes
+            version = struct.unpack_from("!I", data, offset)[0]
             info["version"] = hex(version)
             offset += 4
 
@@ -470,22 +478,23 @@ class ProxyManager:
         else:
             src_str = str(source)
 
+        # Logging Guards to avoid expensive string formatting if not needed
         if protocol == "QUIC":
-            # Formatted RFC 9000 Log
-            # [FIXED] Resilience against non-dict data and missing keys
-            if isinstance(data, dict):
-                msg = f"Type: {data.get('type', 'UNK'):<10} | Ver: {data.get('version','N/A')} | DCID: {data.get('dcid','N/A')}"
-                if 'payload_len' in data:
-                    msg += f" | Len: {data['payload_len']}"
-            else:
-                msg = str(data)
-            log.info(f"[QUIC] {src_str} -> {msg}")
+            if log.isEnabledFor(logging.INFO):
+                # Formatted RFC 9000 Log
+                if isinstance(data, dict):
+                    msg = f"Type: {data.get('type', 'UNK'):<10} | Ver: {data.get('version','N/A')} | DCID: {data.get('dcid','N/A')}"
+                    if 'payload_len' in data:
+                        msg += f" | Len: {data['payload_len']}"
+                else:
+                    msg = str(data)
+                log.info(f"[QUIC] {src_str} -> {msg}")
             
         elif protocol == "CAPTURE":
-            # data contains the CapturedRequest object
-            req = data 
-            if req:
-                log.info(f"[{req.protocol}] {req.method} {req.url} (Body: {len(req.body)} bytes)")
+            if log.isEnabledFor(logging.INFO):
+                req = data 
+                if req:
+                    log.info(f"[{req.protocol}] {req.method} {req.url} (Body: {len(req.body)} bytes)")
 
         elif protocol == "SYSTEM":
             log.info(f"[SYSTEM] {src_str}")

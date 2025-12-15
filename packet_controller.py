@@ -3,6 +3,8 @@
 Implements the PacketController for the 'First Sequence Sync' strategy.
 Uses Linux NetfilterQueue to hold the first packet of a burst.
 Refined: High-performance raw packet parsing (no Scapy) and improved accuracy (no PSH flag reliance).
+[OPTIMIZED] - Pre-compiled structs
+            - unpack_from
 """
 
 import os
@@ -28,6 +30,10 @@ if sys.platform.startswith("linux"):
 # Constants
 REORDER_DELAY = 0.010  # 10ms
 QUEUE_NUM = 99
+
+# Pre-compile struct formats
+_STRUCT_H = struct.Struct("!H")
+_STRUCT_I = struct.Struct("!I")
 
 class PacketController:
     """
@@ -219,7 +225,8 @@ class PacketController:
                 return
 
             # Total Length is at Bytes 2-3
-            total_len = struct.unpack("!H", raw_data[2:4])[0]
+            # Use pre-compiled struct with unpack_from
+            total_len = _STRUCT_H.unpack_from(raw_data, 2)[0]
 
             # --- 2. Parse TCP Header ---
             tcp_header_start = ihl
@@ -228,7 +235,8 @@ class PacketController:
                 return
 
             # Sequence Number: Bytes 4-7 relative to TCP start
-            seq = struct.unpack("!I", raw_data[tcp_header_start + 4 : tcp_header_start + 8])[0]
+            # Use pre-compiled struct with unpack_from
+            seq = _STRUCT_I.unpack_from(raw_data, tcp_header_start + 4)[0]
             
             # Data Offset: Byte 12, high 4 bits (in 32-bit words)
             data_offset_byte = raw_data[tcp_header_start + 12]
@@ -298,4 +306,3 @@ class PacketController:
                 self.first_packet_held.clear()
                 self.subsequent_packets_released.clear()
                 self.expected_next_seq = None
-                

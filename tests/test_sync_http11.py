@@ -55,8 +55,11 @@ class TestHTTP11SyncEngine:
         
         assert sock == mock_ssl_sock
         mock_create_conn.assert_called_with(("1.2.3.4", 443), timeout=ANY)
+        
         # Verify Nagle disabled (Precision Requirement)
-        mock_raw_sock.setsockopt.assert_called_with(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # Using assert_any_call because SO_SNDBUF is called afterwards
+        mock_raw_sock.setsockopt.assert_any_call(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        
         # Verify ALPN (Protocol Requirement)
         mock_ssl_ctx.return_value.set_alpn_protocols.assert_called_with(["http/1.1"])
 
