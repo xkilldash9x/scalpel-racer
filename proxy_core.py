@@ -1,7 +1,8 @@
 # proxy_core.py
 
 """
-Implements a RFC-Compliant Dual-Stack (HTTP/1.1 and HTTP/2) Proxy Handler.
+[VECTOR] ASYNC PROXY CORE - SCALPEL RACER
+RFC-Compliant Dual-Stack (HTTP/1.1 and HTTP/2) Proxy Handler.
 
 Refactored for Manager Integration and Scalpel Racer MITM capabilities.
 Includes full logic for recursive TLS upgrading, strict HTTP parsing,
@@ -11,6 +12,7 @@ VECTOR OPTIMIZATIONS:
 - IO: TCP_NODELAY enabled on upstream sockets.
 - MEMORY: MemoryView slicing in strict line reader to avoid copying.
 - IO: 64KB Read Chunks.
+- MEMORY: __slots__ usage for high-frequency objects.
 """
 
 import asyncio
@@ -110,7 +112,10 @@ READ_CHUNK_SIZE = 65536        # 64KB Read Buffer (vs 4KB)
 COMPACTION_THRESHOLD = 16384   # 16KB Threshold for lazy compaction
 
 class StreamContext:
-    """Maintains state for a single HTTP/2 stream. Optimized for memory with __slots__."""
+    """
+    Maintains state for a single HTTP/2 stream. 
+    Optimized for memory with __slots__ to handle high concurrency.
+    """
     __slots__ = (
         'stream_id', 'scheme', 'downstream_closed', 'upstream_closed',
         'upstream_flow_event', 'downstream_flow_event',
@@ -123,12 +128,17 @@ class StreamContext:
         self.scheme = scheme
         self.downstream_closed = False
         self.upstream_closed = False
+        
+        # Flow control events - Start set to True (open)
         self.upstream_flow_event = asyncio.Event()
         self.downstream_flow_event = asyncio.Event()
         self.upstream_flow_event.set()
         self.downstream_flow_event.set()
+        
+        # Queues for passing data between reader/writer loops
         self.upstream_queue = asyncio.Queue(maxsize=STREAM_QUEUE_SIZE)
         self.downstream_queue = asyncio.Queue(maxsize=STREAM_QUEUE_SIZE)
+        
         self.sender_tasks: List[asyncio.Task] = []
         self.captured_headers = {"pseudo": {}, "headers": []}
         self.request_body = bytearray()
@@ -145,6 +155,12 @@ class PayloadTooLargeError(ProxyError):
 
 class BaseProxyHandler:
     """Shared logic for Upstream Connection and Logging."""
+    
+    __slots__ = (
+        'explicit_host', 'upstream_verify_ssl', 'upstream_ca_bundle', 
+        'callback', 'ssl_context_factory', 'upstream_host', 'upstream_port'
+    )
+
     def __init__(self, explicit_host: str, upstream_verify_ssl: bool, 
                  upstream_ca_bundle: Optional[str], manager_callback: Callable,
                  ssl_context_factory: Optional[Callable] = None):
@@ -166,7 +182,7 @@ class BaseProxyHandler:
     def _parse_target(self, explicit_host: str, default_port: int = 443) -> Tuple[str, int]:
         """
         Robust parsing of host:port strings, handling IPv6 brackets.
-        Now accepts a dynamic default_port based on scheme (80 vs 443).
+        Accepts a dynamic default_port based on scheme (80 vs 443).
         """
         if not explicit_host:
             return "", 0
@@ -238,10 +254,18 @@ class Http11ProxyHandler(BaseProxyHandler):
     - CONNECT tunneling with optional MITM.
     - Security checks for Request Smuggling (CL.TE conflicts).
     """
+    
+    __slots__ = (
+        'reader', 'writer', 'target_override', 'scope_pattern', 
+        'buffer', '_buffer_offset', 'enable_tunneling', 
+        'strict_mode', '_previous_byte_was_cr'
+    )
+
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, 
                  explicit_host: str, manager_callback, target_override, scope_pattern,
                  upstream_verify_ssl=False, upstream_ca_bundle=None, initial_data=b"",
-                 ssl_context_factory=None, enable_tunneling=True):
+                 ssl_context_factory=None, enable_tunneling=True, strict_mode=True):
+        
         super().__init__(explicit_host, upstream_verify_ssl, upstream_ca_bundle, manager_callback, ssl_context_factory)
         self.reader = reader
         self.writer = writer
@@ -250,6 +274,7 @@ class Http11ProxyHandler(BaseProxyHandler):
         self.buffer = bytearray(initial_data)
         self._buffer_offset = 0 # Offset for consumed bytes
         self.enable_tunneling = enable_tunneling
+        self.strict_mode = strict_mode
         self._previous_byte_was_cr = False
 
     async def _read_strict_line(self) -> bytes:
@@ -382,12 +407,16 @@ class Http11ProxyHandler(BaseProxyHandler):
                 
                 if te_header:
                     # RFC 7230 Section 3.3.3: If both present, TE overrides. 
-                    # Security: Remove CL to avoid ambiguity downstream.
                     if cl_header:
-                        self.log("WARN", "Ambiguous Request: CL and TE both present. Stripping CL.")
-                        headers = [h for h in headers if h[0].lower() != 'content-length']
-                        if 'content-length' in headers_dict:
-                             del headers_dict['content-length']
+                        if self.strict_mode:
+                            # Security: Remove CL to avoid ambiguity downstream (Safe Mode)
+                            self.log("WARN", "Ambiguous Request: CL and TE both present. Stripping CL (Strict Mode).")
+                            headers = [h for h in headers if h[0].lower() != 'content-length']
+                            if 'content-length' in headers_dict:
+                                del headers_dict['content-length']
+                        else:
+                            # Attack Mode: Forward both to test downstream Desync
+                            self.log("WARN", "Ambiguous Request: CL and TE both present. Forwarding both (Strict Mode OFF).")
                     
                     encodings = [e.strip().lower() for e in te_header.split(',')]
                     if 'chunked' in encodings and encodings[-1] != 'chunked':
@@ -608,7 +637,8 @@ class Http11ProxyHandler(BaseProxyHandler):
                     enable_tunneling=self.enable_tunneling,
                     upstream_verify_ssl=self.upstream_verify_ssl,
                     upstream_ca_bundle=self.upstream_ca_bundle,
-                    ssl_context_factory=self.ssl_context_factory
+                    ssl_context_factory=self.ssl_context_factory,
+                    strict_mode=self.strict_mode # Propagate flag
                 )
                 await handler.run()
                 return
@@ -632,22 +662,44 @@ class Http11ProxyHandler(BaseProxyHandler):
         except Exception:
             await self._send_error(502, "Bad Gateway")
 
+    async def _send_error(self, code, message):
+        try:
+            self.writer.write(f"HTTP/1.1 {code} {message}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".encode())
+            await self.writer.drain()
+        except Exception as e:
+            # [LOGGING FIX] Log this as debug, often just means client went away
+            self.log("DEBUG", f"Failed to send error {code} to client: {e}")
+
     async def _pipe(self, r, w, flush_buffer=False):
+        """
+        Pipes data between streams.
+        [LOGGING FIX] Now reports why a pipe broke.
+        """
         try:
             if flush_buffer and (len(self.buffer) - self._buffer_offset) > 0:
                 w.write(self.buffer[self._buffer_offset:])
                 await w.drain()
                 self._buffer_offset = 0
                 del self.buffer[:]
+            
             while not r.at_eof():
                 data = await r.read(65536)
                 if not data: break
                 w.write(data)
                 await w.drain()
-        except: pass
+                
+        except (ConnectionResetError, BrokenPipeError):
+            # Normal connection termination, usually verbose/debug only
+            pass 
+        except Exception as e:
+            # Actual unexpected errors
+            self.log("ERROR", f"Pipe transfer error: {e}")
         finally:
-            try: w.close(); await w.wait_closed()
-            except: pass
+            try: 
+                w.close()
+                await w.wait_closed()
+            except Exception: 
+                pass
 
     def _record_capture(self, method, path, headers, body, scheme, authority):
         if self.target_override:
@@ -671,6 +723,15 @@ class NativeProxyHandler(BaseProxyHandler):
     Manages complex state machinery for H2 frames, streams, and flow control.
     Supports Tunneling, Capture, and MITM.
     """
+    
+    __slots__ = (
+        'client_reader', 'client_writer', 'target_override', 'scope_pattern',
+        'enable_tunneling', 'initial_data', 'upstream_reader', 'upstream_writer',
+        'upstream_scheme', 'ds_h2_lock', 'us_h2_lock', 'ds_socket_lock',
+        'us_socket_lock', 'downstream_conn', 'upstream_conn', 'streams',
+        'closed', 'draining'
+    )
+
     def __init__(self, client_reader, client_writer, explicit_host, manager_callback, 
                  target_override, scope_pattern, enable_tunneling=True, 
                  upstream_verify_ssl=False, upstream_ca_bundle=None, initial_data=b"",
@@ -1260,13 +1321,20 @@ class NativeProxyHandler(BaseProxyHandler):
             del self.streams[stream_id]
 
 class DualProtocolHandler:
+    __slots__ = (
+        'reader', 'writer', 'explicit_host', 'callback', 'target_override',
+        'scope_pattern', 'enable_tunneling', 'upstream_verify_ssl',
+        'upstream_ca_bundle', 'ssl_context_factory', 'strict_mode'
+    )
+
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, 
                  explicit_host: str, manager_callback: Callable, 
                  target_override: Optional[str], scope_pattern: Optional[Any],
                  enable_tunneling: bool = True,
                  upstream_verify_ssl: bool = False,
                  upstream_ca_bundle: Optional[str] = None,
-                 ssl_context_factory: Optional[Callable] = None):
+                 ssl_context_factory: Optional[Callable] = None,
+                 strict_mode: bool = True):
         
         self.reader = reader
         self.writer = writer
@@ -1278,6 +1346,7 @@ class DualProtocolHandler:
         self.upstream_verify_ssl = upstream_verify_ssl
         self.upstream_ca_bundle = upstream_ca_bundle
         self.ssl_context_factory = ssl_context_factory
+        self.strict_mode = strict_mode
 
     async def run(self):
         protocol, initial_data = await self._detect_protocol()
@@ -1298,7 +1367,8 @@ class DualProtocolHandler:
                 self.upstream_verify_ssl, self.upstream_ca_bundle,
                 initial_data=initial_data,
                 ssl_context_factory=self.ssl_context_factory,
-                enable_tunneling=self.enable_tunneling
+                enable_tunneling=self.enable_tunneling,
+                strict_mode=self.strict_mode
             )
         await handler.run()
 
@@ -1322,12 +1392,13 @@ class DualProtocolHandler:
         except Exception as e:
             return "http/1.1", b""
 
-async def start_proxy_server(host, port, manager_callback, target_override=None, scope_pattern=None, ssl_context_factory=None):
+async def start_proxy_server(host, port, manager_callback, target_override=None, scope_pattern=None, ssl_context_factory=None, strict_mode=True):
     async def _handle_client(reader, writer):
         handler = DualProtocolHandler(
             reader, writer, explicit_host="", manager_callback=manager_callback,
             target_override=target_override, scope_pattern=scope_pattern,
-            ssl_context_factory=ssl_context_factory
+            ssl_context_factory=ssl_context_factory,
+            strict_mode=strict_mode
         )
         await handler.run()
 
@@ -1341,3 +1412,5 @@ async def start_proxy_server(host, port, manager_callback, target_override=None,
             pass
         finally:
             manager_callback("SYSTEM", "TCP (H1/H2) Proxy stopped")
+            server.close()
+            await server.wait_closed()

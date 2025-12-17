@@ -1,12 +1,33 @@
 # structures.py
 """
-Data structures and constants for the Scalpel Racer application.
+[VECTOR] CORE DATA STRUCTURES
+Single Source of Truth.
+Optimized for memory efficiency (__slots__) and rapid serialization.
 Standardized for integration across the Proxy Manager, Core, and Race Engines.
-[Security] Includes sensitive header redaction for log sanitization.
-[VECTOR OPTIMIZED] Uses __slots__ for memory efficiency in high-volume objects.
 """
 
 from typing import Dict, List, Tuple, Optional, Any, TypedDict
+
+# --- Constants ---
+MAX_RESPONSE_BODY_READ = 1024 * 1024  # 1MB limit for response analysis
+SYNC_MARKER = b"{{SYNC}}"             # Marker for splitting payloads
+
+# RFC 9113: Headers to strip during forwarding
+# [OPTIMIZED] Changed to set for O(1) lookup
+HOP_BY_HOP_HEADERS = {
+    'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+    'te', 'trailers', 'transfer-encoding', 'upgrade', 'host', 
+    'accept-encoding', 'upgrade-insecure-requests', 'proxy-connection', 
+    'content-length', 'http2-settings'
+}
+
+# OpSec: Headers to redact in UI logs
+SENSITIVE_HEADERS = {
+    'authorization', 'proxy-authorization', 'cookie', 'set-cookie', 
+    'x-auth-token', 'x-api-key', 'access_token', 'authentication', 'bearer'
+}
+
+# --- Types ---
 
 class CapturedHeaders(TypedDict):
     """
@@ -15,50 +36,16 @@ class CapturedHeaders(TypedDict):
     pseudo: Dict[str, str]
     headers: List[Tuple[str, str]]
 
-# --- Constants ---
-MAX_RESPONSE_BODY_READ = 1024 * 1024  # 1MB max read for analysis
-SYNC_MARKER = b"{{SYNC}}"
-
-# RFC 9113 Section 8.2.2: Connection-Specific Header Fields 
-# These must be stripped during HTTP/2 forwarding.
-HOP_BY_HOP_HEADERS = [
-    'connection', 
-    'keep-alive', 
-    'proxy-authenticate', 
-    'proxy-authorization',
-    'te', 
-    'trailers', 
-    'transfer-encoding', 
-    'upgrade',
-    'host', 
-    'accept-encoding', 
-    'upgrade-insecure-requests',
-    'proxy-connection', 
-    'content-length', 
-    'http2-settings'
-]
-
-# Sensitive headers that should be redacted in logs
-SENSITIVE_HEADERS = {
-    'authorization', 
-    'proxy-authorization', 
-    'cookie', 
-    'set-cookie', 
-    'x-auth-token',
-    'x-api-key',
-    'access_token'
-}
-
-# --- Data Structures ---
-
 class ScanResult:
     """
-    Represents the result of a single race attempt (probe).
-    [VECTOR] Optimized: __slots__ reduces memory usage by avoiding __dict__.
+    Result of a single probe within a race batch.
+    [VECTOR] Optimized: __slots__ reduces memory usage.
     """
     __slots__ = ('index', 'status_code', 'duration', 'body_hash', 'body_snippet', 'error')
     
-    def __init__(self, index: int, status_code: int, duration: float, body_hash: Optional[str] = None, body_snippet: Optional[str] = None, error: Optional[str] = None):
+    def __init__(self, index: int, status_code: int, duration: float, 
+                 body_hash: Optional[str] = None, body_snippet: Optional[str] = None, 
+                 error: Optional[str] = None):
         self.index = index
         self.status_code = status_code
         self.duration = duration
@@ -77,15 +64,26 @@ class ScanResult:
             'error': self.error
         }
 
+    def __repr__(self):
+        return f"<ScanResult #{self.index} Status:{self.status_code}>"
+
 class CapturedRequest:
     """
-    Represents a captured HTTP request.
-    Shared definition for proxy_core and scalpel_racer.
+    Standardized request object. 
+    Used by Proxy to capture, and Race Engines to replay.
     [VECTOR] Optimized: __slots__ significantly lowers instantiation overhead.
     """
     __slots__ = ('id', 'method', 'url', 'headers', 'body', 'truncated', 'protocol', 'edited_body')
     
-    def __init__(self, id: int, method: str, url: str, headers: List[Tuple[str, str]], body: bytes, truncated: bool = False, protocol: str = "HTTP/1.1", edited_body: Optional[bytes] = None):
+    def __init__(self, 
+                 id: int, 
+                 method: str, 
+                 url: str, 
+                 headers: List[Tuple[str, str]], 
+                 body: bytes, 
+                 truncated: bool = False, 
+                 protocol: str = "HTTP/1.1", 
+                 edited_body: Optional[bytes] = None):
         self.id = id
         self.method = method
         self.url = url
@@ -96,12 +94,24 @@ class CapturedRequest:
         self.edited_body = edited_body
 
     def get_attack_payload(self) -> bytes:
-        """Returns the edited body if available, otherwise the original captured body."""
+        """Returns the edited body if it exists, else the captured body."""
         return self.edited_body if self.edited_body is not None else self.body
 
     def headers_dict(self) -> Dict[str, str]:
         """Returns headers as a dictionary (lossy for duplicate keys).""" 
         return dict(self.headers)
+
+    def display_str(self) -> str:
+        """Sanitized string for CLI display."""
+        body_len = len(self.get_attack_payload())
+        edit_flag = "[E]" if self.edited_body is not None else ""
+        trunc_flag = " [T]" if self.truncated else ""
+        
+        clean_url = self.url
+        if len(clean_url) > 60:
+            clean_url = clean_url[:57] + "..."
+            
+        return f"[{self.protocol}] {self.method:<6} {clean_url} ({body_len}b){edit_flag}{trunc_flag}"
 
     def _get_redacted_headers(self) -> str:
         """Returns a string representation of headers with sensitive values masked."""
@@ -113,21 +123,12 @@ class CapturedRequest:
                 lines.append(f"{k}: {v}")
         return ", ".join(lines)
 
-    def __str__(self) -> str:
-        """CLI-friendly string representation with security redaction."""
-        body_len = len(self.get_attack_payload())
-        edited_flag = "[E]" if self.edited_body is not None else ""
-        
-        # Truncate URL for display
-        display_url = self.url if len(self.url) < 70 else self.url[:67] + "..."
-        trunc_flag = " [T]" if self.truncated else ""
-        
-        # We don't print full headers in the one-line summary
-        return f"{self.id:<5} {self.protocol:<8} {self.method:<7} {display_url} ({body_len} bytes){edited_flag}{trunc_flag}"
-    
     def detailed_str(self) -> str:
         """Detailed string representation with full headers and body."""
-        return f"{self.__str__()}\n\nHeaders: {self._get_redacted_headers()}\nBody: {self.get_attack_payload().decode('utf-8', 'ignore')}"
+        return f"{self.display_str()}\n\nHeaders: {self._get_redacted_headers()}\nBody: {self.get_attack_payload().decode('utf-8', 'ignore')}"
+
+    def __str__(self) -> str:
+        return self.display_str()
 
     def to_dict(self) -> Dict[str, Any]:
         """Converts the request to a dictionary format for logging or storage."""
@@ -136,12 +137,13 @@ class CapturedRequest:
             'method': self.method,
             'url': self.url,
             'headers': self.headers_dict(),
-            # Decode for JSON serialization
             'body': self.get_attack_payload().decode('utf-8', 'ignore'),
             'truncated': self.truncated,
             'protocol': self.protocol,
             'edited_body': self.edited_body.decode('utf-8', 'ignore') if self.edited_body else None
         }
+
+# --- Preserved Data Structures (From Original Source) ---
 
 class RaceResult:
     """
@@ -190,7 +192,6 @@ class RaceResult:
             'final_duration': self.final_duration,
             'final_protocol': self.final_protocol,
             'final_headers': self.final_headers,
-            # We skip full body serialization for RaceResult in summaries as it can be large
             'final_truncated': self.final_truncated,
             'error': self.final_error
         }

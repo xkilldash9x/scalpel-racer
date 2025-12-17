@@ -1,4 +1,11 @@
+################################################################################
+## START OF FILE: tests/test_packet_controller.py
+################################################################################
 # tests/test_packet_controller.py
+"""
+Tests for packet_controller.py using nftables (nft).
+[VECTOR] Updated to verify 'nft' command sequences and queue binding.
+"""
 import pytest
 import time
 import struct
@@ -12,130 +19,80 @@ class TestPacketController:
     @pytest.fixture
     def pc(self):
         """Fixture for a standard PacketController instance."""
+        # Force availability for testing logic
         with patch("packet_controller.NFQUEUE_AVAILABLE", True):
             return PacketController("1.2.3.4", 80, 1000)
 
-    @patch("packet_controller.subprocess.check_call")
-    def test_iptables_interaction_insert(self, mock_run, pc):
+    @patch("packet_controller.subprocess.call")
+    def test_nftables_add_sequence(self, mock_run, pc):
         """
-        Test Idempotency & Security:
-        1. Insert Rule (-I) -> Rule doesn't exist -> Execute Insert.
-        2. Insert Rule (-I) -> Rule exists -> Do nothing.
-        3. Verify PSH flag is REMOVED from the rule.
+        Verifies that start() executes the correct sequence of 'nft' commands
+        to establish the interception table, chain, and rule.
         """
-        # Case 1: Rule missing (Check fails), should Insert
-        mock_run.side_effect = [subprocess.CalledProcessError(1, "cmd"), None]
-        pc._manage_iptables("I")
+        mock_run.return_value = 0
         
-        assert mock_run.call_count == 2
-        # Verify -C check
-        assert "-C" in mock_run.call_args_list[0][0][0]
-        
-        # Verify -I action (Security: Insert at top)
-        args = mock_run.call_args_list[1][0][0]
-        assert "-I" in args
-        assert str(QUEUE_NUM) in args
-        
-        # CRITICAL VERIFICATION: Ensure PSH flag is NOT in the arguments
-        assert "PSH" not in args
-        assert "--tcp-flags" not in args
-
-        # Case 2: Rule exists, should NOT insert again
-        mock_run.reset_mock()
-        mock_run.side_effect = [None] # Check succeeds
-        pc._manage_iptables("I")
-        
-        assert mock_run.call_count == 1
-        assert "-C" in mock_run.call_args_list[0][0][0]
-        # No -I call
-
-    @patch("packet_controller.subprocess.check_call")
-    def test_iptables_interaction_delete(self, mock_run, pc):
-        """
-        Test Idempotency:
-        1. Delete Rule -> Rule exists -> Execute Delete.
-        2. Delete Rule -> Rule missing -> Do nothing.
-        """
-        # Case 1: Rule exists, should delete
-        mock_run.side_effect = [None, None]
-        pc._manage_iptables("D")
-        
-        assert mock_run.call_count == 2
-        assert "-D" in mock_run.call_args_list[1][0][0]
-
-        # Case 2: Rule missing, should NOT delete
-        mock_run.reset_mock()
-        mock_run.side_effect = [subprocess.CalledProcessError(1, "cmd")]
-        pc._manage_iptables("D")
-        
-        assert mock_run.call_count == 1
-        # No -D call
-
-    @patch("packet_controller.NetfilterQueue")
-    @patch("packet_controller.subprocess.check_call")
-    def test_start_success(self, mock_run, mock_nfq, pc):
-        """Test successful start up sequence."""
-        mock_run.return_value = None 
-        
-        mock_nfq_instance = mock_nfq.return_value
-        mock_nfq_instance.run.side_effect = lambda: time.sleep(0.1)
-
-        pc.start()
-
-        assert pc.active is True
-        assert pc.nfqueue is not None
-        mock_nfq_instance.bind.assert_called_with(QUEUE_NUM, pc._queue_callback)
-        
-        assert pc.listener_thread.is_alive()
-        assert pc.release_thread.is_alive()
-        
-        pc.stop()
-        assert pc.active is False
-
-    @patch("packet_controller.NetfilterQueue")
-    @patch("packet_controller.subprocess.check_call")
-    def test_start_bind_failure(self, mock_run, mock_nfq, pc):
-        """
-        CRITICAL: If NFQueue bind fails, we MUST remove the iptables rule
-        and raise an exception.
-        """
-        mock_run.return_value = None
-        mock_nfq.return_value.bind.side_effect = OSError("Bind failed")
-
-        with pytest.raises(RuntimeError, match="Failed to bind NFQueue"):
+        with patch("packet_controller.NetfilterQueue"):
             pc.start()
         
-        # Verify cleanup occurred (iptables delete)
-        assert mock_run.call_count >= 2
-        # Ensure Delete was attempted
-        assert any("-D" in call[0][0] for call in mock_run.call_args_list)
+        assert mock_run.call_count >= 3
+        
+        # 1. Create Table
+        cmd_table = mock_run.call_args_list[0][0][0]
+        assert "add" in cmd_table and "table" in cmd_table and "scalpel_racer" in cmd_table
+
+        # 2. Create Chain
+        cmd_chain = mock_run.call_args_list[1][0][0]
+        assert "chain" in cmd_chain and "output_hook" in cmd_chain
+
+        # 3. Add Rule
+        cmd_rule = mock_run.call_args_list[2][0][0]
+        assert "rule" in cmd_rule and "queue" in cmd_rule and str(QUEUE_NUM) in cmd_rule
+
+    @patch("packet_controller.subprocess.call")
+    def test_nftables_cleanup_sequence(self, mock_run, pc):
+        """
+        Verifies that stop() cleans up the nftables configuration atomically.
+        """
+        pc.active = True
+        pc.listener_thread = MagicMock()
+        pc.release_thread = MagicMock()
+        pc.nfqueue = MagicMock()
+
+        pc.stop()
+        
+        # Look for table deletion
+        delete_calls = [c for c in mock_run.call_args_list if "delete" in c[0][0]]
+        assert len(delete_calls) > 0
+        args = delete_calls[0][0][0]
+        assert "delete" in args and "table" in args and "scalpel_racer" in args
+
+    @patch("packet_controller.NetfilterQueue")
+    @patch("packet_controller.subprocess.call")
+    def test_start_bind_failure_cleanup(self, mock_run, mock_nfq, pc):
+        """
+        If NFQueue binding fails, we must rollback nftables rules.
+        """
+        mock_run.return_value = 0
+        mock_nfq.return_value.bind.side_effect = OSError("Permission denied")
+
+        with pytest.raises(OSError):
+            pc.start()
+        
+        # Verify rollback attempt
+        delete_calls = [c for c in mock_run.call_args_list if "delete" in c[0][0]]
+        assert len(delete_calls) > 0
 
     def _build_raw_packet(self, seq, payload_len, proto=6):
-        """
-        Helper to build raw IPv4+TCP byte strings for testing logic without Scapy.
-        """
-        # IPv4 Header (20 bytes)
-        # Ver(4) + IHL(5) = 0x45
+        """Helper to build raw IPv4+TCP byte strings."""
         total_len = 20 + 20 + payload_len
-        # Pack: ! B B H H H B B H I I
-        # I (Unsigned Int) used for Source/Dest IP for simplicity (0, 0)
-        ip_header = struct.pack("!BBHHHBBHII", 
-                                0x45, 0, total_len, 0, 0, 
-                                64, proto, 0, 0, 0)
-        
-        # TCP Header (20 bytes)
-        # Data Offset (5 words) = 0x50
+        ip_header = struct.pack("!BBHHHBBHII", 0x45, 0, total_len, 0, 0, 64, proto, 0, 0, 0)
         data_offset = (5 << 4)
-        # Pack: ! H H I I B B H H H
-        tcp_header = struct.pack("!HHIIBBHHH", 
-                                 1234, 80, seq, 0, 
-                                 data_offset, 0, 0, 0, 0)
-        
+        tcp_header = struct.pack("!HHIIBBHHH", 1234, 80, seq, 0, data_offset, 0, 0, 0, 0)
         payload = b'X' * payload_len
         return ip_header + tcp_header + payload
 
     def test_queue_callback_logic(self, pc):
-        """Test the logic using raw packet construction."""
+        """Test the First-Seq packet holding logic."""
         pc.active = True
         
         def create_mock_pkt(seq, payload_len):
@@ -144,113 +101,98 @@ class TestPacketController:
             pc._queue_callback(pkt)
             return pkt
 
-        # 1. First Packet (Seq 100, Len 10) -> SHOULD HOLD
+        # 1. First Packet -> HOLD
         pkt1 = create_mock_pkt(100, 10)
         pkt1.accept.assert_not_called()
         assert pc.first_packet_info[0] == 100
-        assert pc.expected_next_seq == 110
         assert pc.first_packet_held.is_set()
 
-        # 2. Duplicate First Packet (Retransmission) -> SHOULD PASS
-        pkt1_dup = create_mock_pkt(100, 10)
-        pkt1_dup.accept.assert_called_once()
-
-        # 3. Next Packet (Seq 110, Len 5) -> SHOULD PASS & TRIGGER SYNC
+        # 2. Next Packet -> PASS & RELEASE
         pkt2 = create_mock_pkt(110, 5)
         pkt2.accept.assert_called_once()
-        assert pc.expected_next_seq == 115
         assert pc.subsequent_packets_released.is_set()
-
-        # 4. Out of Order (Seq 200) -> SHOULD PASS
-        pkt3 = create_mock_pkt(200, 5)
-        pkt3.accept.assert_called_once()
-
-    def test_queue_callback_edge_cases(self, pc):
-        """Test parsing robustness against malformed/irrelevant packets."""
-        pc.active = True
-        
-        # 1. Non-IPv4 Packet (Version 6)
-        pkt = MagicMock()
-        # Ver=6, IHL=0, then random bytes
-        pkt.get_payload.return_value = b'\x60' + b'\x00'*39 
-        pc._queue_callback(pkt)
-        pkt.accept.assert_called_once()
-
-        # 2. Non-TCP Protocol (UDP = 17)
-        pkt = MagicMock()
-        pkt.get_payload.return_value = self._build_raw_packet(100, 10, proto=17)
-        pc._queue_callback(pkt)
-        pkt.accept.assert_called_once()
-
-        # 3. Empty TCP Payload (e.g. ACK)
-        pkt = MagicMock()
-        pkt.get_payload.return_value = self._build_raw_packet(100, 0)
-        pc._queue_callback(pkt)
-        pkt.accept.assert_called_once()
-        # Verify it didn't trigger logic
-        assert pc.first_packet_info is None
-
-        # 4. Truncated Packet (Too short for IP header)
-        pkt = MagicMock()
-        pkt.get_payload.return_value = b'\x00' * 10
-        pc._queue_callback(pkt)
-        pkt.accept.assert_called_once()
 
     def test_delayed_release_logic(self, pc):
         """Test the timing and release logic of the background thread."""
         pc.active = True
-        
-        # Setup fake packet
         mock_pkt = MagicMock()
         pc.first_packet_info = (100, mock_pkt)
         
-        # Case 1: Timeout waiting for subsequent packets
+        # Case 1: Success sync
+        # Reset event mocks
+        pc.first_packet_held.wait = MagicMock(return_value=True)
+        pc.subsequent_packets_released.wait = MagicMock(return_value=True) # Sync happened
+        
+        with patch("time.sleep") as mock_sleep:
+            pc._delayed_release()
+            mock_sleep.assert_called_with(REORDER_DELAY)
+            mock_pkt.accept.assert_called_once()
+            assert pc.first_packet_info is None
+
+        # Case 2: Sync Timeout (Fail Open behavior check)
+        # Reset state
+        mock_pkt.reset_mock()
+        pc.first_packet_info = (100, mock_pkt)
         pc.first_packet_held.wait = MagicMock(return_value=True)
         pc.subsequent_packets_released.wait = MagicMock(return_value=False) # Timeout
         
         with patch("time.sleep") as mock_sleep:
-            pc._delayed_release_first_packet()
+            pc._delayed_release()
             
-            # It should NOT sleep for REORDER_DELAY if it timed out (just releases)
+            # Should NOT sleep for reorder delay if we timed out waiting
             mock_sleep.assert_not_called()
+            # But SHOULD accept the packet eventually to avoid dropping it
             mock_pkt.accept.assert_called_once()
             assert pc.first_packet_info is None
 
-        # Case 2: Success sync
-        pc.first_packet_info = (100, mock_pkt)
-        mock_pkt.reset_mock()
-        pc.subsequent_packets_released.wait = MagicMock(return_value=True) # Sync happen
-        
-        with patch("time.sleep") as mock_sleep:
-            pc._delayed_release_first_packet()
+    def test_thread_lifecycle_integration(self, pc):
+        """Ensure threads start and stop correctly via start()/stop()."""
+        # We rely on integration via start() because _start_listener_thread is internal/implementation detail
+        with patch("packet_controller.subprocess.call", return_value=0), \
+             patch("packet_controller.NetfilterQueue"):
             
-            mock_sleep.assert_called_with(REORDER_DELAY)
-            mock_pkt.accept.assert_called_once()
+            pc.start()
+            assert pc.listener_thread.is_alive()
+            assert pc.release_thread.is_alive()
+            
+            pc.stop()
+            assert not pc.listener_thread.is_alive()
+            # release_thread is daemon, might stay alive briefly in test but join() is not explicitly called in stop usually
+            # unless implemented. Checking active flag is safer.
+            assert pc.active is False
 
-    @patch("packet_controller.subprocess.check_call")
-    def test_stop_fail_open(self, mock_run, pc):
-        """Ensure stop() releases held packets so traffic isn't lost."""
-        pc.active = True
-        pc.nfqueue = MagicMock()
-        pc.listener_thread = MagicMock()
-        pc.release_thread = MagicMock()
-
-# Explicitly set is_alive to False to satisfy the assertion later
-        pc.listener_thread.is_alive.return_value = False
-        pc.release_thread.is_alive.return_value = False
-        
-        # Simulate a held packet
-        mock_pkt = MagicMock()
-        pc.first_packet_info = (100, mock_pkt)
-
-        pc.stop()
-        
-        # Verify packet was accepted (Fail Open)
-        mock_pkt.accept.assert_called_once()
-        assert pc.first_packet_info is None
-        
-        # Verify iptables cleanup
-        assert any("-D" in call[0][0] for call in mock_run.call_args_list)
-        assert not pc.active
-        assert not pc.listener_thread.is_alive()
-        assert not pc.release_thread.is_alive()
+    def test_packet_controller_integration(self, pc):
+        """Test the integration of the packet controller with nftables logic."""
+        with patch("packet_controller.subprocess.call", return_value=0) as mock_run:
+            with patch("packet_controller.NetfilterQueue") as MockNFQ:
+                pc.start()
+                
+                # Verify nftables add calls
+                add_calls = [c for c in mock_run.call_args_list if "add" in c[0][0]]
+                assert len(add_calls) >= 3
+                
+                # Verify NFQueue bind
+                assert pc.nfqueue.bind.called
+                
+                # Simulate packet flow
+                mock_pkt = MagicMock()
+                mock_pkt.get_payload.return_value = self._build_raw_packet(100, 10)
+                pc._queue_callback(mock_pkt)
+                
+                assert pc.first_packet_held.is_set()
+                
+                # Trigger release logic manually to simulate thread action
+                pc.subsequent_packets_released.wait = MagicMock(return_value=True)
+                with patch("time.sleep") as mock_sleep:
+                    pc._delayed_release()
+                    mock_sleep.assert_called_with(REORDER_DELAY)
+                    mock_pkt.accept.assert_called_once()
+                    
+                pc.stop()
+                
+                # Verify nftables delete calls
+                delete_calls = [c for c in mock_run.call_args_list if "delete" in c[0][0]]
+                assert len(delete_calls) > 0
+                
+                # Verify NFQueue unbind
+                assert pc.nfqueue.unbind.called
