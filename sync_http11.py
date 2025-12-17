@@ -107,6 +107,9 @@ class HTTP11SyncEngine:
     def _parse_target(self):
         """
         Parses the target URL to extract host, port, and scheme.
+
+        Raises:
+            ValueError: If the URL scheme is unsupported (not http or https).
         """
         parsed_url = urlparse(self.request.url)
         self.target_host = parsed_url.hostname
@@ -123,6 +126,9 @@ class HTTP11SyncEngine:
         """
         Prepares the payload stages and initializes the synchronization barrier.
         Splits the payload by the `{{SYNC}}` marker.
+
+        Raises:
+            ValueError: If fewer than 2 stages are found (requires at least one sync marker).
         """
         payload = self.request.get_attack_payload()
         # The actual length sent over the wire excludes the markers
@@ -155,6 +161,12 @@ class HTTP11SyncEngine:
     def run_attack(self) -> List[Union[ScanResult, None]]:
         """
         Executes the synchronized attack.
+
+        Resolves the IP, launches concurrent threads, waits for completion,
+        and aggregates the results.
+
+        Returns:
+            List[Union[ScanResult, None]]: A list of results for each probe.
         """
         logger.info(f"Connecting to {self.target_host}:{self.target_port}...")
         
@@ -190,6 +202,12 @@ class HTTP11SyncEngine:
     def _connect(self) -> socket.socket:
         """
         Establishes a persistent TCP (and optionally SSL) connection.
+
+        Returns:
+            socket.socket: The connected socket object.
+
+        Raises:
+            ConnectionError: If connection fails or SSL handshake fails.
         """
         try:
             # Connect using the resolved IP
@@ -221,6 +239,9 @@ class HTTP11SyncEngine:
     def _serialize_headers(self) -> bytes:
         """
         Serializes HTTP/1.1 headers for the request.
+
+        Returns:
+            bytes: The serialized headers as a byte string.
         """
         parsed_url = urlparse(self.request.url)
         path = parsed_url.path or '/'
@@ -277,6 +298,9 @@ class HTTP11SyncEngine:
     def _attack_thread(self, index: int):
         """
         The main logic for a single synchronized attack thread. Implements fail-fast mechanism.
+
+        Args:
+            index (int): The index of this thread/probe.
         """
         sock = None
         response = None

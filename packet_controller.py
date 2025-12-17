@@ -38,6 +38,17 @@ class PacketController:
     Uses nftables for rule management.
     """
     def __init__(self, target_ip: str, target_port: int, source_port: int):
+        """
+        Initializes the PacketController.
+
+        Args:
+            target_ip (str): The destination IP address to filter.
+            target_port (int): The destination port to filter.
+            source_port (int): The source port to filter.
+
+        Raises:
+            ImportError: If NetfilterQueue is not available and not running in a test environment.
+        """
         if not NFQUEUE_AVAILABLE and 'unittest' not in sys.modules:
             raise ImportError("NetfilterQueue not available (Linux Only). Cannot use first-seq strategy.")
 
@@ -64,10 +75,23 @@ class PacketController:
         signal.signal(signal.SIGINT, self._signal_handler)
 
     def _signal_handler(self, signum, frame):
+        """
+        Handles shutdown signals (SIGINT) to ensure proper cleanup.
+
+        Args:
+            signum (int): The signal number.
+            frame (frame): The current stack frame.
+        """
         self.stop()
         sys.exit(0)
 
     def start(self):
+        """
+        Starts the packet interception and release threads.
+
+        It sets up the nftables rules, binds the NetfilterQueue, and starts
+        the listener and release threads.
+        """
         self._manage_nftables(action='add')
         self.nfqueue = NetfilterQueue()
         try:
@@ -85,6 +109,12 @@ class PacketController:
         self.release_thread.start()
 
     def stop(self):
+        """
+        Stops the packet controller and cleans up resources.
+
+        It disables the nftables rules, unbinds the NetfilterQueue,
+        releases any held packets, and stops the threads.
+        """
         if not self.active: return
         self.active = False
         
@@ -121,6 +151,9 @@ class PacketController:
         """
         Manages nftables rules.
         Creates a dedicated table 'scalpel_racer' to avoid polluting the global filter table.
+
+        Args:
+            action (str): The action to perform ('add' or 'delete').
         """
         table_name = "scalpel_racer"
         chain_name = "output_hook"
@@ -162,6 +195,10 @@ class PacketController:
                 pass
 
     def _listener_loop(self):
+        """
+        The main loop that listens for packets on the NetfilterQueue.
+        It keeps running as long as the controller is active.
+        """
         # [FIX] Loop while active to ensure thread stays alive in tests where run() is mocked to return instantly
         while self.active:
             try: 
@@ -172,6 +209,15 @@ class PacketController:
             time.sleep(0.1)
 
     def _queue_callback(self, pkt):
+        """
+        Callback function invoked for each packet intercepted by NetfilterQueue.
+
+        It determines whether to hold the packet (if it's the first data packet)
+        or release it (if it's a subsequent packet).
+
+        Args:
+            pkt: The intercepted packet object.
+        """
         if not self.active:
             pkt.accept(); return
         try:
@@ -206,6 +252,10 @@ class PacketController:
         except: pkt.accept()
 
     def _delayed_release(self):
+        """
+        Thread that waits for a specific condition (subsequent packets released)
+        or a timeout before releasing the held first packet.
+        """
         if not self.first_packet_held.wait(timeout=5): return
         
         # Wait for subsequent packets or short timeout

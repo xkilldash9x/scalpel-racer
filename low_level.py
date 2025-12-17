@@ -84,6 +84,13 @@ class StreamContext:
     __slots__ = ('stream_id', 'index', 'body', 'finished', 'headers', 'start_time', 'end_time', 'error')
 
     def __init__(self, stream_id: int, index: int):
+        """
+        Initializes the StreamContext.
+
+        Args:
+            stream_id (int): The HTTP/2 stream identifier.
+            index (int): The index of this request in the batch.
+        """
         self.stream_id = stream_id
         self.index = index
         self.body = bytearray()
@@ -96,7 +103,18 @@ class StreamContext:
         self.error: Optional[Any] = None
 
 class HTTP2RaceEngine:
+    """
+    Direct socket manipulation for HTTP/2 race conditions (SPA).
+    """
     def __init__(self, request: CapturedRequest, concurrency: int, strategy="spa"):
+        """
+        Initializes the HTTP2RaceEngine.
+
+        Args:
+            request (CapturedRequest): The request to attack with.
+            concurrency (int): The number of concurrent requests.
+            strategy (str): The attack strategy ('spa' or 'first-seq').
+        """
         self.request = request
         self.concurrency = concurrency
         self.strategy = strategy
@@ -161,6 +179,9 @@ class HTTP2RaceEngine:
         """
         Establishes the SSL/TLS connection and performs H2 handshake.
         Includes socket tuning for race condition performance.
+
+        Raises:
+            ValueError: If the target host cannot be determined.
         """
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -196,6 +217,15 @@ class HTTP2RaceEngine:
         self.sock.sendall(self.conn.data_to_send())
 
     def _build_headers(self, cl: int) -> List[Tuple[Union[str, bytes], Union[str, bytes]]]:
+        """
+        Builds the HTTP/2 headers for the request.
+
+        Args:
+            cl (int): The content length of the request body.
+
+        Returns:
+            List[Tuple[Union[str, bytes], Union[str, bytes]]]: A list of header tuples.
+        """
         p = urlparse(self.request.url)
         path = p.path
         
@@ -248,6 +278,15 @@ class HTTP2RaceEngine:
         return headers
 
     def run_attack(self) -> List[ScanResult]:
+        """
+        Executes the HTTP/2 race attack.
+
+        Connects to the target, sets up streams, sends headers and partial body,
+        and then triggers the race by sending the final byte for all streams.
+
+        Returns:
+            List[ScanResult]: A list of results for each stream.
+        """
         pc = None
         try:
             self.connect()
@@ -322,6 +361,9 @@ class HTTP2RaceEngine:
         """
         Processes H2 events and updates stream state.
         Separated from _recv to allow isolated unit testing (resolves Ghost Methods).
+
+        Args:
+            events (List[Any]): A list of h2 events to process.
         """
         for e in events:
             if isinstance(e, (StreamEnded, StreamReset)):
@@ -397,6 +439,9 @@ class HTTP2RaceEngine:
         """
         Compiles results from the StreamContext objects.
         This runs off the hot-path, so we can do our decoding and hashing here.
+
+        Returns:
+            List[ScanResult]: The finalized results of the race.
         """
         res = []
         # Sort by index to maintain logical order of race attempts
