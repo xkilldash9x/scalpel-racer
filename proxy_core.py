@@ -577,10 +577,11 @@ class Http11ProxyHandler(BaseProxyHandler):
 
             self.buffer.extend(data)
         
-        chunk = self.buffer[self._buffer_offset : self._buffer_offset + n]
+        # [OPTIMIZATION] Use memoryview to slice without creating an intermediate bytearray copy
+        chunk = memoryview(self.buffer)[self._buffer_offset : self._buffer_offset + n]
         self._buffer_offset += n
 
-        return bytes(chunk)
+        return chunk.tobytes()
 
     async def _handle_connect(self, target: str):
         check_url = f"https://{target}/"
