@@ -96,6 +96,14 @@ async def Last_Byte_Stream_Body(payload: bytes, barrier: Optional[asyncio.Barrie
     """
     Generator for Last-Byte-Sync (LBS) / Single-Packet-Attack (SPA).
     Yields payload minus last byte, waits for barrier, then yields last byte.
+
+    Args:
+        payload (bytes): The full request payload.
+        barrier (Optional[asyncio.Barrier]): Synchronization barrier.
+        warmup_ms (int): Warmup time in milliseconds (unused in this simplified generator but kept for API compatibility).
+
+    Yields:
+        bytes: Chunks of the payload.
     """
     if not payload:
         yield b""
@@ -121,6 +129,13 @@ async def Last_Byte_Stream_Body(payload: bytes, barrier: Optional[asyncio.Barrie
 async def Staged_Stream_Body(payload: bytes, barriers: List[asyncio.Barrier]):
     """
     Generator for Staged Sync (splitting by {{SYNC}} marker).
+
+    Args:
+        payload (bytes): The payload containing sync markers.
+        barriers (List[asyncio.Barrier]): List of barriers for each stage.
+
+    Yields:
+        bytes: Payload parts.
     """
     parts = payload.split(SYNC_MARKER)
     for i, part in enumerate(parts):
@@ -132,7 +147,12 @@ async def Staged_Stream_Body(payload: bytes, barriers: List[asyncio.Barrier]):
         yield part
 
 def edit_request_body(req: CapturedRequest):
-    """Interactive editor for request body."""
+    """
+    Interactive editor for request body.
+
+    Args:
+        req (CapturedRequest): The request to edit.
+    """
     print(f"Current Body:\n{req.get_attack_payload()}")
     print("Enter new body (end with empty line):")
     lines = []
@@ -148,7 +168,12 @@ def edit_request_body(req: CapturedRequest):
         req.edited_body = "".join(lines).encode()
 
 def fix_sudo_ownership(filepath: str):
-    """Fixes file ownership if run with sudo."""
+    """
+    Fixes file ownership if run with sudo.
+
+    Args:
+        filepath (str): The path to the file.
+    """
     uid = os.environ.get('SUDO_UID')
     gid = os.environ.get('SUDO_GID')
     if uid and gid:
@@ -158,7 +183,12 @@ def fix_sudo_ownership(filepath: str):
             pass
 
 def analyze_results(results: List[ScanResult]):
-    """Prints a statistical summary of the race results."""
+    """
+    Prints a statistical summary of the race results.
+
+    Args:
+        results (List[ScanResult]): The list of race results.
+    """
     print("\n[Response Signatures]")
     groups = {}
     total_dur = 0
@@ -187,15 +217,26 @@ def analyze_results(results: List[ScanResult]):
 class CAManager(CertManager):
     """Wrapper around CertManager to satisfy test suite API."""
     def initialize(self):
+        """Initializes the CA Manager."""
         # Optimization: Generate shared ephemeral keys if needed.
         # [FIX] Rely on parent __init__ to handle generation to avoid duplicate calls
         pass
 
     def generate_ca(self):
+        """Generates the CA certificate and key."""
         # Explicit generation trigger
         self._load_or_generate_ca()
         
     def generate_host_cert(self, hostname):
+        """
+        Generates a certificate for a specific host.
+
+        Args:
+            hostname (str): The hostname.
+
+        Returns:
+            ssl.SSLContext: The SSL context.
+        """
         # Explicit host generation trigger
         return self.get_context_for_host(hostname)
 
@@ -205,6 +246,12 @@ class CAManager(CertManager):
 def safe_spawn(tg, coro, results_list, index):
     """
     Safely spawns a task within a TaskGroup, capturing exceptions into the results list.
+
+    Args:
+        tg: The TaskGroup.
+        coro: The coroutine to run.
+        results_list (list): The list to store results in.
+        index (int): The index in the results list.
     """
     async def wrapper():
         try:
@@ -218,6 +265,19 @@ def safe_spawn(tg, coro, results_list, index):
 async def send_probe_advanced(client, req, payload, barriers, warmup_ms, index, is_staged, base_headers):
     """
     Worker function to send a single HTTP probe using httpx with stream optimization.
+
+    Args:
+        client: The httpx client.
+        req: The request object.
+        payload: The request payload.
+        barriers: List of barriers.
+        warmup_ms: Warmup time.
+        index: Probe index.
+        is_staged: Whether it is a staged attack.
+        base_headers: Base headers for the request.
+
+    Returns:
+        ScanResult: The result of the probe.
     """
     url = req.url
     method = req.method
@@ -259,6 +319,16 @@ async def send_probe_advanced(client, req, payload, barriers, warmup_ms, index, 
 async def run_scan(req: CapturedRequest, concurrency: int, http2: bool, warmup: int, strategy: str) -> List[ScanResult]:
     """
     Main entry point for running an attack scan.
+
+    Args:
+        req (CapturedRequest): The request to attack with.
+        concurrency (int): Number of concurrent requests.
+        http2 (bool): Whether to use HTTP/2.
+        warmup (int): Warmup time in ms.
+        strategy (str): Attack strategy.
+
+    Returns:
+        List[ScanResult]: List of scan results.
     """
     # 1. HTTP/2 Delegation
     if http2:
@@ -303,11 +373,26 @@ class CaptureApp:
         self.request_log = []
 
     def on_capture(self, type_, data):
+        """
+        Callback for capture events.
+
+        Args:
+            type_ (str): Event type.
+            data: Event data.
+        """
         if type_ == "CAPTURE":
             self.request_log.append(data)
 
 class ScalpelApp:
+    """Main application class handling the UI and orchestration."""
     def __init__(self, port, strategy):
+        """
+        Initializes the ScalpelApp.
+
+        Args:
+            port (int): The proxy port.
+            strategy (str): The default attack strategy.
+        """
         self.port = port
         self.strategy = strategy
         self.storage = []
@@ -320,6 +405,10 @@ class ScalpelApp:
         """
         Callback hooked into ProxyManager.
         Receives captured requests immediately.
+
+        Args:
+            t (str): Type of message.
+            d (Any): Data payload.
         """
         if t == "CAPTURE":
             self.storage.append(d)
@@ -334,6 +423,9 @@ class ScalpelApp:
              print_formatted_text(ANSI(f"{Fore.BLUE}[SYS] {d}{Style.RESET_ALL}"))
 
     async def run(self):
+        """
+        Runs the main application loop.
+        """
         # Print Banner
         print_formatted_text(ANSI(BANNER.format(Fore=Fore, Style=Style)))
 
