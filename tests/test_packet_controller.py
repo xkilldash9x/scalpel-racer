@@ -1,6 +1,3 @@
-################################################################################
-## START OF FILE: tests/test_packet_controller.py
-################################################################################
 # tests/test_packet_controller.py
 """
 Tests for packet_controller.py using nftables (nft).
