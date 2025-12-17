@@ -124,6 +124,13 @@ class StreamContext:
     )
 
     def __init__(self, stream_id: int, scheme: str):
+        """
+        Initializes a StreamContext object.
+
+        Args:
+            stream_id (int): The unique identifier for the stream.
+            scheme (str): The URL scheme (http/https).
+        """
         self.stream_id = stream_id
         self.scheme = scheme
         self.downstream_closed = False
@@ -146,11 +153,16 @@ class StreamContext:
         self.truncated = False
 
     def __repr__(self):
+        """
+        Returns a string representation of the StreamContext.
+        """
         return f"<StreamContext id={self.stream_id} scheme={self.scheme}>"
 
 class ProxyError(Exception):
+    """Base class for proxy-related errors."""
     pass
 class PayloadTooLargeError(ProxyError):
+    """Raised when the payload exceeds the maximum allowed size."""
     pass
 
 class BaseProxyHandler:
@@ -164,6 +176,16 @@ class BaseProxyHandler:
     def __init__(self, explicit_host: str, upstream_verify_ssl: bool, 
                  upstream_ca_bundle: Optional[str], manager_callback: Callable,
                  ssl_context_factory: Optional[Callable] = None):
+        """
+        Initializes the BaseProxyHandler.
+
+        Args:
+            explicit_host (str): The explicit host to connect to (if any).
+            upstream_verify_ssl (bool): Whether to verify upstream SSL certificates.
+            upstream_ca_bundle (Optional[str]): Path to a custom CA bundle for upstream verification.
+            manager_callback (Callable): Callback function for logging.
+            ssl_context_factory (Optional[Callable]): Factory for creating SSL contexts.
+        """
         self.explicit_host = explicit_host
         self.upstream_verify_ssl = upstream_verify_ssl
         self.upstream_ca_bundle = upstream_ca_bundle
@@ -173,6 +195,13 @@ class BaseProxyHandler:
         self.upstream_port: int = 443
 
     def log(self, level: str, msg: Any):
+        """
+        Logs a message using the manager callback.
+
+        Args:
+            level (str): The log level (e.g., 'INFO', 'ERROR').
+            msg (Any): The message to log.
+        """
         if self.callback:
             try:
                 self.callback(level, msg)
@@ -183,6 +212,13 @@ class BaseProxyHandler:
         """
         Robust parsing of host:port strings, handling IPv6 brackets.
         Accepts a dynamic default_port based on scheme (80 vs 443).
+
+        Args:
+            explicit_host (str): The host string to parse.
+            default_port (int): The default port if none is specified.
+
+        Returns:
+            Tuple[str, int]: A tuple containing the host and port.
         """
         if not explicit_host:
             return "", 0
@@ -205,6 +241,17 @@ class BaseProxyHandler:
         return explicit_host, default_port
 
     async def _connect_upstream(self, host: str, port: int, alpn_protocols: List[str] = None) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """
+        Establishes a connection to the upstream server.
+
+        Args:
+            host (str): The upstream host.
+            port (int): The upstream port.
+            alpn_protocols (List[str]): List of ALPN protocols to negotiate.
+
+        Returns:
+            Tuple[asyncio.StreamReader, asyncio.StreamWriter]: The reader and writer for the connection.
+        """
         ctx = ssl.create_default_context()
         if self.upstream_verify_ssl:
             ctx.verify_mode = ssl.CERT_REQUIRED
@@ -240,6 +287,16 @@ class BaseProxyHandler:
             raise
 
     def _is_url_allowed(self, url: str, scope_pattern: Optional[Any]) -> bool:
+        """
+        Checks if a URL is allowed based on the scope pattern.
+
+        Args:
+            url (str): The URL to check.
+            scope_pattern (Optional[Any]): The regex pattern for allowed scopes.
+
+        Returns:
+            bool: True if allowed, False otherwise.
+        """
         if not scope_pattern:
             return True
         return bool(scope_pattern.search(url))
@@ -265,7 +322,23 @@ class Http11ProxyHandler(BaseProxyHandler):
                  explicit_host: str, manager_callback, target_override, scope_pattern,
                  upstream_verify_ssl=False, upstream_ca_bundle=None, initial_data=b"",
                  ssl_context_factory=None, enable_tunneling=True, strict_mode=True):
-        
+        """
+        Initializes the Http11ProxyHandler.
+
+        Args:
+            reader (asyncio.StreamReader): The client reader.
+            writer (asyncio.StreamWriter): The client writer.
+            explicit_host (str): The explicit host to connect to.
+            manager_callback (Callable): Callback for logging.
+            target_override (str): Optional target override URL.
+            scope_pattern (Any): Regex pattern for allowed scopes.
+            upstream_verify_ssl (bool): Whether to verify upstream SSL.
+            upstream_ca_bundle (str): Path to CA bundle.
+            initial_data (bytes): Initial data read from the socket (e.g. during protocol detection).
+            ssl_context_factory (Callable): Factory for SSL contexts.
+            enable_tunneling (bool): Whether to enable CONNECT tunneling.
+            strict_mode (bool): Whether to enforce strict HTTP parsing.
+        """
         super().__init__(explicit_host, upstream_verify_ssl, upstream_ca_bundle, manager_callback, ssl_context_factory)
         self.reader = reader
         self.writer = writer
@@ -281,6 +354,12 @@ class Http11ProxyHandler(BaseProxyHandler):
         """
         Reads a line strictly terminated by CRLF, but allows lenient fallback for Bare LF.
         Optimization: Uses smart compaction to avoid O(N^2) buffer resizing on large streams.
+
+        Returns:
+            bytes: The read line, excluding the terminator.
+
+        Raises:
+            ProxyError: If the line exceeds the maximum length or other read errors occur.
         """
         while True:
             try:
@@ -351,6 +430,10 @@ class Http11ProxyHandler(BaseProxyHandler):
             return line
 
     async def run(self):
+        """
+        Runs the HTTP/1.1 proxy loop.
+        Parses requests, handles validation, and forwards traffic.
+        """
         try:
             while True:
                 try:
@@ -452,7 +535,16 @@ class Http11ProxyHandler(BaseProxyHandler):
                 self.writer.close()
 
     async def _validate_request(self, method: str, headers_dict: Dict[str, str]) -> bool:
-        """Validates specific protocol requirements."""
+        """
+        Validates specific protocol requirements.
+
+        Args:
+            method (str): The HTTP method.
+            headers_dict (Dict[str, str]): The parsed headers.
+
+        Returns:
+            bool: True if valid, False otherwise.
+        """
         if method == 'OPTIONS' and 'access-control-request-method' not in headers_dict:
              pass # Optional in some contexts
         
@@ -467,12 +559,29 @@ class Http11ProxyHandler(BaseProxyHandler):
         return True
 
     async def _send_error(self, code, message):
+        """
+        Sends an HTTP error response to the client.
+
+        Args:
+            code (int): The HTTP status code.
+            message (str): The error message.
+        """
         try:
             self.writer.write(f"HTTP/1.1 {code} {message}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".encode())
             await self.writer.drain()
         except Exception: pass
 
     async def _handle_request(self, method, target, version_b, headers, headers_dict):
+        """
+        Handles a standard HTTP request.
+
+        Args:
+            method (str): The HTTP method.
+            target (str): The request target.
+            version_b (bytes): The HTTP version.
+            headers (List[Tuple[str, str]]): List of headers.
+            headers_dict (Dict[str, str]): Dictionary of headers.
+        """
         req_host = self.explicit_host
 
         # RFC 7230 Section 5.4: If the target URI includes an authority component,
@@ -567,6 +676,12 @@ class Http11ProxyHandler(BaseProxyHandler):
         u_writer.close()
 
     async def _read_chunked_body(self) -> bytes:
+        """
+        Reads a chunked HTTP body.
+
+        Returns:
+            bytes: The assembled body content.
+        """
         body_parts = []
         while True:
             line = await self._read_strict_line()
@@ -590,6 +705,18 @@ class Http11ProxyHandler(BaseProxyHandler):
         return b"".join(body_parts)
     
     async def _read_bytes(self, n: int) -> bytes:
+        """
+        Reads a specific number of bytes from the stream.
+
+        Args:
+            n (int): The number of bytes to read.
+
+        Returns:
+            bytes: The read bytes.
+
+        Raises:
+            ProxyError: If read times out or is incomplete.
+        """
         while (len(self.buffer) - self._buffer_offset) < n:
             try:
                 # Larger chunk size for fewer syscalls for performance
@@ -612,6 +739,12 @@ class Http11ProxyHandler(BaseProxyHandler):
         return bytes(chunk)
 
     async def _handle_connect(self, target: str):
+        """
+        Handles HTTP CONNECT tunneling.
+
+        Args:
+            target (str): The target host:port.
+        """
         check_url = f"https://{target}/"
         if not self._is_url_allowed(check_url, self.scope_pattern):
             self.log("WARN", f"Blocked CONNECT to {target} (Scope Violation)")
@@ -662,18 +795,15 @@ class Http11ProxyHandler(BaseProxyHandler):
         except Exception:
             await self._send_error(502, "Bad Gateway")
 
-    async def _send_error(self, code, message):
-        try:
-            self.writer.write(f"HTTP/1.1 {code} {message}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".encode())
-            await self.writer.drain()
-        except Exception as e:
-            # [LOGGING FIX] Log this as debug, often just means client went away
-            self.log("DEBUG", f"Failed to send error {code} to client: {e}")
-
     async def _pipe(self, r, w, flush_buffer=False):
         """
         Pipes data between streams.
         [LOGGING FIX] Now reports why a pipe broke.
+
+        Args:
+            r: The source stream reader.
+            w: The destination stream writer.
+            flush_buffer (bool): Whether to flush the internal buffer first.
         """
         try:
             if flush_buffer and (len(self.buffer) - self._buffer_offset) > 0:
@@ -702,6 +832,17 @@ class Http11ProxyHandler(BaseProxyHandler):
                 pass
 
     def _record_capture(self, method, path, headers, body, scheme, authority):
+        """
+        Records a captured request.
+
+        Args:
+            method (str): The HTTP method.
+            path (str): The request path.
+            headers (List[Tuple[str, str]]): The request headers.
+            body (bytes): The request body.
+            scheme (str): The URL scheme.
+            authority (str): The authority component.
+        """
         if self.target_override:
             url = urljoin(self.target_override, path.lstrip('/'))
         else:
@@ -736,7 +877,22 @@ class NativeProxyHandler(BaseProxyHandler):
                  target_override, scope_pattern, enable_tunneling=True, 
                  upstream_verify_ssl=False, upstream_ca_bundle=None, initial_data=b"",
                  ssl_context_factory=None):
-        
+        """
+        Initializes the NativeProxyHandler.
+
+        Args:
+            client_reader: The client reader.
+            client_writer: The client writer.
+            explicit_host: The explicit host.
+            manager_callback: Log callback.
+            target_override: Target override URL.
+            scope_pattern: Scope regex pattern.
+            enable_tunneling: Enable tunneling flag.
+            upstream_verify_ssl: Verify upstream SSL flag.
+            upstream_ca_bundle: CA bundle path.
+            initial_data: Initial data buffer.
+            ssl_context_factory: SSL context factory.
+        """
         super().__init__(explicit_host, upstream_verify_ssl, upstream_ca_bundle, manager_callback, ssl_context_factory)
         self.client_reader = client_reader
         self.client_writer = client_writer
@@ -775,6 +931,10 @@ class NativeProxyHandler(BaseProxyHandler):
         self.draining = False
 
     async def run(self):
+        """
+        Main execution loop for the HTTP/2 proxy.
+        Handles connection setup, event loops, and cleanup.
+        """
         try:
             try:
                 self.upstream_host, self.upstream_port = self._parse_target(self.explicit_host)
@@ -836,6 +996,9 @@ class NativeProxyHandler(BaseProxyHandler):
             await self.cleanup()
 
     async def connect_upstream(self):
+        """
+        Connects to the upstream server using HTTP/2 ALPN.
+        """
         self.upstream_reader, self.upstream_writer = await self._connect_upstream(
             self.upstream_host, self.upstream_port, alpn_protocols=["h2"]
         )
@@ -844,12 +1007,26 @@ class NativeProxyHandler(BaseProxyHandler):
             raise ConnectionError("Upstream did not negotiate HTTP/2")
 
     async def _read_loop_wrapper(self, reader, conn, h2_lock, writer, socket_lock, handler):
+        """
+        Wraps the read loop to handle exceptions and close signaling.
+        """
         try:
             await self.read_loop(reader, conn, h2_lock, writer, socket_lock, handler)
         except Exception:
             self.closed.set()
 
     async def read_loop(self, reader, conn, h2_lock, writer, socket_lock, event_handler):
+        """
+        Continuously reads data from the reader, updates H2 state, and triggers events.
+
+        Args:
+            reader: The stream reader.
+            conn: The H2 connection object.
+            h2_lock: Lock for H2 state.
+            writer: The stream writer.
+            socket_lock: Lock for socket writing.
+            event_handler: Handler for H2 events.
+        """
         while not self.closed.is_set():
             try:
                 data = await asyncio.wait_for(reader.read(65536), timeout=IDLE_TIMEOUT)
@@ -883,6 +1060,19 @@ class NativeProxyHandler(BaseProxyHandler):
         Consumes payloads from a queue and sends them to the respective connection.
         Handles Flow Control Backpressure correctly.
         [VECTOR OPTIMIZED] Batches writes to reduce syscall overhead.
+
+        Args:
+            stream_id: Stream ID.
+            conn: Target H2 connection.
+            writer: Target writer.
+            queue: Data source queue.
+            flow_event: Flow control event.
+            h2_lock: Target H2 lock.
+            socket_lock: Target socket lock.
+            ack_conn: Connection to send ACKs to.
+            ack_h2_lock: ACK H2 lock.
+            ack_writer: ACK writer.
+            ack_socket_lock: ACK socket lock.
         """
         while not self.closed.is_set():
             try:
@@ -992,6 +1182,12 @@ class NativeProxyHandler(BaseProxyHandler):
         except: pass
 
     async def handle_request_received(self, event: RequestReceived):
+        """
+        Handles an incoming request stream from the client.
+
+        Args:
+            event (RequestReceived): The H2 event.
+        """
         stream_id = event.stream_id
         if stream_id in self.streams:
              async with self.ds_h2_lock:
@@ -1047,6 +1243,12 @@ class NativeProxyHandler(BaseProxyHandler):
                 ctx.upstream_queue.put_nowait(None)
 
     async def handle_downstream_event(self, event):
+        """
+        Dispatches events received from the client/downstream.
+
+        Args:
+            event: The H2 event.
+        """
         if isinstance(event, RequestReceived):
             await self.handle_request_received(event)
         elif isinstance(event, DataReceived):
@@ -1085,6 +1287,12 @@ class NativeProxyHandler(BaseProxyHandler):
             await self.flush(self.downstream_conn, self.client_writer, self.ds_h2_lock, self.ds_socket_lock)
 
     async def handle_upstream_event(self, event):
+        """
+        Dispatches events received from the upstream server.
+
+        Args:
+            event: The H2 event.
+        """
         if isinstance(event, ResponseReceived):
              try:
                  safe, _ = self._prepare_forwarded_headers(event.headers, is_upstream=False)
@@ -1119,6 +1327,16 @@ class NativeProxyHandler(BaseProxyHandler):
              await self.flush(self.upstream_conn, self.upstream_writer, self.us_h2_lock, self.us_socket_lock)
 
     def _prepare_forwarded_headers(self, headers, is_upstream=True):
+        """
+        Sanitizes and prepares headers for forwarding.
+
+        Args:
+            headers: List of headers.
+            is_upstream (bool): True if forwarding to upstream.
+
+        Returns:
+            Tuple: (Sanitized headers, protocol)
+        """
         decoded_headers = []
         method = None
         protocol = None
@@ -1172,6 +1390,15 @@ class NativeProxyHandler(BaseProxyHandler):
         return self._wrap_security(final_headers), protocol
 
     def _process_headers_for_capture(self, headers: List[Tuple[Any, Any]]) -> CapturedHeaders:
+        """
+        Processes headers for capturing purposes.
+
+        Args:
+            headers: Raw headers.
+
+        Returns:
+            CapturedHeaders: Structured headers for capture.
+        """
         pseudo = {}
         normal = []
         cookies = []
@@ -1195,10 +1422,26 @@ class NativeProxyHandler(BaseProxyHandler):
         return {"pseudo": pseudo, "headers": normal}
 
     def _wrap_security(self, headers):
+        """
+        Wraps headers in HPack security structures for sensitive headers.
+
+        Args:
+            headers: The headers list.
+
+        Returns:
+            List: Headers with sensitive fields marked as NeverIndexed.
+        """
         if not hpack: return headers
         return [hpack.NeverIndexedHeaderTuple(k, v) if k.lower() in SENSITIVE_HEADERS else (k, v) for k, v in headers]
 
     async def handle_window_updated(self, event, direction):
+        """
+        Handles flow control window updates.
+
+        Args:
+            event: WindowUpdated event.
+            direction (str): 'upstream' or 'downstream'.
+        """
         sid = event.stream_id
         streams_snapshot = list(self.streams.values())
         if sid == 0:
@@ -1211,6 +1454,12 @@ class NativeProxyHandler(BaseProxyHandler):
             else: ctx.downstream_flow_event.set()
 
     def finalize_capture(self, ctx: StreamContext):
+        """
+        Finalizes the capture of a stream's request.
+
+        Args:
+            ctx (StreamContext): The stream context.
+        """
         if ctx.capture_finalized: return
         ctx.capture_finalized = True
         
@@ -1238,6 +1487,9 @@ class NativeProxyHandler(BaseProxyHandler):
         self.log("CAPTURE", captured)
 
     async def _monitor_shutdown(self):
+        """
+        Monitors for shutdown signals and unblocks queues.
+        """
         await self.closed.wait()
         for ctx in list(self.streams.values()):
             try: ctx.upstream_queue.put_nowait(None)
@@ -1246,6 +1498,9 @@ class NativeProxyHandler(BaseProxyHandler):
             except asyncio.QueueFull: pass
 
     async def _keepalive_loop(self):
+        """
+        Sends keep-alive pings periodically.
+        """
         while not self.closed.is_set():
             await asyncio.sleep(KEEPALIVE_INTERVAL)
             if self.upstream_conn:
@@ -1259,6 +1514,9 @@ class NativeProxyHandler(BaseProxyHandler):
             await self.flush(self.downstream_conn, self.client_writer, self.ds_h2_lock, self.ds_socket_lock)
 
     async def cleanup(self):
+        """
+        Cleans up resources and closes connections.
+        """
         self.closed.set()
         for w in [self.client_writer, self.upstream_writer]:
             if w:
@@ -1268,6 +1526,12 @@ class NativeProxyHandler(BaseProxyHandler):
             for t in ctx.sender_tasks: t.cancel()
 
     async def terminate(self, code):
+        """
+        Terminates the proxy session with a specific error code.
+
+        Args:
+            code: The H2 error code.
+        """
         self.closed.set()
         async with self.ds_h2_lock:
             try: self.downstream_conn.close_connection(code)
@@ -1275,6 +1539,9 @@ class NativeProxyHandler(BaseProxyHandler):
         await self.flush(self.downstream_conn, self.client_writer, self.ds_h2_lock, self.ds_socket_lock)
         
     async def graceful_shutdown(self):
+        """
+        Initiates a graceful shutdown (GOAWAY).
+        """
         if self.draining or self.closed.is_set(): return
         self.draining = True
         async with self.ds_socket_lock:
@@ -1291,6 +1558,9 @@ class NativeProxyHandler(BaseProxyHandler):
         await self.flush(self.downstream_conn, self.client_writer, self.ds_h2_lock, self.ds_socket_lock)
 
     async def flush(self, conn, writer, h2_lock, socket_lock):
+        """
+        Flushes pending data from H2 connection to the socket.
+        """
         if self.closed.is_set(): return
         bytes_to_send = None
         async with h2_lock:
@@ -1305,6 +1575,15 @@ class NativeProxyHandler(BaseProxyHandler):
                     self.closed.set()
 
     def _cleanup_stream(self, stream_id: int, downstream_closed=False, upstream_closed=False, force_close=False):
+        """
+        Cleans up stream resources.
+
+        Args:
+            stream_id (int): The stream ID.
+            downstream_closed (bool): If downstream is closed.
+            upstream_closed (bool): If upstream is closed.
+            force_close (bool): Force close regardless of state.
+        """
         if stream_id not in self.streams: return
         ctx = self.streams[stream_id]
         if downstream_closed: ctx.downstream_closed = True
@@ -1321,6 +1600,10 @@ class NativeProxyHandler(BaseProxyHandler):
             del self.streams[stream_id]
 
 class DualProtocolHandler:
+    """
+    Handles initial connection and protocol detection (HTTP/1.1 vs HTTP/2).
+    Dispatches to the appropriate proxy handler.
+    """
     __slots__ = (
         'reader', 'writer', 'explicit_host', 'callback', 'target_override',
         'scope_pattern', 'enable_tunneling', 'upstream_verify_ssl',
@@ -1335,7 +1618,22 @@ class DualProtocolHandler:
                  upstream_ca_bundle: Optional[str] = None,
                  ssl_context_factory: Optional[Callable] = None,
                  strict_mode: bool = True):
+        """
+        Initializes the DualProtocolHandler.
         
+        Args:
+            reader: Client reader.
+            writer: Client writer.
+            explicit_host: Explicit host.
+            manager_callback: Callback.
+            target_override: Target override.
+            scope_pattern: Scope pattern.
+            enable_tunneling: Tunneling flag.
+            upstream_verify_ssl: Verify SSL flag.
+            upstream_ca_bundle: CA bundle path.
+            ssl_context_factory: SSL context factory.
+            strict_mode: Strict mode flag.
+        """
         self.reader = reader
         self.writer = writer
         self.explicit_host = explicit_host
@@ -1349,6 +1647,9 @@ class DualProtocolHandler:
         self.strict_mode = strict_mode
 
     async def run(self):
+        """
+        Detects protocol and runs the appropriate handler.
+        """
         protocol, initial_data = await self._detect_protocol()
         
         handler = None
@@ -1373,6 +1674,12 @@ class DualProtocolHandler:
         await handler.run()
 
     async def _detect_protocol(self) -> Tuple[str, bytes]:
+        """
+        Detects the protocol by peeking at the first few bytes or ALPN.
+
+        Returns:
+            Tuple[str, bytes]: (protocol, initial_data)
+        """
         ssl_obj = self.writer.get_extra_info('ssl_object')
         if ssl_obj:
             alpn_proto = ssl_obj.selected_alpn_protocol()
@@ -1393,6 +1700,18 @@ class DualProtocolHandler:
             return "http/1.1", b""
 
 async def start_proxy_server(host, port, manager_callback, target_override=None, scope_pattern=None, ssl_context_factory=None, strict_mode=True):
+    """
+    Starts the TCP proxy server.
+
+    Args:
+        host (str): The host to bind to.
+        port (int): The port to bind to.
+        manager_callback (Callable): Callback for logging.
+        target_override (str): Target override URL.
+        scope_pattern (Any): Regex pattern for scope.
+        ssl_context_factory (Callable): Factory for SSL contexts.
+        strict_mode (bool): Strict mode flag.
+    """
     async def _handle_client(reader, writer):
         handler = DualProtocolHandler(
             reader, writer, explicit_host="", manager_callback=manager_callback,

@@ -49,6 +49,13 @@ def decode_varint(buf: bytes, offset: int) -> Tuple[Optional[int], int]:
     """
     Decodes a QUIC Variable-Length Integer (RFC 9000).
     Returns (value, length_of_varint) or (None, length_of_varint) if buffer incomplete.
+
+    Args:
+        buf (bytes): The buffer to decode from.
+        offset (int): The offset to start decoding at.
+
+    Returns:
+        Tuple[Optional[int], int]: The decoded integer and its length.
     """
     if offset >= len(buf):
         return None, 1
@@ -72,6 +79,16 @@ def decode_varint(buf: bytes, offset: int) -> Tuple[Optional[int], int]:
 class CapturedRequest:
     """Standardized object for captured HTTP traffic (TCP or QUIC)."""
     def __init__(self, protocol: str, method: str, url: str, headers: Union[Dict[str, str], List[Tuple[bytes, bytes]]], body: bytes = b""):
+        """
+        Initializes a CapturedRequest.
+
+        Args:
+            protocol (str): The protocol used (e.g., "HTTP/3").
+            method (str): The HTTP method.
+            url (str): The request URL.
+            headers: The request headers.
+            body (bytes): The request body.
+        """
         self.id = 0  # Placeholder, assigned by ProxyManager
         self.protocol = protocol
         self.method = method
@@ -80,6 +97,9 @@ class CapturedRequest:
         self.body = body
 
     def __repr__(self) -> str:
+        """
+        Returns a string representation of the CapturedRequest.
+        """
         return f"<{self.protocol} {self.method} {self.url} ({len(self.body)} bytes)>"
 
 # -----------------------------------------------------------------------------
@@ -88,6 +108,15 @@ class CapturedRequest:
 class QuicPacketParser:
     """Parses RFC 9000 Packets (Headers Only)."""
     def parse_packet(self, data: Union[bytes, memoryview]) -> Dict[str, Any]:
+        """
+        Parses the headers of a QUIC packet.
+
+        Args:
+            data: The packet data.
+
+        Returns:
+            Dict[str, Any]: Extracted packet information.
+        """
         if not isinstance(data, (bytes, memoryview)):
             # Handle weird input types gracefully for resilience tests
             return {"error": "Invalid Input Type"}
@@ -129,6 +158,15 @@ class QuicFrameParser:
     """Parses QUIC Frames from decrypted payload."""
     @staticmethod
     def parse_frames(payload: bytes) -> List[Dict[str, Any]]:
+        """
+        Parses QUIC frames from a decrypted payload.
+
+        Args:
+            payload (bytes): The decrypted payload.
+
+        Returns:
+            List[Dict[str, Any]]: A list of parsed frames.
+        """
         frames = []
         offset = 0
         while offset < len(payload):
@@ -266,6 +304,15 @@ class H3FrameParser:
     """Parses HTTP/3 Frames (DATA, HEADERS, SETTINGS)."""
     @staticmethod
     def parse(data: bytes) -> List[Dict[str, Any]]:
+        """
+        Parses HTTP/3 frames.
+
+        Args:
+            data (bytes): The data containing H3 frames.
+
+        Returns:
+            List[Dict[str, Any]]: A list of parsed H3 frames.
+        """
         frames = []
         offset = 0
         while offset < len(data):
@@ -358,6 +405,12 @@ if HAS_AIOQUIC:
                     log.debug(f"Could not set socket options: {e}")
 
         def quic_event_received(self, event: Any):
+            """
+            Handles incoming QUIC events.
+
+            Args:
+                event (Any): The QUIC event.
+            """
             # 1. Pass Protocol Events to HTTP/3 Connection Layer
             if isinstance(event, StreamDataReceived):
                 self._h3_conn.handle_event(event)
@@ -367,6 +420,12 @@ if HAS_AIOQUIC:
                 self._handle_h3_event(h3_event)
 
         def _handle_h3_event(self, event: Any):
+            """
+            Handles H3 events.
+
+            Args:
+                event (Any): The H3 event.
+            """
             if isinstance(event, HeadersReceived):
                 self._process_headers(event)
             elif isinstance(event, DataReceived):
@@ -406,6 +465,12 @@ if HAS_AIOQUIC:
                 self._finalize_request(stream_id)
 
         def _process_data(self, event: DataReceived):
+            """
+            Processes H3 data frames.
+
+            Args:
+                event (DataReceived): The data received event.
+            """
             stream_id = event.stream_id
             if stream_id in self._stream_buffers:
                 self._stream_buffers[stream_id]["body"] += event.data
@@ -414,7 +479,11 @@ if HAS_AIOQUIC:
 
         def _finalize_request(self, stream_id: int):
             """Called when stream is fully received.
-            Log it and Respond."""
+            Log it and Respond.
+
+            Args:
+                stream_id (int): The stream identifier.
+            """
             req_data = self._stream_buffers.pop(stream_id, None)
             if not req_data: return
 
@@ -447,6 +516,15 @@ if HAS_AIOQUIC:
 # -----------------------------------------------------------------------------
 class QuicServer:
     def __init__(self, host: str, port: int, callback: callable, ssl_context_factory=None):
+        """
+        Initializes the QuicServer.
+
+        Args:
+            host (str): The host to bind to.
+            port (int): The port to bind to.
+            callback (callable): The callback for logging.
+            ssl_context_factory: Factory for SSL contexts.
+        """
         self.host = host
         self.port = port
         self.callback = callback
@@ -455,10 +533,12 @@ class QuicServer:
 
     # -- Fallback UDP Protocol --
     class UdpFallbackProtocol(asyncio.DatagramProtocol):
+        """Fallback protocol for UDP when AioQuic is missing."""
         def __init__(self, server: 'QuicServer'): 
             self.server = server
 
         def connection_made(self, transport):
+            """Called when connection is made."""
             # USAGE OF SOCKET: Fallback mode optimization
             sock = transport.get_extra_info('socket')
             if sock:
@@ -466,10 +546,15 @@ class QuicServer:
                 except: pass
 
         def datagram_received(self, data, addr):
+            """Called when a datagram is received."""
             parsed = self.server.parser.parse_packet(data)
             self.server.callback("QUIC_RAW", addr, parsed)
 
     async def start(self):
+        """
+        Starts the QUIC server.
+        Uses AioQuic if available, otherwise falls back to basic UDP sniffer.
+        """
         loop = asyncio.get_running_loop()
         log.info(f"QUIC (H3) UDP Listener starting on {self.host}:{self.port}")
         
@@ -507,6 +592,15 @@ class QuicServer:
 # -----------------------------------------------------------------------------
 class ProxyManager:
     def __init__(self, tcp_port=8080, quic_port=4433, ssl_context_factory=None, external_callback=None):
+        """
+        Initializes the ProxyManager.
+
+        Args:
+            tcp_port (int): The TCP port for HTTP/1.1 and HTTP/2.
+            quic_port (int): The UDP port for HTTP/3.
+            ssl_context_factory: Factory for SSL contexts.
+            external_callback: External callback for UI updates.
+        """
         self.tcp_port = tcp_port
         self.quic_port = quic_port
         self.ssl_context_factory = ssl_context_factory
@@ -522,7 +616,14 @@ class ProxyManager:
         self.proxy_task = None
 
     def unified_capture_callback(self, protocol: str, source: Any, data: Any = None):
-        """Unified logging for both TCP and QUIC streams with ID assignment."""
+        """
+        Unified logging for both TCP and QUIC streams with ID assignment.
+
+        Args:
+            protocol (str): The protocol (e.g., "CAPTURE", "QUIC", "SYSTEM").
+            source (Any): The source of the log (e.g., IP address, system component).
+            data (Any): The payload or message.
+        """
         type_ = protocol
         payload = data if data is not None else source
         
@@ -568,6 +669,14 @@ class ProxyManager:
             except Exception: pass
 
     async def run(self, target_override=None, scope_regex=None, strict_mode=True):
+        """
+        Runs the Proxy Manager, starting both TCP and QUIC servers.
+
+        Args:
+            target_override (str): Optional target override URL.
+            scope_regex (str): Optional regex for scope filtering.
+            strict_mode (bool): Whether to enable strict mode.
+        """
         log.info("=== Starting Proxy Manager ===")
         
         scope_pattern = None

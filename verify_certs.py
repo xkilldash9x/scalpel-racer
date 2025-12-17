@@ -1,6 +1,4 @@
-################################################################################
-# START OF FILE: ./verify_certs.py
-################################################################################
+# verify_certs.py
 """
 [VECTOR] PKI INFRASTRUCTURE
 Handles CA generation and Dynamic Leaf Certificate Signing.
@@ -21,6 +19,7 @@ from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import ec
+from typing import Optional
 
 # -- Constants --
 CA_KEY_PATH = "scalpel_ca.key"
@@ -33,6 +32,13 @@ class CertManager:
     leaf certificates for intercepted traffic on the fly.
     """
     def __init__(self):
+        """
+        Initializes the CertManager.
+
+        It initializes the CA key and certificate, the lock, the cache,
+        and the shared ephemeral key. It also ensures the certs directory exists
+        and loads or generates the CA.
+        """
         self.ca_key = None
         self.ca_cert = None
         self.lock = threading.Lock()
@@ -50,6 +56,10 @@ class CertManager:
     def _load_or_generate_ca(self):
         """
         Loads the existing CA from disk or generates a new one if missing.
+
+        This method checks for the existence of the CA key and certificate.
+        If they don't exist, it generates a new ECC P-256 key pair and a self-signed
+        CA certificate, then saves them to disk. If they do exist, it loads them.
         """
         if not os.path.exists(CA_KEY_PATH) or not os.path.exists(CA_CERT_PATH):
             print("[*] Generating new Scalpel CA (ECC P-256)...")
@@ -105,6 +115,12 @@ class CertManager:
         """
         Returns an SSLContext with a certificate valid for the specific hostname.
         Uses caching to avoid regenerating certs for the same host.
+
+        Args:
+            hostname (str): The hostname for which to generate the certificate.
+
+        Returns:
+            ssl.SSLContext: An SSL context configured with the generated certificate and key.
         """
         with self.lock:
             if hostname in self.cache:
