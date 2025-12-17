@@ -39,6 +39,7 @@ try:
     from prompt_toolkit import PromptSession, print_formatted_text
     from prompt_toolkit.patch_stdout import patch_stdout
     from prompt_toolkit.formatted_text import HTML, ANSI
+    from prompt_toolkit.completion import WordCompleter
 
     # Custom Proxy Core
     from proxy_manager import ProxyManager
@@ -310,7 +311,9 @@ class ScalpelApp:
         self.port = port
         self.strategy = strategy
         self.storage = []
-        self.session = PromptSession()
+        # UX: Autocompletion for commands
+        self.command_completer = WordCompleter(['ls', 'last', 'race', 'exit', 'quit', 'q'], ignore_case=True)
+        self.session = PromptSession(completer=self.command_completer)
         self.mgr = None
 
     def _handler(self, t, d):
@@ -423,7 +426,12 @@ class ScalpelApp:
                                 elif hasattr(r, 'error') and r.error:
                                      codes['Error'] = codes.get('Error', 0) + 1
                                      
-                            print_formatted_text(ANSI(f"{Fore.WHITE}Results ({duration:.2f}s): {codes}{Style.RESET_ALL}"))
+                            # UX: Better result formatting
+                            print_formatted_text(ANSI(f"\n{Fore.CYAN}--- Race Results ({duration:.2f}s) ---{Style.RESET_ALL}"))
+                            for code, count in codes.items():
+                                color = Fore.GREEN if code == 200 else Fore.RED
+                                print_formatted_text(ANSI(f"  {color}Status {code:<4}: {count}{Style.RESET_ALL}"))
+                            print_formatted_text("")
                         
                         except ValueError:
                             print_formatted_text("Invalid args")
