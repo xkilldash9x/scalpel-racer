@@ -40,12 +40,10 @@ class PacketController:
     def __init__(self, target_ip: str, target_port: int, source_port: int):
         """
         Initializes the PacketController.
-
         Args:
             target_ip (str): The destination IP address to filter.
             target_port (int): The destination port to filter.
             source_port (int): The source port to filter.
-
         Raises:
             ImportError: If NetfilterQueue is not available and not running in a test environment.
         """
@@ -77,7 +75,6 @@ class PacketController:
     def _signal_handler(self, signum, frame):
         """
         Handles shutdown signals (SIGINT) to ensure proper cleanup.
-
         Args:
             signum (int): The signal number.
             frame (frame): The current stack frame.
@@ -88,7 +85,6 @@ class PacketController:
     def start(self):
         """
         Starts the packet interception and release threads.
-
         It sets up the nftables rules, binds the NetfilterQueue, and starts
         the listener and release threads.
         """
@@ -111,7 +107,6 @@ class PacketController:
     def stop(self):
         """
         Stops the packet controller and cleans up resources.
-
         It disables the nftables rules, unbinds the NetfilterQueue,
         releases any held packets, and stops the threads.
         """
@@ -151,7 +146,6 @@ class PacketController:
         """
         Manages nftables rules.
         Creates a dedicated table 'scalpel_racer' to avoid polluting the global filter table.
-
         Args:
             action (str): The action to perform ('add' or 'delete').
         """
@@ -211,10 +205,8 @@ class PacketController:
     def _queue_callback(self, pkt):
         """
         Callback function invoked for each packet intercepted by NetfilterQueue.
-
         It determines whether to hold the packet (if it's the first data packet)
         or release it (if it's a subsequent packet).
-
         Args:
             pkt: The intercepted packet object.
         """
