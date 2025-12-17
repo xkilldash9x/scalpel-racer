@@ -4,26 +4,29 @@ Scalpel Racer is an advanced race condition testing tool designed to identify an
 
 ## Features
 
-* **Concurrency**: Sends multiple requests simultaneously to trigger race conditions.
-* **Attack Strategies**:
-    * **Auto (httpx)**: Uses asynchronous HTTP requests (via `httpx`) with synchronization barriers. Supports both Last-Byte Sync and Staged attacks (using `{{SYNC}}` markers).
-    * **SPA (Single Packet Attack)**: Uses low-level HTTP/2 frames to send request headers early and trigger all requests with a single TCP packet containing the last byte of data. This minimizes network jitter.
-    * **First-Seq (First Sequence Sync)**: A highly advanced strategy that uses Linux `NetfilterQueue` and `iptables` to intercept and synchronize the very first TCP packet of the request burst, ensuring maximum parallelism at the network layer.
-* **Traffic Capture**: Includes a built-in proxy server to capture requests directly from your browser, Burp Suite, or other tools.
-* **Request Editing**: Modify captured requests (body, headers) before launching an attack. Supports inserting `{{SYNC}}` markers for staged attacks.
-* **HTTPS Interception**: Supports HTTPS traffic capture via a dynamically generated Certificate Authority (CA).
-* **Response Analysis**: Automatically groups responses by status code and body hash, calculates timing statistics (average, jitter), and generates histograms.
+*   **Concurrency**: Sends multiple requests simultaneously to trigger race conditions.
+*   **Attack Strategies**:
+    *   **Auto (httpx)**: Uses asynchronous HTTP requests (via `httpx`) with synchronization barriers. Supports both Last-Byte Sync and Staged attacks (using `{{SYNC}}` markers).
+    *   **SPA (Single Packet Attack)**: Uses low-level HTTP/2 frames to send request headers early and trigger all requests with a single TCP packet containing the last byte of data. This minimizes network jitter.
+    *   **First-Seq (First Sequence Sync)**: A highly advanced strategy that uses Linux `NetfilterQueue` and `iptables` to intercept and synchronize the very first TCP packet of the request burst, ensuring maximum parallelism at the network layer.
+*   **Traffic Capture**: Includes a built-in proxy server (TCP & QUIC/HTTP3 awareness) to capture requests directly from your browser, Burp Suite, or other tools.
+*   **Request Editing**: Modify captured requests (body, headers) before launching an attack. Supports inserting `{{SYNC}}` markers for staged attacks.
+*   **HTTPS Interception**: Supports HTTPS traffic capture via a dynamically generated Certificate Authority (CA).
+*   **Response Analysis**: Automatically groups responses by status code and body hash, calculates timing statistics (average, jitter), and generates histograms.
+*   **HTTP/3 Support**: Includes experimental support for HTTP/3 (QUIC) interception and logging via `proxy_manager.py` (requires `aioquic`).
 
 ## Requirements
 
-* **Python 3.11+** (Required for `asyncio.TaskGroup` and modern TLS features)
-* **Core Dependencies**:
-    * `httpx`: For standard HTTP requests and the 'auto' strategy.
-    * `numpy`: For statistical analysis of timing data.
-    * `cryptography`: For HTTPS interception (CA generation).
-* **Advanced Dependencies** (Required for SPA and First-Seq):
-    * `h2` (>= 4.1.0): Required for HTTP/2 Single Packet Attacks and First-Seq.
-    * `NetfilterQueue` & `scapy`: Required for the First-Seq strategy (Linux only, requires root).
+*   **Python 3.11+** (Required for `asyncio.TaskGroup` and modern TLS features)
+*   **Core Dependencies**:
+    *   `httpx`: For standard HTTP requests and the 'auto' strategy.
+    *   `numpy`: For statistical analysis of timing data.
+    *   `cryptography`: For HTTPS interception (CA generation).
+*   **Advanced Dependencies** (Required for SPA and First-Seq):
+    *   `h2` (>= 4.1.0): Required for HTTP/2 Single Packet Attacks and First-Seq.
+    *   `NetfilterQueue` & `scapy`: Required for the First-Seq strategy (Linux only, requires root).
+*   **Optional Dependencies**:
+    *   `aioquic`: Required for HTTP/3 (QUIC) proxying and interception.
 
 ### Installation
 
@@ -55,7 +58,11 @@ Scalpel Racer is an advanced race condition testing tool designed to identify an
 
     *Note: If `requirements.txt` is missing, install the packages manually:*
     ```bash
-    pip install httpx numpy cryptography h2
+    pip install httpx numpy cryptography h2 prompt_toolkit colorama
+    ```
+    *For HTTP/3 support:*
+    ```bash
+    pip install aioquic
     ```
     *For Linux users wanting to use `first-seq`:*
     ```bash
@@ -145,18 +152,45 @@ This is the most potent strategy. It leverages `iptables` to route specific outg
 
 ## Architecture & Code Structure
 
-*   **`scalpel_racer.py`**: The main entry point. Handles CLI argument parsing, the interactive UI, the proxy server (`CaptureServer`), and the high-level attack orchestration (`run_scan`). It also contains the `CAManager` for handling TLS certificates.
-*   **`structures.py`**: Defines core data classes like `CapturedRequest` and `ScanResult`, along with global constants.
-*   **`proxy_core.py`**: Implements the `NativeProxyHandler` using `h2` for robust HTTP/2 proxying and interception. (Used internally by the proxy logic).
-*   **`low_level.py`**: Contains the `HTTP2RaceEngine`. This class implements the raw socket management and HTTP/2 protocol logic required for the SPA and First-Seq strategies. It operates synchronously to ensure precise timing.
-*   **`sync_http11.py`**: Provides `HTTP11SyncEngine` for synchronous, thread-based HTTP/1.1 attacks (an alternative to the asyncio-based 'auto' strategy for specific use cases).
-*   **`packet_controller.py`**: Manages the Linux-specific packet interception logic using `NetfilterQueue` and `scapy`. It handles the `iptables` rules and the packet release timing for the First-Seq strategy.
-*   **`run_h2_lab.py`**: Launcher for a vulnerable HTTP/2 lab environment (requires `hypercorn`).
-*   **`verify_certs.py`**: Utility script to verify the consistency of the generated CA key and certificate.
+The repository is organized into several key components that work together to capture, process, and replay requests:
+
+*   **`scalpel_racer.py`**: The **Command Center**. It handles the interactive CLI (via `prompt_toolkit`), argument parsing, and high-level orchestration of the attack. It delegates capturing to `ProxyManager` and attacks to the specific engines.
+*   **`proxy_manager.py`**: The **Unified Proxy Orchestrator**. It manages both the TCP proxy (for HTTP/1.1 & HTTP/2) and the QUIC server (for HTTP/3). It acts as the central logging facility, feeding captured requests back to `scalpel_racer.py`.
+*   **`proxy_core.py`**: The **TCP Proxy Engine**. Implements `NativeProxyHandler` using `h2` and `asyncio`. It handles the complex logic of intercepting and parsing HTTP/1.1 and HTTP/2 traffic, including TLS termination.
+*   **`low_level.py`**: The **HTTP/2 Race Engine**. Contains `HTTP2RaceEngine`, which implements the raw socket and protocol logic required for the high-precision **SPA** and **First-Seq** strategies.
+*   **`sync_http11.py`**: The **HTTP/1.1 Sync Engine**. Implements `HTTP11SyncEngine` using Python threads and barriers to execute synchronous **Staged Attacks** (Staged LBS) for legacy HTTP/1.1 targets.
+*   **`packet_controller.py`**: The **Network Interceptor**. Manages Linux `NetfilterQueue` and `iptables` rules. It is responsible for holding and releasing packets at the kernel level for the **First-Seq** strategy.
+*   **`structures.py`**: **Data Models**. Defines shared data structures like `CapturedRequest` and `ScanResult` to ensure consistency across the application.
+*   **`verify_certs.py`**: **Certificate Utility**. Handles the generation and verification of the dynamic CA certificates used for HTTPS interception.
 
 ## Troubleshooting
 
-*   **`NetfilterQueue` not found**: Ensure you have installed the system headers (`libnetfilter-queue-dev`) before installing the Python package.
-*   **Permission Denied**: The `first-seq` strategy modifies firewall rules and requires `sudo`.
-*   **Browser Warnings**: Ensure `scalpel_ca.pem` is correctly imported into your Trusted Root store.
-*   **No Requests Captured**: Check if your browser is configured to use the proxy (default `localhost:8080`) and that the `scope` regex isn't filtering out your target.
+### Common Issues
+
+*   **`AttributeError: module 'asyncio' has no attribute 'TaskGroup'`**:
+    *   **Cause**: You are running Python older than 3.11.
+    *   **Fix**: Upgrade to Python 3.11 or higher.
+
+*   **`ImportError: No module named 'aioquic'`**:
+    *   **Cause**: The optional HTTP/3 dependency is missing.
+    *   **Fix**: Install it via `pip install aioquic` or ignore the warning if you don't need HTTP/3 support.
+
+*   **`NetfilterQueue` not found / `fatal error: libnetfilter_queue/libnetfilter_queue.h: No such file`**:
+    *   **Cause**: Missing system headers for compiling the Python package.
+    *   **Fix**: Run `sudo apt-get install libnetfilter-queue-dev` (Ubuntu/Debian) before pip installing.
+
+*   **`Permission Denied` (when using `first-seq`)**:
+    *   **Cause**: Modifying firewall rules requires root privileges.
+    *   **Fix**: Run the script with `sudo`.
+
+*   **`Address already in use`**:
+    *   **Cause**: Another process (or a previous instance of Scalpel Racer) is using port 8080 or 4433.
+    *   **Fix**: Kill the process using `lsof -i :8080` / `kill <PID>` or use the `-l <port>` argument to listen on a different port.
+
+*   **Browser Warnings / SSL Errors**:
+    *   **Cause**: The browser does not trust the generated CA.
+    *   **Fix**: Import `scalpel_ca.pem` into your browser's Trusted Root Certification Authorities store. Firefox has its own store separate from the OS.
+
+*   **No Requests Captured**:
+    *   **Cause**: The proxy is not configured correctly in your browser/tool, or the `scope` regex is too restrictive.
+    *   **Fix**: Ensure your browser proxy is set to `127.0.0.1:8080` (or your custom port) for both HTTP and HTTPS. Check your `--scope` argument.
