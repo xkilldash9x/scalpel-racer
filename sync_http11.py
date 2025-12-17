@@ -1,4 +1,3 @@
-# sync_http11.py
 """
 Implements the Synchronous HTTP/1.1 Staged Attack engine.
 
@@ -17,13 +16,11 @@ import ssl
 import time
 import threading
 import hashlib
-import sys
 import logging
 from urllib.parse import urlparse
 from typing import List, Dict, Tuple, Optional, Union
 # Import HTTPResponse for robust parsing over raw sockets
 from http.client import HTTPResponse
-import io
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +87,8 @@ class HTTP11SyncEngine:
         self.initial_payload: Optional[bytes] = None
         
         # Results tracking
-        self.results: List[Optional[ScanResult]] = [None] * concurrency
+        # Explicitly using Union to satisfy requirement and clarify intent
+        self.results: List[Union[ScanResult, None]] = [None] * concurrency
 
         self._parse_target()
         self._prepare_payload()
@@ -154,7 +152,7 @@ class HTTP11SyncEngine:
             except NotImplementedError:
                 pass
 
-    def run_attack(self) -> List[ScanResult]:
+    def run_attack(self) -> List[Union[ScanResult, None]]:
         """
         Executes the synchronized attack.
         """
@@ -240,8 +238,9 @@ class HTTP11SyncEngine:
         request_lines.append(f"Host: {host_header}")
 
         # 2. User-provided headers
-        # Use iterator to preserve duplicates and order
-        req_headers_iter = self.request.headers
+        # Use iterator to preserve duplicates and order. Explicitly typing for safety.
+        req_headers_iter: Union[Dict[str, str], List[Tuple[str, str]]] = self.request.headers
+        
         if isinstance(req_headers_iter, dict):
             req_headers_iter = req_headers_iter.items()
 

@@ -49,17 +49,20 @@ class TestH1Security:
         ]
         reader.read.return_value = b"0\r\n\r\n"
         iter_lines = iter(payload)
-        async def mock_read(): return next(iter_lines, b"")
+        async def mock_read(*args): return next(iter_lines, b"")
 
         handler = Http11ProxyHandler(reader, writer, "target.com", None, None, None, enable_tunneling=False)
-        handler._read_strict_line = mock_read
-        handler._read_chunked_body = AsyncMock(return_value=b"")
         
-        await handler.run()
-        # Should NOT have closed due to 400.
-        if writer.write.called:
-            args = writer.write.call_args[0][0]
-            assert b"400" not in args
+        # [FIX] Using patch.object on the Class
+        with patch.object(Http11ProxyHandler, '_read_strict_line', side_effect=mock_read), \
+             patch.object(Http11ProxyHandler, '_read_chunked_body', new_callable=AsyncMock) as mock_chunk:
+            
+            mock_chunk.return_value = b""
+            await handler.run()
+            # Should NOT have closed due to 400.
+            if writer.write.called:
+                args = writer.write.call_args[0][0]
+                assert b"400" not in args
 
     @pytest.mark.asyncio
     async def test_te_smuggling_bad_order(self):
@@ -73,14 +76,16 @@ class TestH1Security:
             b""
         ]
         iter_lines = iter(payload)
-        async def mock_read(): return next(iter_lines, b"")
+        async def mock_read(*args): return next(iter_lines, b"")
 
         handler = Http11ProxyHandler(reader, writer, "target.com", None, None, None)
-        handler._read_strict_line = mock_read
-        await handler.run()
         
-        writer.write.assert_called()
-        assert b"400 Bad Transfer-Encoding" in writer.write.call_args[0][0]
+        # [FIX] Using patch.object on the Class
+        with patch.object(Http11ProxyHandler, '_read_strict_line', side_effect=mock_read):
+            await handler.run()
+            
+            writer.write.assert_called()
+            assert b"400 Bad Transfer-Encoding" in writer.write.call_args[0][0]
 
     @pytest.mark.asyncio
     async def test_cl_te_conflict_handling(self):
@@ -95,18 +100,21 @@ class TestH1Security:
             b""
         ]
         iter_lines = iter(payload)
-        async def mock_read(): return next(iter_lines, b"")
+        async def mock_read(*args): return next(iter_lines, b"")
 
         handler = Http11ProxyHandler(reader, writer, "target.com", None, None, None, enable_tunneling=False)
-        handler._read_strict_line = mock_read
-        handler._read_chunked_body = AsyncMock(return_value=b"safe")
-        handler._handle_request = AsyncMock()
         
-        await handler.run()
-        
-        headers_dict = handler._handle_request.call_args[0][4]
-        assert "content-length" not in headers_dict
-        assert "transfer-encoding" in headers_dict
+        # [FIX] Using patch.object on the Class
+        with patch.object(Http11ProxyHandler, '_read_strict_line', side_effect=mock_read), \
+             patch.object(Http11ProxyHandler, '_read_chunked_body', return_value=b"safe"), \
+             patch.object(Http11ProxyHandler, '_handle_request', new_callable=AsyncMock) as mock_handle:
+            
+            await handler.run()
+            
+            # Access last argument for headers_dict (robust against presence of self)
+            headers_dict = mock_handle.call_args[0][-1]
+            assert "content-length" not in headers_dict
+            assert "transfer-encoding" in headers_dict
 
     @pytest.mark.asyncio
     async def test_recursive_connect_attempt(self):
