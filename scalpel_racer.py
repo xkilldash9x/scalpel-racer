@@ -33,6 +33,33 @@ try:
     UI_AVAILABLE = True
 except ImportError:
     UI_AVAILABLE = False
+
+    # Fallback for missing UI libraries
+    def print_formatted_text(*args, **kwargs):
+        for arg in args:
+            print(arg)
+
+    def ANSI(text): return text
+    def HTML(text): return text
+
+    class PromptSession:
+        def __init__(self, completer=None, **kwargs): pass
+        async def prompt_async(self, text): return await asyncio.to_thread(input, text)
+
+    class WordCompleter:
+        def __init__(self, words, ignore_case=True): pass
+
+    class patch_stdout:
+        def __enter__(self): pass
+        def __exit__(self, *args): pass
+
+    # Mock Colorama
+    class MockColor:
+        def __getattr__(self, name): return ""
+
+    Fore = MockColor()
+    Style = MockColor()
+
     print("Warning: 'prompt_toolkit' or 'colorama' not found. UI will be limited.")
 
 # 2. Network & Performance
@@ -372,7 +399,7 @@ class ScalpelApp:
         self.port = port
         self.strategy = strategy
         self.storage: List[CapturedRequest] = []
-        self.command_completer = WordCompleter(['ls', 'last', 'race', 'exit', 'quit', 'q'], ignore_case=True)
+        self.command_completer = WordCompleter(['ls', 'last', 'race', 'help', 'exit', 'quit', 'q'], ignore_case=True)
         self.session = PromptSession(completer=self.command_completer)
         self.mgr = None
         self.cert_mgr = None
@@ -446,6 +473,15 @@ class ScalpelApp:
                             continue
                         parts = ['race', str(len(self.storage) - 1)]
                         cmd = 'race'
+
+                    elif cmd in ('help', '?'):
+                        print_formatted_text(ANSI(f"\n{Fore.YELLOW}--- Scalpel Racer Commands ---{Style.RESET_ALL}"))
+                        print_formatted_text(ANSI(f"  {Fore.CYAN}ls{Style.RESET_ALL}                     : List captured requests (shows last 15)"))
+                        print_formatted_text(ANSI(f"  {Fore.CYAN}last{Style.RESET_ALL}                   : Race the most recently captured request"))
+                        print_formatted_text(ANSI(f"  {Fore.CYAN}race <id> [threads]{Style.RESET_ALL}    : Race specific request (default threads: 10)"))
+                        print_formatted_text(ANSI(f"  {Fore.CYAN}help / ?{Style.RESET_ALL}               : Show this help message"))
+                        print_formatted_text(ANSI(f"  {Fore.CYAN}exit / quit / q{Style.RESET_ALL}        : Exit the application"))
+                        print_formatted_text("")
 
                     if cmd == 'race':
                         if len(parts) < 2: 
