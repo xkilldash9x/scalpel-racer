@@ -19,7 +19,11 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 # -- Import Permission Handler --
 # This automatically registers the atexit cleanup hook for permissions
-import permissions
+try:
+    import permissions
+except ImportError:
+    # Fallback if permissions.py isn't present in this specific run context
+    print("[!] Warning: 'permissions' module not found. Cleanup hooks may not run.")
 
 # -- Constants --
 CA_KEY_PATH = "scalpel_ca.key"
@@ -30,7 +34,9 @@ class CertManager:
     """
     Manages the internal Certificate Authority and generates/signs
     leaf certificates for intercepted traffic on the fly.
-    Includes optimization for Shared Ephemeral Keys to reduce CPU load.
+    
+    Includes optimization for Shared Ephemeral Keys and specific support
+    for QUIC/HTTP3 listener certificates.
     """
     def __init__(self):
         self.ca_key = None
@@ -43,82 +49,143 @@ class CertManager:
         # during high-traffic interception.
         self.shared_leaf_key = ec.generate_private_key(ec.SECP256R1())
 
+        # -- Directory Security --
+        # Enforce 700 permissions on the certs directory to prevent
+        # unauthorized local users from reading private keys.
         if not os.path.exists(CERTS_DIR):
             os.makedirs(CERTS_DIR, mode=0o700)
         else:
-            # Ensure existing directory has safe permissions
             current_mode = stat.S_IMODE(os.stat(CERTS_DIR).st_mode)
             if current_mode != 0o700:
                 os.chmod(CERTS_DIR, 0o700)
         
         self._load_or_generate_ca()
+        
+        # Generate the static server certs required for the QUIC listener
+        self._generate_static_server_cert()
 
     def _load_or_generate_ca(self):
         """
-        Loads the existing CA from disk or generates a new ECC P-256 CA
-        if one does not exist.
+        Loads the existing CA from disk or generates a new ECC P-256 CA.
+        [SECURED] Includes 'Self-Healing' logic for corrupted key files.
         """
-        if not os.path.exists(CA_KEY_PATH) or not os.path.exists(CA_CERT_PATH):
-            print("[*] Generating new Scalpel CA (ECC P-256)...")
-            
-            # 1. Generate Private Key
-            self.ca_key = ec.generate_private_key(ec.SECP256R1())
-            
-            # 2. Configure Identity
-            # Using specific OIDs makes the cert look more 'official' during inspection
-            name = x509.Name([
-                x509.NameAttribute(NameOID.COMMON_NAME, "Scalpel Racer CA"),
-                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Red Team Ops"),
-                x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "Automated Security Testing"),
-            ])
-            
-            # 3. Build CA Certificate
-            # Valid for 10 years (3650 days)
-            self.ca_cert = x509.CertificateBuilder().subject_name(
-                name
-            ).issuer_name(
-                name
-            ).public_key(
-                self.ca_key.public_key()
-            ).serial_number(
-                x509.random_serial_number()
-            ).not_valid_before(
-                datetime.datetime.now(datetime.timezone.utc)
-            ).not_valid_after(
-                datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650)
-            ).add_extension(
-                x509.BasicConstraints(ca=True, path_length=None), critical=True,
-            ).sign(self.ca_key, hashes.SHA256())
-
-            # 4. Write Private Key (Securely)
-            # Using os.open to ensure 600 permissions atomically
-            fd = os.open(CA_KEY_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # 1. Attempt Load if files exist
+        if os.path.exists(CA_KEY_PATH) and os.path.exists(CA_CERT_PATH):
             try:
-                f = os.fdopen(fd, "wb")
-            except Exception:
-                os.close(fd)
-                raise
-
-            with f:
-                f.write(self.ca_key.private_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PrivateFormat.TraditionalOpenSSL,
-                    encryption_algorithm=serialization.NoEncryption(),
-                ))
-            
-            # 5. Write Certificate
-            with open(CA_CERT_PATH, "wb") as f:
-                f.write(self.ca_cert.public_bytes(serialization.Encoding.PEM))
+                print("[*] Loading existing Scalpel CA...")
+                with open(CA_KEY_PATH, "rb") as f:
+                    self.ca_key = serialization.load_pem_private_key(f.read(), password=None)
+                with open(CA_CERT_PATH, "rb") as f:
+                    self.ca_cert = x509.load_pem_x509_certificate(f.read())
                 
-            print(f"[+] CA Generated: {CA_CERT_PATH}")
-        else:
-            # Load existing CA
-            with open(CA_KEY_PATH, "rb") as f:
-                self.ca_key = serialization.load_pem_private_key(f.read(), password=None)
-            with open(CA_CERT_PATH, "rb") as f:
-                self.ca_cert = x509.load_pem_x509_certificate(f.read())
+                # If successful, return early
+                return
+            except (ValueError, TypeError, AttributeError) as e:
+                print(f"[!] CA State Corrupted ({e}). Initiating Self-Healing...")
+                # Fall through to generation logic below
+        
+        # 2. Generation Logic (Runs if files missing OR corrupted)
+        print("[*] Generating new Scalpel CA (ECC P-256)...")
+        
+        self.ca_key = ec.generate_private_key(ec.SECP256R1())
+        
+        name = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, "Scalpel Racer CA"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Red Team Ops"),
+            x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "Automated Security Testing"),
+        ])
+        
+        self.ca_cert = x509.CertificateBuilder().subject_name(
+            name
+        ).issuer_name(
+            name
+        ).public_key(
+            self.ca_key.public_key()
+        ).serial_number(
+            x509.random_serial_number()
+        ).not_valid_before(
+            datetime.datetime.now(datetime.timezone.utc)
+        ).not_valid_after(
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650)
+        ).add_extension(
+            x509.BasicConstraints(ca=True, path_length=None), critical=True,
+        ).sign(self.ca_key, hashes.SHA256())
 
-def get_context_for_host(self, hostname: str) -> ssl.SSLContext:
+        # Write Private Key
+        with open(CA_KEY_PATH, "wb") as f:
+            f.write(self.ca_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption(),
+            ))
+            
+        # Write Certificate
+        with open(CA_CERT_PATH, "wb") as f:
+            f.write(self.ca_cert.public_bytes(serialization.Encoding.PEM))
+            
+        print(f"[+] CA Generated/Healed: {CA_CERT_PATH}")
+
+    def _generate_static_server_cert(self):
+        """
+        Generates 'server.crt' and 'server.key' in the certs directory.
+        These are required for the QUIC / HTTP/3 listener to bind initially.
+        """
+        server_crt_path = os.path.join(CERTS_DIR, "server.crt")
+        server_key_path = os.path.join(CERTS_DIR, "server.key")
+
+        # Skip if they already exist to save IO
+        if os.path.exists(server_crt_path) and os.path.exists(server_key_path):
+            return
+
+        print("[*] Generating static QUIC/HTTP3 listener certificates (server.crt)...")
+        
+        # Use the shared leaf key for the server cert as well
+        key = self.shared_leaf_key
+        
+        # We generally use localhost or the machine hostname for the main listener
+        # Clients will SNI negotiate for the actual target later
+        common_name = "localhost"
+        
+        subject = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, common_name),
+        ])
+
+        builder = x509.CertificateBuilder().subject_name(
+            subject
+        ).issuer_name(
+            self.ca_cert.subject
+        ).public_key(
+            key.public_key()
+        ).serial_number(
+            x509.random_serial_number()
+        ).not_valid_before(
+            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
+        ).not_valid_after(
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=365)
+        )
+
+        builder = builder.add_extension(
+            x509.SubjectAlternativeName([
+                x509.DNSName(common_name),
+                x509.DNSName("127.0.0.1"),
+                x509.DNSName("::1")
+            ]),
+            critical=False,
+        )
+
+        cert = builder.sign(self.ca_key, hashes.SHA256())
+
+        with open(server_key_path, "wb") as f:
+            f.write(key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption(),
+            ))
+        
+        with open(server_crt_path, "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+    def get_context_for_host(self, hostname: str) -> ssl.SSLContext:
         """
         Returns an SSLContext configured with a certificate for the specific hostname.
         Uses a read-through cache and shared key optimization.
@@ -129,6 +196,7 @@ def get_context_for_host(self, hostname: str) -> ssl.SSLContext:
                 return self.cache[hostname]
 
             # [SECURITY FIX] Sanitize input to prevent Path Traversal
+            # validates that we aren't accepting "../../etc/passwd" as a hostname
             safe_hostname = os.path.basename(hostname)
             
             # Fallback for empty/malicious edge cases
@@ -186,11 +254,13 @@ def get_context_for_host(self, hostname: str) -> ssl.SSLContext:
             ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
             ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
             
-            # Support HTTP/2 and HTTP/1.1
-            ctx.set_alpn_protocols(["h2", "http/1.1"])
+            # Support HTTP/3 (h3), HTTP/2 (h2) and HTTP/1.1
+            # "h3" is required for QUIC
+            ctx.set_alpn_protocols(["h3", "h2", "http/1.1"])
             
             self.cache[hostname] = ctx
             return ctx
+
 def install_to_trust_store():
     """
     Installs the generated CA certificate to the system trust store.

@@ -9,7 +9,8 @@ from unittest.mock import MagicMock, patch, AsyncMock, mock_open
 from scalpel_racer import (
     run_scan, CertManager, Last_Byte_Stream_Body, Staged_Stream_Body,
     analyze_results, ScalpelApp, 
-    safe_spawn, send_probe_advanced
+    safe_spawn, 
+    send_probe_advanced
 )
 
 # [FIX] Import verify_certs to ensure the patcher can find the module
@@ -166,6 +167,8 @@ class TestScalpelIntegration:
              patch("verify_certs.os.path.exists", return_value=False), \
              patch("verify_certs.os.makedirs"), \
              patch("os.chown"), patch("os.chmod"), \
+             patch("verify_certs.os.open", return_value=123), \
+             patch("verify_certs.os.fdopen", mock_open()), \
              patch("verify_certs.ec.generate_private_key") as mock_key, \
              patch("verify_certs.x509.CertificateBuilder") as mock_builder:
             
@@ -175,8 +178,9 @@ class TestScalpelIntegration:
                            'not_valid_before', 'not_valid_after', 'add_extension']:
                 getattr(builder_instance, method).return_value = builder_instance
             
-            # [FIXED] CertManager generates CA in __init__ automatically via _load_or_generate_ca
-            # We do NOT call generate_ca() manually anymore as the method was removed.
+            # [FIXED] Configure key to return bytes for serialization to satisfy file.write()
+            mock_key.return_value.private_bytes.return_value = b"MOCK_KEY_BYTES"
+            
             mgr = CertManager()
             
             # Verify that we actually called the key generation
@@ -189,6 +193,8 @@ class TestScalpelIntegration:
         with patch("builtins.open", mock_open()), \
              patch("verify_certs.os.path.exists", return_value=False), \
              patch("verify_certs.os.makedirs"), \
+             patch("verify_certs.os.open", return_value=123), \
+             patch("verify_certs.os.fdopen", mock_open()), \
              patch("verify_certs.ec.generate_private_key") as mock_gen_key, \
              patch("verify_certs.x509.CertificateBuilder") as mock_builder, \
              patch("verify_certs.ssl.create_default_context"):
@@ -198,7 +204,11 @@ class TestScalpelIntegration:
                            'not_valid_before', 'not_valid_after', 'add_extension']:
                 getattr(builder_instance, method).return_value = builder_instance
             
+            # [FIXED] Configure key to return bytes for serialization
+            mock_gen_key.return_value.private_bytes.return_value = b"MOCK_KEY_BYTES"
+            
             mgr = CertManager()
+            
             # This triggers _load_or_generate_ca (1 key gen) + shared key init (1 key gen)
             # Re-initialize to ensure we capture the constructor calls
             mgr.__init__()
@@ -235,9 +245,10 @@ class TestScalpelIntegration:
         # [FIX] Update expectation to match 'Avg:' instead of 'Average:'
         assert "Avg: 86.67ms" in captured.out
 
-    @patch("permissions.os.chown")
+    # [FIX] Patch lchown instead of chown to match implementation
+    @patch("permissions.os.lchown")
     @patch("permissions.os.walk")
-    def test_fix_sudo_ownership(self, mock_walk, mock_chown):
+    def test_fix_sudo_ownership(self, mock_walk, mock_lchown):
         """Test that file ownership is reverted if running as sudo."""
         mock_walk.return_value = [("/fake/dir", [], ["test.pem"])]
         
@@ -247,7 +258,8 @@ class TestScalpelIntegration:
             permissions.restore_ownership()
             
             expected_path = os.path.join("/fake/dir", "test.pem")
-            mock_chown.assert_any_call(expected_path, 1000, 1000)
+            # Assert against lchown
+            mock_lchown.assert_any_call(expected_path, 1000, 1000)
 
     @patch("scalpel_racer.print_formatted_text")
     @patch("scalpel_racer.PromptSession")
