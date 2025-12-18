@@ -937,10 +937,20 @@ class NativeProxyHandler(BaseProxyHandler):
                 except asyncio.QueueEmpty:
                     pass
 
+                # [OPTIMIZATION] Batch buffer for this iteration of items to reduce syscalls
+                batch_data = bytearray()
+
                 for item in items:
                     if item is None:
                         # Termination signal received
                         queue.task_done()
+                        # Flush any pending data before returning
+                        if batch_data:
+                            async with socket_lock:
+                                try:
+                                    writer.write(batch_data)
+                                    await writer.drain()
+                                except: pass
                         return
 
                     payload, end_stream, ack_length = item
@@ -954,11 +964,7 @@ class NativeProxyHandler(BaseProxyHandler):
                                 conn_data = conn.data_to_send()
                             except Exception: break
                         if conn_data:
-                            async with socket_lock:
-                                try:
-                                    writer.write(conn_data)
-                                    await writer.drain()
-                                except: break
+                            batch_data.extend(conn_data)
                     else:
                         # Data Body with Robust Flow Control
                         data = payload
@@ -1012,18 +1018,23 @@ class NativeProxyHandler(BaseProxyHandler):
                                 except Exception: 
                                     break_loop = True
 
-                            # 1. Send Data (outside lock)
+                            # 1. Accumulate Data
                             if chunk_data:
-                                async with socket_lock:
-                                    try:
-                                        writer.write(chunk_data)
-                                        await writer.drain()
-                                    except: break
+                                batch_data.extend(chunk_data)
                             
                             if break_loop: break
                             
-                            # 2. Handle Zero Window Wait (outside lock)
+                            # 2. Handle Zero Window Wait
                             if should_wait_for_window:
+                                # MUST flush before waiting
+                                if batch_data:
+                                    async with socket_lock:
+                                        try:
+                                            writer.write(batch_data)
+                                            await writer.drain()
+                                        except: pass
+                                    batch_data.clear()
+
                                 try: 
                                     # Defense in Depth: Timeout to prevent infinite hang/resource exhaustion
                                     await asyncio.wait_for(flow_event.wait(), timeout=FLOW_CONTROL_TIMEOUT)
@@ -1049,7 +1060,22 @@ class NativeProxyHandler(BaseProxyHandler):
                                 except: pass
 
                     queue.task_done()
-                    if end_stream: return
+                    if end_stream:
+                        if batch_data:
+                             async with socket_lock:
+                                 try:
+                                     writer.write(batch_data)
+                                     await writer.drain()
+                                 except: pass
+                        return
+
+                # Flush batch at end of items
+                if batch_data:
+                    async with socket_lock:
+                        try:
+                            writer.write(batch_data)
+                            await writer.drain()
+                        except: pass
 
             except Exception as e:
                 self.log("ERROR", f"Stream sender error: {e}")
