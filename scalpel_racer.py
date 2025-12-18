@@ -336,7 +336,7 @@ class ScalpelApp:
         self.port = port
         self.strategy = strategy
         self.storage: List[CapturedRequest] = []
-        self.command_completer = WordCompleter(['ls', 'last', 'race', 'exit', 'quit', 'q'], ignore_case=True)
+        self.command_completer = WordCompleter(['ls', 'last', 'race', 'exit', 'quit', 'q', 'help', '?'], ignore_case=True)
         self.session = PromptSession(completer=self.command_completer)
         self.mgr = None
         self.cert_mgr = None
@@ -384,11 +384,25 @@ class ScalpelApp:
                     
                     if cmd == 'ls':
                         print_formatted_text(ANSI(f"\n{Fore.YELLOW}--- History ({len(self.storage)}) ---{Style.RESET_ALL}"))
-                        for i in range(max(0, len(self.storage) - 15), len(self.storage)): 
-                            req = self.storage[i]
-                            txt = req.display_str() if hasattr(req, 'display_str') else f"{req.method} {req.url}"
-                            print_formatted_text(f"[{i}] {txt}")
+                        if not self.storage:
+                            print_formatted_text(ANSI(f"{Fore.CYAN}ℹ No requests captured yet.{Style.RESET_ALL}"))
+                            print_formatted_text(ANSI(f"{Fore.CYAN}  Configure your browser/client to proxy through {Fore.WHITE}localhost:{self.port}{Style.RESET_ALL}"))
+                        else:
+                            for i in range(max(0, len(self.storage) - 15), len(self.storage)):
+                                req = self.storage[i]
+                                txt = req.display_str() if hasattr(req, 'display_str') else f"{req.method} {req.url}"
+                                print_formatted_text(f"[{i}] {txt}")
                     
+                    elif cmd in ('help', '?'):
+                        print_formatted_text(ANSI(f"\n{Fore.YELLOW}--- Available Commands ---{Style.RESET_ALL}"))
+                        print_formatted_text(ANSI(f"  {Fore.GREEN}ls{Style.RESET_ALL}          List recent captured requests"))
+                        print_formatted_text(ANSI(f"  {Fore.GREEN}last{Style.RESET_ALL}        Race the most recently captured request"))
+                        print_formatted_text(ANSI(f"  {Fore.GREEN}race <id>{Style.RESET_ALL}   Race a specific request ID (from ls)"))
+                        print_formatted_text(ANSI(f"  {Fore.GREEN}exit{Style.RESET_ALL}        Stop proxy and exit"))
+                        print_formatted_text(ANSI(f"\n{Fore.YELLOW}--- Tips ---{Style.RESET_ALL}"))
+                        print_formatted_text(ANSI(f"  • Configure your browser to proxy HTTP traffic to {Fore.WHITE}127.0.0.1:{self.port}{Style.RESET_ALL}"))
+                        print_formatted_text(ANSI(f"  • Race commands accept optional thread count: {Fore.CYAN}race <id> 20{Style.RESET_ALL}"))
+
                     elif cmd == 'last':
                         if not self.storage: 
                             print_formatted_text("No captures.")
