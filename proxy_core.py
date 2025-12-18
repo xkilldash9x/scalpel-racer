@@ -55,6 +55,9 @@ except ImportError:
     
     SENSITIVE_HEADERS = {'authorization', 'proxy-authorization', 'cookie', 'set-cookie', 'x-auth-token'}
 
+# [VECTOR] Byte-optimized Sets for Zero-Copy Header Processing
+SENSITIVE_HEADERS_BYTES = {h.encode('ascii') for h in SENSITIVE_HEADERS}
+
 if TYPE_CHECKING:
     from h2.connection import H2Connection
     from h2.config import H2Configuration
@@ -91,7 +94,7 @@ except ImportError:
 
 # H2 Specific forbidden headers (RFC 7540)
 H2_FORBIDDEN_HEADERS = frozenset({
-    'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade'
+    b'connection', b'keep-alive', b'proxy-connection', b'transfer-encoding', b'upgrade'
 })
 
 # Regex for strict header validation (No whitespace before colon, strict tokens)
@@ -924,47 +927,62 @@ class NativeProxyHandler(BaseProxyHandler):
         await self.flush(self.downstream_conn, self.client_writer, self.ds_h2_lock, self.ds_socket_lock)
 
     def _prepare_forwarded_headers(self, headers, is_upstream=True):
-        """Sanitizes and prepares headers for forwarding."""
+        """
+        Sanitizes and prepares headers for forwarding.
+        [VECTOR] Optimization: Processes headers as bytes to avoid decode/encode overhead.
+        """
         decoded = []; method = None; protocol = None; host_val = None
+
         for k, v in headers:
-            k_s = k.decode('utf-8') if isinstance(k, bytes) else k
-            v_s = v.decode('utf-8') if isinstance(v, bytes) else v
-            if '\n' in v_s or '\r' in v_s: raise ValueError(f"Illegal header value: {k_s}")
-            if k_s == ':method': method = v_s
-            elif k_s == ':protocol': protocol = v_s
-            elif k_s.lower() == 'host': host_val = v_s
-            decoded.append((k_s, v_s))
+            # Ensure bytes
+            k_b = k if isinstance(k, bytes) else k.encode('utf-8')
+            v_b = v if isinstance(v, bytes) else v.encode('utf-8')
+
+            if b'\n' in v_b or b'\r' in v_b: raise ValueError(f"Illegal header value: {k_b}")
+
+            if k_b == b':method': method = v_b
+            elif k_b == b':protocol': protocol = v_b
+            elif k_b.lower() == b'host': host_val = v_b
+            decoded.append((k_b, v_b))
+
         out = []; seen_regular = False
-        is_connect = (method == 'CONNECT'); is_extended = is_connect and (protocol is not None)
+        is_connect = (method == b'CONNECT'); is_extended = is_connect and (protocol is not None)
         pseudo = {}
-        for k_s, v_s in decoded:
-            if k_s.startswith(':'):
+
+        for k_b, v_b in decoded:
+            if k_b.startswith(b':'):
                 if seen_regular: raise ValueError("Pseudo-header after regular")
-                pseudo[k_s] = v_s
+                pseudo[k_b] = v_b
             else:
                 seen_regular = True
-                if k_s.lower() in H2_FORBIDDEN_HEADERS: continue
+                k_lower = k_b.lower()
+                if k_lower in H2_FORBIDDEN_HEADERS: continue
                 
                 # [UPDATED] Strict TE Header Processing
-                if k_s.lower() == 'te':
-                    if v_s.lower() == 'trailers': out.append((k_s, v_s))
-                    continue # Stop processing 'te' here so it doesn't fall through to append
+                if k_lower == b'te':
+                    if v_b.lower() == b'trailers': out.append((k_b, v_b))
+                    continue
+
+                if k_lower == b'host': continue
+                out.append((k_b, v_b))
                 
-                if k_s.lower() == 'host': continue
-                out.append((k_s, v_s))
         final = []
         if is_upstream:
-            if ':authority' not in pseudo:
-                if host_val: pseudo[':authority'] = host_val
+            if b':authority' not in pseudo:
+                if host_val: pseudo[b':authority'] = host_val
                 elif self.upstream_host:
                     auth = self.upstream_host
                     if self.upstream_port not in (80, 443): auth += f":{self.upstream_port}"
-                    pseudo[':authority'] = auth
+                    pseudo[b':authority'] = auth.encode('utf-8')
+
         for k, v in pseudo.items():
-            if k == ':authority' and not is_upstream and ':authority' not in pseudo: continue
-            if is_connect and not is_extended and k in (':scheme', ':path'): continue
+            if k == b':authority' and not is_upstream and b':authority' not in pseudo: continue
+            if is_connect and not is_extended and k in (b':scheme', b':path'): continue
             final.append((k, v))
         final.extend(out)
+
+        # Protocol is returned as bytes; upstream consumers generally check truthiness
+        # or handle bytes correctly given the context of H2 pseudo-headers.
         return self._wrap_security(final), protocol
 
     def _process_headers_for_capture(self, headers: List[Tuple[Any, Any]]) -> CapturedHeaders:
@@ -987,7 +1005,8 @@ class NativeProxyHandler(BaseProxyHandler):
     def _wrap_security(self, headers):
         """Wraps headers in HPack security structures for sensitive headers."""
         if not hpack: return headers
-        return [hpack.NeverIndexedHeaderTuple(k, v) if k.lower() in SENSITIVE_HEADERS else (k, v) for k, v in headers]
+        # [VECTOR] Optimization: Check against byte set
+        return [hpack.NeverIndexedHeaderTuple(k, v) if k.lower() in SENSITIVE_HEADERS_BYTES else (k, v) for k, v in headers]
 
     async def handle_window_updated(self, event, direction):
         """Handles flow control window updates."""

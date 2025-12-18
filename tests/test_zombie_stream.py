@@ -88,8 +88,8 @@ class TestProxyZombieStreams(unittest.IsolatedAsyncioTestCase):
         # Should contain: (headers, end_stream, ack_len)
         item = await ctx.downstream_queue.get()
         
-        # [FIX] Expect Strings, because proxy_core._prepare_forwarded_headers decodes them.
-        expected_headers = [(':status', '200'), ('server', 'nginx')]
+        # [UPDATED] Expect Bytes, because proxy_core._prepare_forwarded_headers now preserves bytes.
+        expected_headers = [(b':status', b'200'), (b'server', b'nginx')]
         
         self.assertEqual(item[0], expected_headers)
         self.assertFalse(item[1]) # Stream not ended yet
