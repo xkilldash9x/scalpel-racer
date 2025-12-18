@@ -38,6 +38,9 @@ class TestCertManager:
         # Mock filesystem to say files do NOT exist
         with patch("os.path.exists", return_value=False), \
              patch("builtins.open", MagicMock()) as mock_file, \
+             patch("os.open", MagicMock()) as mock_os_open, \
+             patch("os.fdopen", MagicMock()) as mock_fdopen, \
+             patch("os.close", MagicMock()), \
              patch("os.makedirs"):
             
             # Use real class to test the _load_or_generate_ca logic
@@ -47,9 +50,8 @@ class TestCertManager:
             # Once for shared leaf key, Once for CA key
             assert mock_ec.call_count >= 2
             
-            # Should open key file and cert file for writing
-            assert mock_file.call_count >= 2
-            mock_file.assert_any_call(CA_KEY_PATH, "wb")
+            # Should open key file (via os.open) and cert file (via builtins.open)
+            mock_os_open.assert_any_call(CA_KEY_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             mock_file.assert_any_call(CA_CERT_PATH, "wb")
             
             # Verify CA cert builder was invoked
@@ -61,8 +63,13 @@ class TestCertManager:
         """Verify loading existing keys from disk."""
         with patch("os.path.exists", return_value=True), \
              patch("builtins.open", MagicMock()), \
+             patch("os.chmod", MagicMock()), \
+             patch("os.stat") as mock_stat, \
              patch("verify_certs.ec.generate_private_key"): # Mock shared key gen
              
+             # Mock stat so S_IMODE works
+             mock_stat.return_value.st_mode = 0o700
+
              mgr = CertManager()
              
              mock_load_key.assert_called()
@@ -102,7 +109,10 @@ class TestCertManager:
         host = "cache-test.com"
         
         # Mock file IO for saving the leaf cert
-        with patch("builtins.open", MagicMock()):
+        with patch("builtins.open", MagicMock()), \
+             patch("os.open", MagicMock()), \
+             patch("os.fdopen", MagicMock()), \
+             patch("os.close", MagicMock()):
             # First Call: Should generate
             ctx1 = manager.get_context_for_host(host)
             
@@ -151,7 +161,10 @@ class TestCertManager:
 
         host = "secure-test.com"
 
-        with patch("builtins.open", MagicMock()):
+        with patch("builtins.open", MagicMock()), \
+             patch("os.open", MagicMock()), \
+             patch("os.fdopen", MagicMock()), \
+             patch("os.close", MagicMock()):
             manager.get_context_for_host(host)
 
         # 1. Verify Public Key setting
