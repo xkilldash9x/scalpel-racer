@@ -1,6 +1,4 @@
-################################################################################
-# START OF FILE: tests/test_scalpel_racer.py
-################################################################################
+# tests/test_scalpel_racer.py
 import pytest
 import asyncio
 import ssl
@@ -12,9 +10,13 @@ from unittest.mock import MagicMock, patch, AsyncMock, mock_open
 # Import the module under test
 from scalpel_racer import (
     run_scan, CAManager, Last_Byte_Stream_Body, Staged_Stream_Body,
-    analyze_results, CaptureApp, edit_request_body, fix_sudo_ownership,
+    analyze_results, CaptureApp, 
+    edit_request_body,
     safe_spawn, send_probe_advanced, CA_CERT_FILE, CA_KEY_FILE, IP_REGEX
 )
+
+# Import the new location for permission handling
+import permissions
 
 try:
     from structures import ScanResult, CapturedRequest, SYNC_MARKER
@@ -217,6 +219,7 @@ class TestScalpelIntegration:
              patch("scalpel_racer.ec.generate_private_key") as mock_gen_key, \
              patch("scalpel_racer.x509.CertificateBuilder") as mock_builder, \
              patch("verify_certs.ssl.create_default_context"):
+        
             
             # Setup fluent interface for mock builder
             builder_instance = mock_builder.return_value
@@ -263,15 +266,25 @@ class TestScalpelIntegration:
         # Should verify timing average (100+110+50)/3 = 86.67
         assert "Average: 86.67ms" in captured.out
 
-    @patch("scalpel_racer.os.chown")
-    @patch("scalpel_racer.os.chmod")
-    def test_fix_sudo_ownership(self, mock_chmod, mock_chown):
+    # [REFACTORED TEST]
+    # We patch 'permissions' module dependencies because the functionality moved there.
+    @patch("permissions.os.chown")
+    @patch("permissions.os.walk")
+    def test_fix_sudo_ownership(self, mock_walk, mock_chown):
         """Test that file ownership is reverted if running as sudo."""
+        # Mock os.walk to return a fake file structure
+        # Yields: (root, dirs, files)
+        mock_walk.return_value = [("/fake/dir", [], ["test.pem"])]
+        
         with patch("os.geteuid", return_value=0), \
              patch.dict("os.environ", {"SUDO_UID": "1000", "SUDO_GID": "1000"}):
             
-            fix_sudo_ownership("test.pem")
-            mock_chown.assert_called_with("test.pem", 1000, 1000)
+            # Call the updated function
+            permissions.restore_ownership()
+            
+            # Verify chown was called on the file found by walk
+            expected_path = os.path.join("/fake/dir", "test.pem")
+            mock_chown.assert_any_call(expected_path, 1000, 1000)
 
     @patch("builtins.input")
     @patch("sys.stdin")

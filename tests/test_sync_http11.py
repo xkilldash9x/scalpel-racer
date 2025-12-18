@@ -33,11 +33,18 @@ class TestHTTP11SyncEngine:
         with pytest.raises(ValueError, match="Unsupported URL scheme"):
             HTTP11SyncEngine(req, 1)
 
-    def test_init_no_sync_marker(self):
-        """Ensure missing {{SYNC}} marker raises ValueError."""
+    def test_init_no_sync_marker_implicit(self):
+        """
+        [UPDATED] Ensure missing {{SYNC}} marker triggers Implicit Last-Byte-Sync.
+        Previously expected to raise ValueError, now expects auto-split.
+        """
         req = CapturedRequest(id=0, method="GET", headers=[], url="http://a.com", body=b"nosync")
-        with pytest.raises(ValueError, match="requires at least one"):
-            HTTP11SyncEngine(req, 1)
+        engine = HTTP11SyncEngine(req, 1)
+        
+        # Should split "nosync" into "nosyn" and "c"
+        assert len(engine.stages) == 2
+        assert engine.stages[0] == b"nosyn"
+        assert engine.stages[1] == b"c"
 
     @patch("sync_http11.socket.create_connection")
     @patch("sync_http11.ssl.create_default_context")
@@ -175,6 +182,9 @@ class TestHTTP11SyncEngine:
         
         mock_resp = MagicMock()
         mock_resp.status = 200
+        # [FIX] Mock isclosed to return False so the check passes
+        mock_resp.isclosed.return_value = False
+        
         # read(limit) returns full, then read(1) returns more data
         mock_resp.read.side_effect = [b"A" * 1024*1024, b"X"] 
         mock_http_resp.return_value = mock_resp

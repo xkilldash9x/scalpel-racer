@@ -1,14 +1,12 @@
+# sync_http11.py
 """
 Implements the Synchronous HTTP/1.1 Staged Attack engine.
 
-This module provides a specialized attack engine (`HTTP11SyncEngine`) that uses Python
-threads and barriers to synchronize the sending of request payloads across multiple
-connections. It is designed to achieve higher precision than asyncio-based approaches
-by synchronizing threads immediately before the `socket.send` call.
-
-[OPTIMIZED] - Header pre-serialization and pre-concatenation
-            - SO_SNDBUF tuning to 256KB
-            - Local variable caching in hot loop
+[UPDATED] - Supports 'first-seq' (PacketController integration) via specialized H1 subclass.
+          - Supports Implicit Last-Byte-Sync (no {{SYNC}} markers needed).
+          - Robust fail-fast barrier synchronization.
+          - [FIX] Preserves duplicate headers (e.g. Set-Cookie).
+          - [FIX] Detects and warns on response truncation.
 """
 
 import socket
@@ -17,17 +15,27 @@ import time
 import threading
 import hashlib
 import logging
+import struct
+import subprocess
 from urllib.parse import urlparse
 from typing import List, Dict, Tuple, Optional, Union
-# Import HTTPResponse for robust parsing over raw sockets
 from http.client import HTTPResponse
 
 logger = logging.getLogger(__name__)
 
-# Fallback structures for standalone testing
+# --- Dependency Handling ---
+try:
+    from packet_controller import PacketController, NFQUEUE_AVAILABLE
+except ImportError:
+    PacketController = None
+    NFQUEUE_AVAILABLE = False
+
 try:
     from structures import ScanResult, CapturedRequest, MAX_RESPONSE_BODY_READ, SYNC_MARKER
 except ImportError:
+    # Fallback structures for standalone testing
+    MAX_RESPONSE_BODY_READ = 1024 * 1024
+    SYNC_MARKER = b"{{SYNC}}"
     class ScanResult:
         __slots__ = ('index', 'status_code', 'duration', 'body_hash', 'body_snippet', 'error')
         def __init__(self, index, status_code, duration, body_hash=None, body_snippet=None, error=None):
@@ -39,34 +47,153 @@ except ImportError:
             self.id = id; self.method = method; self.url = url; self.headers = headers or {}; self.body = body; self.edited_body = None
         def get_attack_payload(self) -> bytes:
             return self.edited_body if self.edited_body is not None else self.body
-    MAX_RESPONSE_BODY_READ = 1024 * 1024
-    SYNC_MARKER = b"{{SYNC}}"
+        def headers_dict(self) -> Dict[str, str]:
+            return dict(self.headers) if isinstance(self.headers, list) else self.headers
 
-# Configuration Constants
+# --- Constants ---
 CONNECTION_TIMEOUT = 10.0
 RESPONSE_TIMEOUT = 10.0
-BARRIER_TIMEOUT = 15.0 # Timeout for synchronization barrier
+BARRIER_TIMEOUT = 15.0
 
+# Structs for low-level packet parsing
+_STRUCT_H = struct.Struct("!H")
+
+# --- H1 Specialized Kernel Controller ---
+class H1PacketController(PacketController if PacketController else object):
+    """
+    Specialized PacketController for HTTP/1.1 Multi-Socket Attacks.
+    
+    The standard PacketController is designed for HTTP/2 (single stream, sequence tracking).
+    HTTP/1.1 uses multiple sockets with random sequences. This subclass overrides the logic
+    to implement 'Count-Based Bunching' (holding N packets) and wildcard source port filtering.
+    """
+    def __init__(self, target_ip: str, target_port: int, concurrency: int):
+        # Initialize parent with source_port=0 (Wildcard placeholder)
+        if PacketController:
+            super().__init__(target_ip, target_port, 0)
+        self.concurrency = concurrency
+        self.held_packets = []
+        self.release_event = threading.Event()
+        # Override parent lock for local thread safety
+        self.lock = threading.Lock()
+        self.safety_thread = None
+
+    def _manage_nftables(self, action: str):
+        """
+        Overrides parent rule generation.
+        CRITICAL: Omits 'tcp sport' to trap ALL outgoing connections to the target IP/Port.
+        """
+        table_name = "scalpel_racer_ctx"
+        chain_name = "output_hook"
+        
+        if action == 'add':
+            cmd_table = ['nft', 'add', 'table', 'ip', table_name]
+            cmd_chain = [
+                'nft', 'add', 'chain', 'ip', table_name, chain_name,
+                '{', 'type', 'filter', 'hook', 'output', 'priority', '0', ';', '}'
+            ]
+            # Rule matches DADDR and DPORT only (bunching all sockets to target)
+            cmd_rule = [
+                'nft', 'add', 'rule', 'ip', table_name, chain_name,
+                'ip', 'protocol', 'tcp',
+                'ip', 'daddr', self.target_ip,
+                'tcp', 'dport', str(self.target_port),
+                'counter', 'queue', 'num', str(self.queue_num)
+            ]
+            try:
+                subprocess.call(cmd_table, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                subprocess.call(cmd_chain, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                subprocess.call(cmd_rule, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            except Exception: pass
+
+        elif action == 'delete':
+            cmd_del = ['nft', 'delete', 'table', 'ip', table_name]
+            try:
+                subprocess.call(cmd_del, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            except Exception: pass
+
+    def _queue_callback(self, pkt):
+        """
+        Count-Based Bunching Logic.
+        Holds packets until 'concurrency' count is reached, then releases all.
+        """
+        if not self.active:
+            pkt.accept(); return
+
+        try:
+            raw = pkt.get_payload()
+            # 1. Basic IPv4/TCP Sanity Check
+            if len(raw) < 20 or (raw[0] >> 4) != 4 or raw[9] != 6:
+                pkt.accept(); return
+            
+            # 2. Calculate Payload Length (ignore SYN/ACK/Handshakes)
+            ihl = (raw[0] & 0x0F) * 4
+            total_len = _STRUCT_H.unpack_from(raw, 2)[0]
+            tcp_start = ihl
+            data_off = (raw[tcp_start + 12] >> 4) * 4
+            payload_len = total_len - ihl - data_off
+
+            # 3. Filter: Only hold packets with Data
+            if payload_len <= 0:
+                pkt.accept(); return
+
+            with self.lock:
+                # If race already triggered, pass through
+                if self.release_event.is_set():
+                    pkt.accept(); return
+
+                self.held_packets.append(pkt)
+                
+                # Check Bunch Condition
+                if len(self.held_packets) >= self.concurrency:
+                    self._release_all()
+        except Exception:
+            pkt.accept()
+
+    def _release_all(self):
+        """Releases all held packets simultaneously."""
+        self.release_event.set()
+        for p in self.held_packets:
+            try: p.accept()
+            except: pass
+        self.held_packets.clear()
+
+    def _delayed_release(self):
+        """
+        Safety timeout override.
+        Ensures packets are flushed if the barrier isn't reached in time.
+        """
+        if self.release_event.wait(timeout=5.0):
+            return
+        # Timeout reached (e.g., one thread died), flush everything
+        with self.lock:
+            self._release_all()
+    
+    def start(self):
+        super().start()
+        # Start our specific safety thread
+        self.safety_thread = threading.Thread(target=self._delayed_release, daemon=True)
+        self.safety_thread.start()
+
+
+# --- Main Engine ---
 class HTTP11SyncEngine:
     """
-    Implements high-precision Synchronous Staged Attacks over HTTP/1.1 using threads and barriers.
+    Implements high-precision Synchronous Staged Attacks over HTTP/1.1.
     """
     __slots__ = (
-        'request', 'concurrency', 'target_host', 'target_port', 'scheme', 'target_ip',
+        'request', 'concurrency', 'strategy', 'target_host', 'target_port', 'scheme', 'target_ip',
         'stages', 'total_payload_len', 'barrier', 'ssl_context', 'serialized_headers',
         'results', 'initial_payload'
     )
 
-    def __init__(self, request: CapturedRequest, concurrency: int):
+    def __init__(self, request: CapturedRequest, concurrency: int, strategy: str = "auto"):
         """
         Initializes the HTTP11SyncEngine.
-
-        Args:
-            request (CapturedRequest): The request to attack with.
-            concurrency (int): The number of concurrent threads/requests.
         """
         self.request = request
         self.concurrency = concurrency
+        self.strategy = strategy
         
         self.target_host = None
         self.target_port = None
@@ -75,42 +202,26 @@ class HTTP11SyncEngine:
         
         self.stages: List[bytes] = []
         self.total_payload_len = 0
-        
-        # Synchronization primitives
         self.barrier: threading.Barrier = None
-        
-        # SSL Context (Optimized: Created once)
         self.ssl_context: Optional[ssl.SSLContext] = None
-        
-        # Cache serialized headers
         self.serialized_headers: Optional[bytes] = None
         self.initial_payload: Optional[bytes] = None
         
-        # Results tracking
-        # Explicitly using Union to satisfy requirement and clarify intent
         self.results: List[Union[ScanResult, None]] = [None] * concurrency
 
         self._parse_target()
         self._prepare_payload()
         self._prepare_ssl_context()
         
-        # Pre-serialize
         self.serialized_headers = self._serialize_headers()
         
-        # VECTOR OPTIMIZATION: Pre-calculate the initial payload (Headers + Stage 1)
-        # to avoid concatenation in the thread's hot path.
+        # Pre-calculate initial payload (Headers + Stage 0)
         if self.stages:
             self.initial_payload = self.serialized_headers + self.stages[0]
         else:
             self.initial_payload = self.serialized_headers
 
     def _parse_target(self):
-        """
-        Parses the target URL to extract host, port, and scheme.
-
-        Raises:
-            ValueError: If the URL scheme is unsupported (not http or https).
-        """
         parsed_url = urlparse(self.request.url)
         self.target_host = parsed_url.hostname
         self.scheme = parsed_url.scheme
@@ -120,79 +231,99 @@ class HTTP11SyncEngine:
         elif self.scheme == 'http':
             self.target_port = parsed_url.port or 80
         else:
-            raise ValueError(f"Unsupported URL scheme: {self.scheme}")
+            # Fallback for relative URLs if Host header exists
+            # We check the headers directly without converting to dict to avoid data loss
+            # though here we only need 'host' so dict is fine for finding it.
+            headers = self.request.headers_dict()
+            if 'host' in headers:
+                host_val = headers['host']
+                if ':' in host_val:
+                    self.target_host, port_str = host_val.split(':', 1)
+                    self.target_port = int(port_str)
+                else:
+                    self.target_host = host_val
+                    self.target_port = 80
+                self.scheme = 'http'
+            else:
+                raise ValueError(f"Unsupported URL scheme: {self.scheme}")
 
     def _prepare_payload(self):
         """
-        Prepares the payload stages and initializes the synchronization barrier.
-        Splits the payload by the `{{SYNC}}` marker.
-
-        Raises:
-            ValueError: If fewer than 2 stages are found (requires at least one sync marker).
+        Prepares payload stages.
+        [FIX] Auto-enables Last-Byte-Sync if no {{SYNC}} markers are found.
         """
         payload = self.request.get_attack_payload()
-        # The actual length sent over the wire excludes the markers
         self.total_payload_len = len(payload.replace(SYNC_MARKER, b""))
-        self.stages = payload.split(SYNC_MARKER)
         
-        if len(self.stages) < 2:
-            raise ValueError("Synchronous Staged Attack requires at least one {{SYNC}} marker.")
+        if SYNC_MARKER in payload:
+            # Explicit Staged Attack
+            self.stages = payload.split(SYNC_MARKER)
+        else:
+            # Implicit Last-Byte-Sync (SPA equivalent for H1)
+            if len(payload) > 1:
+                # Normal case: Split last byte
+                self.stages = [payload[:-1], payload[-1:]]
+            elif len(payload) == 1:
+                # 1-byte payload: Send Headers+Empty, wait, then Byte
+                self.stages = [b"", payload]
+            else:
+                # Empty payload: Just send as one chunk
+                self.stages = [payload, b""]
             
-        # Initialize barrier for N concurrent requests.
-        self.barrier = threading.Barrier(self.concurrency)
+        # Only init barrier if we actually have stages to sync
+        if len(self.stages) > 1:
+            self.barrier = threading.Barrier(self.concurrency)
 
     def _prepare_ssl_context(self):
-        """
-        Initializes the SSL context if required.
-        Refactored to run once during init rather than per-connection for efficiency.
-        """
         if self.scheme == 'https':
             self.ssl_context = ssl.create_default_context()
-            # Mimic 'verify=False' - Essential for attacking targets with self-signed certs
             self.ssl_context.check_hostname = False
             self.ssl_context.verify_mode = ssl.CERT_NONE
-            
-            # Force HTTP/1.1 via ALPN if supported
             try:
                 self.ssl_context.set_alpn_protocols(["http/1.1"])
             except NotImplementedError:
                 pass
 
     def run_attack(self) -> List[Union[ScanResult, None]]:
-        """
-        Executes the synchronized attack.
-
-        Resolves the IP, launches concurrent threads, waits for completion,
-        and aggregates the results.
-
-        Returns:
-            List[Union[ScanResult, None]]: A list of results for each probe.
-        """
         logger.info(f"Connecting to {self.target_host}:{self.target_port}...")
         
-        # 1. Resolve IP (Centralized resolution)
         try:
             self.target_ip = socket.gethostbyname(self.target_host)
             logger.info(f"Resolved IP: {self.target_ip}")
         except socket.gaierror as e:
-            logger.error(f"DNS resolution failed: {e}")
-            # Return error results immediately if DNS fails
             return [ScanResult(i, 0, 0.0, error=f"DNS error: {e}") for i in range(self.concurrency)]
 
-        # 2. Launch threads
+        # [FIX] Engage Specialized Kernel Controller for First-Seq
+        pc = None
+        if self.strategy == "first-seq":
+            if PacketController and NFQUEUE_AVAILABLE:
+                logger.info("[!] Engaging Kernel Packet Controller (First-Seq H1 Mode)...")
+                try:
+                    # Initialize our specialized H1 controller
+                    pc = H1PacketController(self.target_ip, self.target_port, self.concurrency)
+                    pc.start()
+                except Exception as e:
+                    logger.error(f"Failed to start PacketController: {e}")
+                    pc = None
+            else:
+                logger.warning("Strategy 'first-seq' unavailable (Requires Linux + NetfilterQueue).")
+
         threads = []
-        for i in range(self.concurrency):
-            t = threading.Thread(target=self._attack_thread, args=(i,))
-            threads.append(t)
-            t.start()
+        try:
+            for i in range(self.concurrency):
+                t = threading.Thread(target=self._attack_thread, args=(i,))
+                threads.append(t)
+                t.start()
 
-        # 3. Wait for completion
-        for t in threads:
-            # Use a timeout for joining threads to prevent infinite hangs
-            t.join(timeout=RESPONSE_TIMEOUT + BARRIER_TIMEOUT + 5)
+            for t in threads:
+                t.join(timeout=RESPONSE_TIMEOUT + BARRIER_TIMEOUT + 5)
+        finally:
+            # [CRITICAL] Ensure Kernel Controller is stopped
+            if pc:
+                logger.info("[!] Disengaging Kernel Controller...")
+                pc.stop()
 
-        # 4. Finalize results
-        # Ensure None results are converted to errors if applicable
+        # Finalize results
         for i in range(self.concurrency):
              if self.results[i] is None:
                   self.results[i] = ScanResult(i, 0, 0.0, error="Thread execution timeout or hang.")
@@ -200,26 +331,13 @@ class HTTP11SyncEngine:
         return self.results
 
     def _connect(self) -> socket.socket:
-        """
-        Establishes a persistent TCP (and optionally SSL) connection.
-
-        Returns:
-            socket.socket: The connected socket object.
-
-        Raises:
-            ConnectionError: If connection fails or SSL handshake fails.
-        """
         try:
-            # Connect using the resolved IP
             sock = socket.create_connection((self.target_ip, self.target_port), timeout=CONNECTION_TIMEOUT)
         except socket.error as e:
             raise ConnectionError(f"Connection failed: {type(e).__name__}: {e}")
 
-        # Optimization: Disable Nagle's algorithm (TCP_NODELAY) explicitly
+        # Performance Tuning
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        
-        # Optimization: Expand Send Buffer to 256KB to prevent blocking in userspace during the burst
-        # This reduces the chance of 'sendall' partially blocking when dumping the payload.
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
         except OSError:
@@ -227,7 +345,6 @@ class HTTP11SyncEngine:
 
         if self.scheme == 'https' and self.ssl_context:
             try:
-                # We must pass the original hostname for SNI.
                 ssl_sock = self.ssl_context.wrap_socket(sock, server_hostname=self.target_host)
                 return ssl_sock
             except ssl.SSLError as e:
@@ -237,126 +354,99 @@ class HTTP11SyncEngine:
         return sock
 
     def _serialize_headers(self) -> bytes:
-        """
-        Serializes HTTP/1.1 headers for the request.
-
-        Returns:
-            bytes: The serialized headers as a byte string.
-        """
         parsed_url = urlparse(self.request.url)
         path = parsed_url.path or '/'
         if parsed_url.query:
             path += '?' + parsed_url.query
 
-        # Start building the request line
         request_lines = [f"{self.request.method} {path} HTTP/1.1"]
         
-        # 1. Host Header
         host_header = self.target_host
         if (self.scheme == 'https' and self.target_port != 443) or \
            (self.scheme == 'http' and self.target_port != 80):
             host_header += f":{self.target_port}"
         request_lines.append(f"Host: {host_header}")
 
-        # 2. User-provided headers
-        # Use iterator to preserve duplicates and order. Explicitly typing for safety.
-        req_headers_iter: Union[Dict[str, str], List[Tuple[str, str]]] = self.request.headers
-        
-        if isinstance(req_headers_iter, dict):
-            req_headers_iter = req_headers_iter.items()
+        # [FIX] Headers handling: Iterate over list to preserve duplicates
+        raw_headers = self.request.headers
+        # Normalize if it happens to be a dict
+        if isinstance(raw_headers, dict):
+            raw_headers = raw_headers.items()
 
+        # Pass 1: Scan for existence of special headers to determine defaults
         seen_keys_lower = set()
-        
-        for k, v in req_headers_iter:
+        for k, v in raw_headers:
+             seen_keys_lower.add(k.lower())
+
+        # Pass 2: Build headers
+        for k, v in raw_headers:
             k_lower = k.lower()
-            seen_keys_lower.add(k_lower)
-            # Skip headers managed explicitly by this engine
             if k_lower not in ['host', 'connection', 'content-length', 'transfer-encoding']:
                 request_lines.append(f"{k}: {v}")
-
-        # 3. Auto-generated headers (only if missing)
         
-        # Ensure Content-Type if missing and body exists
         if 'content-type' not in seen_keys_lower and self.request.method in ["POST", "PUT", "PATCH"] and self.total_payload_len > 0:
              request_lines.append("Content-Type: application/x-www-form-urlencoded")
-
-        # Add Content-Length (crucial for HTTP/1.1 persistence)
+        
         if self.total_payload_len > 0 or self.request.method in ["POST", "PUT", "PATCH"]:
             request_lines.append(f"Content-Length: {self.total_payload_len}")
         
-        # Add default User-Agent if not present
         if 'user-agent' not in seen_keys_lower:
-            # Switched to a standard Chrome User-Agent for better compatibility during testing
-            request_lines.append("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-
-        # Ensure Connection: keep-alive for persistence
+            request_lines.append("User-Agent: Scalpel-Racer/1.1")
+        
         request_lines.append("Connection: keep-alive")
 
-        # Finalize headers block with Double CRLF
         return ("\r\n".join(request_lines) + "\r\n\r\n").encode('utf-8')
 
     def _attack_thread(self, index: int):
-        """
-        The main logic for a single synchronized attack thread. Implements fail-fast mechanism.
-
-        Args:
-            index (int): The index of this thread/probe.
-        """
         sock = None
         response = None
         start_time = 0.0
         
         try:
-            # 1. Connect
             sock = self._connect()
             
-            # [VECTOR OPTIMIZATION] Local variable caching for hot loop
-            # Avoids LOAD_ATTR opcodes during the critical sync moment
+            # Local caching
             sock_sendall = sock.sendall
-            barrier_wait = self.barrier.wait
+            
             initial_payload = self.initial_payload
             stages = self.stages
 
-            # Record start time just before the first send
             start_time = time.perf_counter()
 
-            # 3. Send Headers + First Stage (Optimized: Single send call)
-            # Using pre-calculated payload avoids concatenation overhead in this hot thread
+            # 1. Send Headers + Stage 0
             sock_sendall(initial_payload)
 
-            # 4. Synchronized subsequent stages
-            for stage_index in range(1, len(stages)):
-                # Wait for all threads to reach this point
-                try:
-                    # Use a timeout on the barrier
-                    barrier_wait(timeout=BARRIER_TIMEOUT)
-                # Handle the case where another thread aborted the barrier
-                except threading.BrokenBarrierError:
-                    # Raise an exception to be caught by the outer handler.
-                    raise ConnectionError("Synchronization barrier broken (fail-fast).")
-                
-                # Send immediately
-                sock_sendall(stages[stage_index])
+            # 2. Synchronize and Send Remaining Stages
+            if self.barrier:
+                barrier_wait = self.barrier.wait
+                for stage_index in range(1, len(stages)):
+                    try:
+                        barrier_wait(timeout=BARRIER_TIMEOUT)
+                    except threading.BrokenBarrierError:
+                        raise ConnectionError("Synchronization barrier broken (fail-fast).")
+                    
+                    # If first-seq is active, the H1PacketController will bunch these packets
+                    sock_sendall(stages[stage_index])
             
-            # 5. Receive response
-            # Set timeout for response reading
+            # 3. Read Response
             sock.settimeout(RESPONSE_TIMEOUT)
-
-            # Use http.client.HTTPResponse to parse the incoming data robustly.
             response = HTTPResponse(sock, method=self.request.method)
-            response.begin() # Parses status line and headers
+            response.begin()
 
             status_code = response.status
-            # Read body up to the limit
             body = response.read(MAX_RESPONSE_BODY_READ)
             
-            # Check if more data remains (response too large)
-            if response.read(1):
-                 logger.warning(f"Response truncated (>{MAX_RESPONSE_BODY_READ} bytes) for probe {index}.")
+            # [FIX] Response Truncation Check
+            if not response.isclosed() and len(body) == MAX_RESPONSE_BODY_READ:
+                 try:
+                     # Attempt to peek one more byte
+                     extra = response.read(1)
+                     if extra:
+                         logger.warning(f"Response truncated (exceeded {MAX_RESPONSE_BODY_READ} bytes).")
+                 except Exception: pass
 
             duration = (time.perf_counter() - start_time) * 1000
 
-            # Process body for analysis
             body_hash = None
             body_snippet = None
             if body:
@@ -366,31 +456,18 @@ class HTTP11SyncEngine:
             self.results[index] = ScanResult(index, status_code, duration, body_hash, body_snippet)
 
         except Exception as e:
-            # Capture errors during connection, sending, or receiving
             duration = (time.perf_counter() - start_time) * 1000 if start_time > 0 else 0.0
-            error_msg = f"{type(e).__name__}: {e}"
-            
-            # Only update result if not already set
             if self.results[index] is None:
-                self.results[index] = ScanResult(index, 0, duration, error=error_msg)
+                self.results[index] = ScanResult(index, 0, duration, error=f"{type(e).__name__}: {e}")
 
         finally:
-            # Fail-fast mechanism: Ensure the barrier is aborted if an error occurred in this thread
             try:
-                # If this thread recorded an error and the barrier is still intact, abort it for others.
                 if self.results[index] and self.results[index].error and self.barrier and not self.barrier.broken:
                      self.barrier.abort()
-            except Exception:
-                 pass
-
-            # Cleanup resources
+            except Exception: pass
             if response:
-                try:
-                    response.close()
-                except Exception:
-                    pass
+                try: response.close()
+                except: pass
             if sock:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
+                try: sock.close()
+                except: pass

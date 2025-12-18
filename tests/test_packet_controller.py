@@ -35,7 +35,8 @@ class TestPacketController:
         
         # 1. Create Table
         cmd_table = mock_run.call_args_list[0][0][0]
-        assert "add" in cmd_table and "table" in cmd_table and "scalpel_racer" in cmd_table
+        # [FIX] Updated to match actual table name 'scalpel_racer_ctx'
+        assert "add" in cmd_table and "table" in cmd_table and "scalpel_racer_ctx" in cmd_table
 
         # 2. Create Chain
         cmd_chain = mock_run.call_args_list[1][0][0]
@@ -61,7 +62,8 @@ class TestPacketController:
         delete_calls = [c for c in mock_run.call_args_list if "delete" in c[0][0]]
         assert len(delete_calls) > 0
         args = delete_calls[0][0][0]
-        assert "delete" in args and "table" in args and "scalpel_racer" in args
+        # [FIX] Updated to match actual table name 'scalpel_racer_ctx'
+        assert "delete" in args and "table" in args and "scalpel_racer_ctx" in args
 
     @patch("packet_controller.NetfilterQueue")
     @patch("packet_controller.subprocess.call")
