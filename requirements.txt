@@ -5,7 +5,7 @@ h2>=4.1.0
 hpack>=4.0.0
 uvloop>=0.19.0
 # Advanced Strategy Dependencies (Linux Only)
-NetfilterQueue>=1.0.0
+# NetfilterQueue>=1.0.0
 scapy>=2.4.5
 # Lab & Testing
 hypercorn>=0.16.0

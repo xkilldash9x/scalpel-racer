@@ -21,9 +21,12 @@ class TestCertManager:
             # We explicitly mock os.makedirs to avoid FS touches
             with patch("os.makedirs"):
                 with patch("os.path.exists", return_value=True):
-                    # We also mock the shared key generation in init to avoid real crypto in simple tests
-                    with patch("verify_certs.ec.generate_private_key"):
-                        return CertManager()
+                    # Mock os.stat to prevent FileNotFoundError when checking permissions
+                    with patch("os.stat") as mock_stat:
+                        mock_stat.return_value.st_mode = 0o700
+                        # We also mock the shared key generation in init to avoid real crypto in simple tests
+                        with patch("verify_certs.ec.generate_private_key"):
+                            return CertManager()
 
     @patch("verify_certs.ec.generate_private_key")
     @patch("verify_certs.x509.CertificateBuilder")
