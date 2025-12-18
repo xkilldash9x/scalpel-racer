@@ -70,7 +70,6 @@ class PacketController:
         self.subsequent_packets_released = threading.Event()
         
         atexit.register(self.stop)
-        signal.signal(signal.SIGINT, self._signal_handler)
 
     def _signal_handler(self, signum, frame):
         """
@@ -149,7 +148,7 @@ class PacketController:
         Args:
             action (str): The action to perform ('add' or 'delete').
         """
-        table_name = "scalpel_racer"
+        table_name = "scalpel_racer_ctx"
         chain_name = "output_hook"
         
         if action == 'add':
@@ -261,3 +260,4 @@ class PacketController:
                 self.first_packet_info = None
                 self.first_packet_held.clear()
                 self.subsequent_packets_released.clear()
+                self.expected_next_seq = None

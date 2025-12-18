@@ -16,3 +16,4 @@ collect-code.sh
 .log
 server.key
 server.crt
+certs/

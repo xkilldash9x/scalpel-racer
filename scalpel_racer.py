@@ -1,3 +1,4 @@
+# scalpel_racer.py
 """
 Scalpel Racer - First Edition
 The definitive Async/LBS Race Condition Exploit Tool.
@@ -10,6 +11,7 @@ ENGINE: Dispatcher (HTTP11SyncEngine / HTTP2RaceEngine).
 [REFACTORED] - Direct ProxyManager integration
              - Dynamic SSL Context via CertManager
              - Streamlined UI loop and command handling
+             - AUTO-PERMISSION FIXER (Imported via permissions.py)
 """
 
 import sys
@@ -25,6 +27,10 @@ import traceback
 import os
 import re
 from typing import List, AsyncIterator, Dict, Any, Optional
+
+# -- Import Permission Handler --
+# This automatically registers the atexit cleanup hook
+import permissions
 
 # -- Constants for Tests --
 CA_CERT_FILE = "scalpel_ca.pem"
@@ -80,11 +86,11 @@ init(autoreset=True)
 # [FIX] Use raw string to prevent SyntaxWarning with backslashes
 BANNER = r"""
 {Fore.CYAN}
-     _____ _________      __    ____  ________ 
-    / ___// ____/   | / /   / __ \/ ____/ / 
-    \__ \/ /   / /| |   / /   / /_/ / __/ / /  
-   ___/ / /___/ ___ | / /___/ ____/ /___/ /___ 
-  /____/\____/_/  |_| /_____/_/   /_____/_____/ 
+   _____ _________    __    ____  ________ 
+  / ___// ____/   |  / /   / __ \/ ____/ / 
+  \__ \/ /   / /| | / /   / /_/ / __/ / /  
+ ___/ / /___/ ___ |/ /___/ ____/ /___/ /___
+/____/\____/_/  |_/_____/_/   /_____/_____/
 {Fore.YELLOW}     [ SCALPEL RACER V1.1 ]{Style.RESET_ALL}
 {Style.RESET_ALL}    {Fore.WHITE}-- [+] Developed by The Project Scalpel Team [+] --{Style.RESET_ALL}
 """
@@ -166,21 +172,6 @@ def edit_request_body(req: CapturedRequest):
             break
     if lines:
         req.edited_body = "".join(lines).encode()
-
-def fix_sudo_ownership(filepath: str):
-    """
-    Fixes file ownership if run with sudo.
-
-    Args:
-        filepath (str): The path to the file.
-    """
-    uid = os.environ.get('SUDO_UID')
-    gid = os.environ.get('SUDO_GID')
-    if uid and gid:
-        try:
-            os.chown(filepath, int(uid), int(gid))
-        except Exception:
-            pass
 
 def analyze_results(results: List[ScanResult]):
     """
