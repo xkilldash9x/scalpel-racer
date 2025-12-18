@@ -1,7 +1,7 @@
 # scalpel_racer.py
 """
 Scalpel Racer -- Advanced Race Condition Testing Tool.
-[VECTOR] Optimized: Pre-calculated headers, GC control, and Strategy Routing.
+[VECTOR] Optimized: Pre-calculated headers, GC control, Strategy Routing, and Rich Analytics.
 """
 
 import sys
@@ -14,6 +14,8 @@ import hashlib
 import gc
 from typing import List, AsyncIterator, Optional, Dict, Union, Tuple
 from collections import defaultdict
+
+# -- Third Party Dependencies --
 
 try:
     from colorama import Fore, Style, init as colorama_init
@@ -29,29 +31,45 @@ except ImportError:
 try:
     import httpx
     import uvloop
+    # Windows doesn't support uvloop, so we skip it there
     if sys.platform != "win32":
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-except ImportError: pass
+except ImportError:
+    pass
 
 try:
     import numpy as np
     NUMPY_AVAILABLE = True
 except ImportError:
-    np = None; NUMPY_AVAILABLE = False
+    np = None
+    NUMPY_AVAILABLE = False
 
-try: from proxy_manager import ProxyManager
-except ImportError: sys.exit(1)
-try: from verify_certs import CertManager
-except ImportError: sys.exit(1)
+# -- Internal Modules --
+
+try:
+    from proxy_manager import ProxyManager
+except ImportError:
+    print(f"{Fore.RED}[CRITICAL] 'proxy_manager.py' not found. Cannot start interception engine.{Style.RESET_ALL}")
+    sys.exit(1)
+
+try:
+    from verify_certs import CertManager
+except ImportError:
+    print(f"{Fore.RED}[CRITICAL] 'verify_certs.py' not found. Cannot manage SSL/TLS.{Style.RESET_ALL}")
+    sys.exit(1)
 
 from low_level import HTTP2RaceEngine
 from sync_http11 import HTTP11SyncEngine # [VECTOR] Import H1 Engine
 from structures import ScanResult, CapturedRequest, SYNC_MARKER
 
-if UI_AVAILABLE: colorama_init(autoreset=True)
+if UI_AVAILABLE:
+    colorama_init(autoreset=True)
+
+# -- Configuration --
 
 DEFAULT_CONCURRENCY = 15
 DEFAULT_TIMEOUT = 10.0
+DEFAULT_WARMUP = 100
 logger = logging.getLogger(__name__)
 
 BANNER = r"""
@@ -65,7 +83,13 @@ BANNER = r"""
 {Style.RESET_ALL}    {Fore.WHITE}-- [+] Optimized by Vector [+] --{Style.RESET_ALL}
 """
 
+# -- Helper Functions --
+
 def safe_spawn(tg: asyncio.TaskGroup, coro, result_list, index):
+    """
+    Supervisor wrapper to prevent fail-fast cascades in the TaskGroup.
+    Catches exceptions per-request so one failure doesn't kill the batch.
+    """
     async def wrapper():
         try:
             res = await coro
@@ -75,20 +99,33 @@ def safe_spawn(tg: asyncio.TaskGroup, coro, result_list, index):
     tg.create_task(wrapper())
 
 async def Last_Byte_Stream_Body(payload: bytes, barrier: asyncio.Barrier, warmup_ms: int) -> AsyncIterator[bytes]:
+    """
+    Standard Packet Bunching strategy (Last-Byte Sync).
+    Streams the payload but holds the final byte at the barrier.
+    """
     if len(payload) <= 1:
         if warmup_ms > 0: await asyncio.sleep(warmup_ms / 1000.0)
         try:
             if barrier: await barrier.wait()
         except asyncio.BrokenBarrierError: pass
-        yield payload; return
+        yield payload
+        return
+
     yield payload[:-1] 
+    
     if warmup_ms > 0: await asyncio.sleep(warmup_ms / 1000.0)
+    
     try:
         if barrier: await barrier.wait() 
     except asyncio.BrokenBarrierError: pass
+    
     yield payload[-1:]
 
 async def Staged_Stream_Body(payload: bytes, barriers: List[asyncio.Barrier]) -> AsyncIterator[bytes]:
+    """
+    Multi-stage sync using {{SYNC}} markers in the payload.
+    Useful for complex state machine race conditions.
+    """
     parts = payload.split(SYNC_MARKER)
     barrier_idx = 0
     for i, part in enumerate(parts):
@@ -100,25 +137,43 @@ async def Staged_Stream_Body(payload: bytes, barriers: List[asyncio.Barrier]) ->
                 except asyncio.BrokenBarrierError: pass
         if part: yield part
 
-async def send_probe_advanced(client: httpx.AsyncClient, request: CapturedRequest, payload: bytes, barriers: List[asyncio.Barrier], warmup_ms: int, index: int, is_staged: bool, base_headers: httpx.Headers) -> ScanResult:
+async def send_probe_advanced(
+    client: httpx.AsyncClient, 
+    request: CapturedRequest, 
+    payload: bytes, 
+    barriers: List[asyncio.Barrier], 
+    warmup_ms: int, 
+    index: int, 
+    is_staged: bool, 
+    base_headers: httpx.Headers
+) -> ScanResult:
     """
-    [VECTOR] Optimized to accept pre-calculated base_headers.
+    Sends a single probe. Optimized to accept pre-calculated headers to reduce overhead.
     """
     start_time = time.perf_counter()
-    body_hash = None; body_snippet = None
+    body_hash = None
+    body_snippet = None
+
     try:
-        # [VECTOR] Optimization: Copy pre-validated headers instead of re-parsing
+        # [VECTOR] Optimization: Copy pre-validated headers instead of re-parsing every time
         req_headers = base_headers.copy()
         req_headers["X-Scalpel-Probe"] = f"{index}_{int(time.time())}"
-
+        
         content_stream = None
-        if is_staged: content_stream = Staged_Stream_Body(payload, barriers)
+        if is_staged:
+            content_stream = Staged_Stream_Body(payload, barriers)
         else:
             barrier = barriers[0] if barriers else None
             content_stream = Last_Byte_Stream_Body(payload, barrier, warmup_ms)
+        
+        # We prefer the stream generator if we are syncing, otherwise raw payload
+        final_content = content_stream if content_stream else payload
 
         async with client.stream(
-            method=request.method, url=request.url, content=(content_stream if content_stream else payload), headers=req_headers
+            method=request.method, 
+            url=request.url, 
+            content=final_content, 
+            headers=req_headers
         ) as response:
             body = await response.aread()
             if body:
@@ -132,8 +187,14 @@ async def send_probe_advanced(client: httpx.AsyncClient, request: CapturedReques
         return ScanResult(index, 0, duration, error=str(e))
 
 async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warmup: int, strategy: str = "auto"):
-    if hasattr(request, 'get_attack_payload'): attack_payload = request.get_attack_payload()
-    else: attack_payload = request.body
+    """
+    Orchestrates the race condition attack.
+    Routes to the correct engine (H2, H1 Sync, or Standard H1) based on strategy.
+    """
+    if hasattr(request, 'get_attack_payload'): 
+        attack_payload = request.get_attack_payload()
+    else: 
+        attack_payload = request.body
 
     # [VECTOR] Logic Correction: Correctly route to H1 or H2 engine
     use_h2_engine = False
@@ -144,32 +205,36 @@ async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warm
         # Otherwise allow H1 First-Seq (Packet Bunching)
         if http2 or request.protocol == "HTTP/2":
              use_h2_engine = True
-
+    
     if use_h2_engine:
         engine = HTTP2RaceEngine(request, concurrency, strategy, warmup)
         return await asyncio.to_thread(engine.run_attack)
-
+    
     # Check if we should use specialized H1 Sync Engine (for first-seq on H1)
     if strategy == "first-seq" and not use_h2_engine:
         engine = HTTP11SyncEngine(request, concurrency, strategy)
         return await asyncio.to_thread(engine.run_attack)
 
-    # Standard HTTPX (H1/H2) with Barriers
+    # -- Standard HTTPX (H1/H2) with Barriers --
     sync_markers_count = attack_payload.count(SYNC_MARKER)
     barriers = []
+    
     if sync_markers_count > 0:
         for _ in range(sync_markers_count): barriers.append(asyncio.Barrier(concurrency))
         warmup = 0 
     elif concurrency > 1:
         barriers.append(asyncio.Barrier(concurrency))
 
-    gc.collect(); gc.disable()
-
+    # Clean up memory before the race starts to minimize local jitter
+    gc.collect()
+    gc.disable()
+    
     # [VECTOR] Optimization: Pre-calculate static headers once
     actual_length = len(attack_payload)
     base_headers = httpx.Headers(request.headers)
     base_headers["User-Agent"] = "Scalpel-CLI/5.4-Optimized"
     base_headers["Content-Length"] = str(actual_length)
+    
     if "content-type" not in base_headers and request.method in ["POST", "PUT", "PATCH"] and actual_length > 0:
          base_headers["Content-Type"] = "application/x-www-form-urlencoded"
 
@@ -178,6 +243,8 @@ async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warm
 
     async with httpx.AsyncClient(http2=http2, limits=limits, timeout=timeout, verify=False) as client:
         results = [None] * concurrency
+        
+        # Use TaskGroup for modern asyncio safety if available
         if hasattr(asyncio, 'TaskGroup'):
             async with asyncio.TaskGroup() as tg:
                 for i in range(concurrency):
@@ -185,24 +252,37 @@ async def run_scan(request: CapturedRequest, concurrency: int, http2: bool, warm
                         client, request, attack_payload, barriers, warmup, i, sync_markers_count > 0, base_headers
                     ), results, i)
         else:
-            tasks = [send_probe_advanced(client, request, attack_payload, barriers, warmup, i, sync_markers_count > 0, base_headers) for i in range(concurrency)]
+            # Legacy fallback
+            tasks = [
+                send_probe_advanced(client, request, attack_payload, barriers, warmup, i, sync_markers_count > 0, base_headers) 
+                for i in range(concurrency)
+            ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             results = [r if isinstance(r, ScanResult) else ScanResult(i, 0, 0, error=str(r)) for i, r in enumerate(results)]
 
     gc.enable()
     return results
 
+# -- Analytics & Histogram --
+
 def analyze_results(results: List[ScanResult]):
+    """
+    Analyzes and prints statistical data from the scan results.
+    Merged logic: Refactored Structure + Production Metrics (Min/Max/Gradient).
+    """
     if not results: return
     successful = [r for r in results if r.error is None]
+    
     print_formatted_text(ANSI(f"\n{Fore.CYAN}-- Analysis Summary --{Style.RESET_ALL}"))
+    
     signatures = defaultdict(list)
     for r in successful:
         key = (r.status_code, r.status_code//100, r.body_hash) 
         signatures[key].append(r)
 
     print_formatted_text(ANSI(f"\n{Fore.YELLOW}[Response Signatures]{Style.RESET_ALL}"))
-    if not signatures: print("  (No successful responses)")
+    if not signatures: 
+        print("  (No successful responses)")
     else:
         sorted_keys = sorted(signatures.keys(), key=lambda k: k[0])
         print(f"  {'Count':<6} {'Status':<6} {'Hash (SHA256)':<16} {'Snippet'}")
@@ -218,45 +298,80 @@ def analyze_results(results: List[ScanResult]):
 
     if successful:
         timings = [r.duration for r in successful]
-        avg = sum(timings) / len(timings)
-        std_dev = (sum((t - avg) ** 2 for t in timings) / (len(timings)-1)) ** 0.5 if len(timings) > 1 else 0.0
-        print_formatted_text(ANSI(f"\n{Fore.YELLOW}[Timing Metrics]{Style.RESET_ALL}"))
-        print(f"  Avg: {avg:.2f}ms | Jitter: {std_dev:.2f}ms")
+        if len(timings) > 0:
+            avg = sum(timings) / len(timings)
+            min_t = min(timings)
+            max_t = max(timings)
+            std_dev = (sum((t - avg) ** 2 for t in timings) / (len(timings)-1)) ** 0.5 if len(timings) > 1 else 0.0
+            
+            print_formatted_text(ANSI(f"\n{Fore.YELLOW}[Timing Metrics]{Style.RESET_ALL}"))
+            print(f"  Avg: {avg:.2f}ms | Min: {min_t:.2f}ms | Max: {max_t:.2f}ms | Jitter: {std_dev:.2f}ms")
+            
+            # Histogram Logic
+            if len(timings) > 1 and NUMPY_AVAILABLE:
+                print_formatted_text(ANSI(f"\n{Fore.YELLOW}[Timing Distribution]{Style.RESET_ALL}"))
+                try:
+                    bins_count = min(int(len(timings)/5)+5, 20)
+                    counts, bins = np.histogram(timings, bins=bins_count)
+                    max_count = max(counts) if len(counts) > 0 else 0
+                    
+                    if max_count > 0:
+                        for i in range(len(counts)):
+                            bar_len = int((counts[i] / max_count) * 40)
+                            bar_char = '█'
+                            # Gradient coloring from Production Logic
+                            bar_color = Fore.GREEN
+                            if i > len(counts) * 0.7: bar_color = Fore.YELLOW
+                            if i > len(counts) * 0.9: bar_color = Fore.RED
+                            
+                            bar_display = (bar_char * bar_len) if counts[i] > 0 else ''
+                            print_formatted_text(ANSI(f"  {bins[i]:>6.2f}ms | {bar_color}{bar_display:<40}{Style.RESET_ALL} ({counts[i]})"))
+                except Exception as e:
+                     print(f"Histogram error: {e}")
 
-        if len(timings) > 1 and NUMPY_AVAILABLE:
-            print_formatted_text(ANSI(f"\n{Fore.YELLOW}[Timing Distribution]{Style.RESET_ALL}"))
-            try:
-                counts, bins = np.histogram(timings, bins=min(int(len(timings)/5)+5, 20))
-                max_count = max(counts) if len(counts) > 0 else 0
-                if max_count > 0:
-                    for i in range(len(counts)):
-                        bar_len = int((counts[i] / max_count) * 40); bar_char = '█'
-                        print_formatted_text(ANSI(f"  {bins[i]:>6.2f}ms | {Fore.GREEN}{bar_char*bar_len:<40}{Style.RESET_ALL} ({counts[i]})"))
-            except: pass
+# -- Application Logic --
 
 class ScalpelApp:
     def __init__(self, port, strategy):
-        self.port = port; self.strategy = strategy
+        self.port = port
+        self.strategy = strategy
         self.storage: List[CapturedRequest] = []
         self.command_completer = WordCompleter(['ls', 'last', 'race', 'exit', 'quit', 'q'], ignore_case=True)
         self.session = PromptSession(completer=self.command_completer)
-        self.mgr = None; self.cert_mgr = None; self.capture_count = 0
+        self.mgr = None
+        self.cert_mgr = None
+        self.capture_count = 0
 
     def _handler(self, protocol, data):
+        """
+        Callback handler for the ProxyManager.
+        Receives captured requests, system messages, or errors.
+        """
         if protocol == "CAPTURE":
-            data.id = len(self.storage); self.storage.append(data); self.capture_count += 1
+            data.id = len(self.storage)
+            self.storage.append(data)
+            self.capture_count += 1
             msg = data.display_str() if hasattr(data, 'display_str') else f"{data.method} {data.url}"
             print_formatted_text(ANSI(f"{Fore.GREEN}[+] {msg}{Style.RESET_ALL}"))
-        elif protocol == "SYSTEM": print_formatted_text(ANSI(f"{Fore.BLUE}[SYS] {data}{Style.RESET_ALL}"))
-        elif protocol == "ERROR": print_formatted_text(ANSI(f"{Fore.RED}[ERR] {data}{Style.RESET_ALL}"))
+        elif protocol == "SYSTEM":
+            print_formatted_text(ANSI(f"{Fore.BLUE}[SYS] {data}{Style.RESET_ALL}"))
+        elif protocol == "ERROR":
+            print_formatted_text(ANSI(f"{Fore.RED}[ERR] {data}{Style.RESET_ALL}"))
 
     async def run(self):
         print_formatted_text(ANSI(f"{Fore.YELLOW}[*] Loading Certificate Manager...{Style.RESET_ALL}"))
         self.cert_mgr = CertManager()
+        
         print_formatted_text(ANSI(BANNER.format(Fore=Fore, Style=Style)))
         print_formatted_text(ANSI(f"{Fore.YELLOW}[*] Starting Proxy on port {self.port}...{Style.RESET_ALL}"))
-        self.mgr = ProxyManager(tcp_port=self.port, ssl_context_factory=self.cert_mgr.get_context_for_host, external_callback=self._handler)
+        
+        self.mgr = ProxyManager(
+            tcp_port=self.port, 
+            ssl_context_factory=self.cert_mgr.get_context_for_host, 
+            external_callback=self._handler
+        )
         proxy_task = asyncio.create_task(self.mgr.run())
+        
         print_formatted_text(ANSI(f"{Fore.CYAN}Commands: ls, last, race <id> [threads], exit{Style.RESET_ALL}"))
 
         with patch_stdout():
@@ -266,35 +381,53 @@ class ScalpelApp:
                     parts = line.strip().split()
                     if not parts: continue
                     cmd = parts[0].lower()
+                    
                     if cmd == 'ls':
                         print_formatted_text(ANSI(f"\n{Fore.YELLOW}--- History ({len(self.storage)}) ---{Style.RESET_ALL}"))
-                        for i in range(max(0, len(self.storage) - 15), len(self.storage)):
+                        for i in range(max(0, len(self.storage) - 15), len(self.storage)): 
                             req = self.storage[i]
                             txt = req.display_str() if hasattr(req, 'display_str') else f"{req.method} {req.url}"
                             print_formatted_text(f"[{i}] {txt}")
+                    
                     elif cmd == 'last':
-                        if not self.storage: print_formatted_text("No captures."); continue
-                        parts = ['race', str(len(self.storage) - 1)]; cmd = 'race'
+                        if not self.storage: 
+                            print_formatted_text("No captures.")
+                            continue
+                        parts = ['race', str(len(self.storage) - 1)]
+                        cmd = 'race'
+                    
                     if cmd == 'race':
                         if len(parts) < 2: 
-                            print_formatted_text("usage: race <id> [threads]"); continue
+                            print_formatted_text("usage: race <id> [threads]")
+                            continue
                         try:
-                            idx = int(parts[1]); th = int(parts[2]) if len(parts) > 2 else 10
-                            if idx < 0 or idx >= len(self.storage): print_formatted_text("Invalid ID"); continue
+                            idx = int(parts[1])
+                            th = int(parts[2]) if len(parts) > 2 else 10
+                            
+                            if idx < 0 or idx >= len(self.storage): 
+                                print_formatted_text("Invalid ID")
+                                continue
+                            
                             req = self.storage[idx]
                             print_formatted_text(ANSI(f"{Fore.MAGENTA}[*] Racing {req.url} ({th} threads)...{Style.RESET_ALL}"))
-                            results = await run_scan(req, th, False, 100, self.strategy)
+                            
+                            # Execute the race with the selected strategy
+                            results = await run_scan(req, th, False, DEFAULT_WARMUP, self.strategy)
                             analyze_results(results)
                         except Exception:
                             traceback.print_exc()
+                    
                     elif cmd in ('q', 'exit', 'quit'): 
                         print_formatted_text("Shutting down...")
                         break 
-                except (KeyboardInterrupt, EOFError): break
+                except (KeyboardInterrupt, EOFError): 
+                    break
         
         if self.mgr: self.mgr.stop()
-        try: await proxy_task
-        except asyncio.CancelledError: pass
+        try: 
+            await proxy_task
+        except asyncio.CancelledError: 
+            pass
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Scalpel Racer - Race Condition Exploit Tool")
@@ -304,7 +437,11 @@ if __name__ == "__main__":
     args, unknown = parser.parse_known_args()
 
     try: 
-        if sys.platform == 'win32': asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        if sys.platform == 'win32': 
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         asyncio.run(ScalpelApp(args.port, args.strategy).run())
-    except KeyboardInterrupt: pass
-    except Exception as e: print(f"Error: {e}"); traceback.print_exc()
+    except KeyboardInterrupt: 
+        pass 
+    except Exception as e: 
+        print(f"Error: {e}")
+        traceback.print_exc()
