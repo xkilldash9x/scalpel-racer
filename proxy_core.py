@@ -272,7 +272,7 @@ class Http11ProxyHandler(BaseProxyHandler):
         """
         Reads a line strictly terminated by CRLF, but allows lenient fallback.
         [VECTOR] OPTIMIZATION: Switched to find() instead of index() to avoid 
-        Exception overhead on partial reads, and uses memoryview slicing.
+        Exception overhead on partial reads.
         """
         while True:
             # Returns -1 if not found (faster than raising ValueError)
@@ -315,9 +315,9 @@ class Http11ProxyHandler(BaseProxyHandler):
             # Lenient Mode: Strip CR if present, otherwise handle bare LF
             line_end = lf_index - 1 if is_crlf else lf_index
             
-            # [VECTOR] Optimization: Use memoryview to avoid copying when slicing
+            # [VECTOR] Optimization: Direct slicing is faster than memoryview().tobytes() for small chunks
             if line_end > self._buffer_offset:
-                line = memoryview(self.buffer)[self._buffer_offset:line_end].tobytes()
+                line = self.buffer[self._buffer_offset:line_end]
             else:
                 line = b"" 
             
@@ -536,8 +536,8 @@ class Http11ProxyHandler(BaseProxyHandler):
                   self._buffer_offset = 0
             self.buffer.extend(data)
         
-        # [VECTOR] Zero-copy slicing
-        chunk = memoryview(self.buffer)[self._buffer_offset : self._buffer_offset + n].tobytes()
+        # [VECTOR] Direct slicing is faster than memoryview().tobytes() for typical read sizes
+        chunk = self.buffer[self._buffer_offset : self._buffer_offset + n]
         self._buffer_offset += n
         return chunk
 
