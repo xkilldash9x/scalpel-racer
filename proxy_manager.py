@@ -30,6 +30,19 @@ except ImportError as e:
     # We log the specific error 'e' so we know if it's a missing package or a missing shared library
     log.warning(f"aioquic import failed: {e}. HTTP/3 Proxying will be disabled.")
 
+    # Define dummy classes for type hinting and safe execution
+    class QuicConfiguration: pass
+    class QuicConnectionProtocol: pass
+    class H3Connection: pass
+    class QuicEvent: pass
+    class H3Event: pass
+    class DataReceived: pass
+    class HeadersReceived: pass
+
+    # Define dummy functions
+    async def serve(*args, **kwargs): raise ImportError("aioquic not installed")
+    async def connect(*args, **kwargs): raise ImportError("aioquic not installed")
+
 class CapturedRequest:
     def __init__(self, protocol: str, method: str, url: str, headers: Any, body: bytes = b""):
         self.id = 0
