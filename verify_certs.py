@@ -8,6 +8,7 @@ import datetime
 import ssl
 import threading
 import atexit
+import stat
 from typing import Optional
 
 # Cryptography Imports
@@ -43,7 +44,12 @@ class CertManager:
         self.shared_leaf_key = ec.generate_private_key(ec.SECP256R1())
 
         if not os.path.exists(CERTS_DIR):
-            os.makedirs(CERTS_DIR)
+            os.makedirs(CERTS_DIR, mode=0o700)
+        else:
+            # Ensure existing directory has safe permissions
+            current_mode = stat.S_IMODE(os.stat(CERTS_DIR).st_mode)
+            if current_mode != 0o700:
+                os.chmod(CERTS_DIR, 0o700)
         
         self._load_or_generate_ca()
 
@@ -84,8 +90,16 @@ class CertManager:
                 x509.BasicConstraints(ca=True, path_length=None), critical=True,
             ).sign(self.ca_key, hashes.SHA256())
 
-            # 4. Write Private Key
-            with open(CA_KEY_PATH, "wb") as f:
+            # 4. Write Private Key (Securely)
+            # Using os.open to ensure 600 permissions atomically
+            fd = os.open(CA_KEY_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                f = os.fdopen(fd, "wb")
+            except Exception:
+                os.close(fd)
+                raise
+
+            with f:
                 f.write(self.ca_key.private_bytes(
                     encoding=serialization.Encoding.PEM,
                     format=serialization.PrivateFormat.TraditionalOpenSSL,
@@ -157,8 +171,17 @@ class CertManager:
             key_path = os.path.join(CERTS_DIR, f"{hostname}.key")
             cert_path = os.path.join(CERTS_DIR, f"{hostname}.crt")
             
-            with open(key_path, "wb") as f:
+            # Secure write for private key
+            fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                f = os.fdopen(fd, "wb")
+            except Exception:
+                os.close(fd)
+                raise
+
+            with f:
                 f.write(key_pem)
+
             with open(cert_path, "wb") as f:
                 f.write(cert_pem)
 
