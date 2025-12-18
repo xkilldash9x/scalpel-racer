@@ -13,7 +13,7 @@ MAX_RESPONSE_BODY_READ = 1024 * 1024  # 1MB limit for response analysis
 SYNC_MARKER = b"{{SYNC}}"             # Marker for splitting payloads
 
 # RFC 9113: Headers to strip during forwarding
-# [OPTIMIZED] Changed to set for O(1) lookup
+# [VECTOR OPTIMIZATION] Use set for O(1) lookup speed in hot paths
 HOP_BY_HOP_HEADERS = {
     'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
     'te', 'trailers', 'transfer-encoding', 'upgrade', 'host', 
@@ -22,6 +22,7 @@ HOP_BY_HOP_HEADERS = {
 }
 
 # OpSec: Headers to redact in UI logs
+# [VECTOR OPTIMIZATION] Use set for O(1) lookup speed
 SENSITIVE_HEADERS = {
     'authorization', 'proxy-authorization', 'cookie', 'set-cookie', 
     'x-auth-token', 'x-api-key', 'access_token', 'authentication', 'bearer'
@@ -46,17 +47,6 @@ class ScanResult:
     def __init__(self, index: int, status_code: int, duration: float, 
                  body_hash: Optional[str] = None, body_snippet: Optional[str] = None, 
                  error: Optional[str] = None):
-        """
-        Initializes a ScanResult object.
-
-        Args:
-            index (int): The index of the probe in the race batch.
-            status_code (int): The HTTP status code of the response.
-            duration (float): The duration of the request in seconds.
-            body_hash (Optional[str]): The hash of the response body.
-            body_snippet (Optional[str]): A snippet of the response body.
-            error (Optional[str]): An error message if the request failed.
-        """
         self.index = index
         self.status_code = status_code
         self.duration = duration
@@ -65,12 +55,6 @@ class ScanResult:
         self.error = error
 
     def to_dict(self) -> Dict[str, Any]:
-        """
-        Converts the scan result to a dictionary for logging/storage.
-
-        Returns:
-            Dict[str, Any]: A dictionary representation of the ScanResult.
-        """
         return {
             'index': self.index,
             'status_code': self.status_code,
@@ -81,12 +65,6 @@ class ScanResult:
         }
 
     def __repr__(self):
-        """
-        Returns a string representation of the ScanResult.
-
-        Returns:
-            str: A string representation of the object.
-        """
         return f"<ScanResult #{self.index} Status:{self.status_code}>"
 
 class CapturedRequest:
@@ -106,19 +84,6 @@ class CapturedRequest:
                  truncated: bool = False, 
                  protocol: str = "HTTP/1.1", 
                  edited_body: Optional[bytes] = None):
-        """
-        Initializes a CapturedRequest object.
-
-        Args:
-            id (int): A unique identifier for the request.
-            method (str): The HTTP method (e.g., 'GET', 'POST').
-            url (str): The full URL of the request.
-            headers (List[Tuple[str, str]]): A list of header tuples (name, value).
-            body (bytes): The request body.
-            truncated (bool): Whether the body was truncated during capture.
-            protocol (str): The protocol version (e.g., 'HTTP/1.1', 'HTTP/2').
-            edited_body (Optional[bytes]): An optional edited version of the body.
-        """
         self.id = id
         self.method = method
         self.url = url
@@ -129,32 +94,15 @@ class CapturedRequest:
         self.edited_body = edited_body
 
     def get_attack_payload(self) -> bytes:
-        """
-        Returns the edited body if it exists, else the captured body.
-
-        Returns:
-            bytes: The payload to be used in an attack.
-        """
+        """Returns the edited body if it exists, else the captured body."""
         return self.edited_body if self.edited_body is not None else self.body
 
     def headers_dict(self) -> Dict[str, str]:
-        """
-        Returns headers as a dictionary.
-
-        Note: This conversion is lossy for duplicate keys.
-
-        Returns:
-            Dict[str, str]: A dictionary of headers.
-        """
+        """Returns headers as a dictionary. Note: Lossy for duplicate keys."""
         return dict(self.headers)
 
     def display_str(self) -> str:
-        """
-        Sanitized string for CLI display.
-
-        Returns:
-            str: A formatted string summary of the request.
-        """
+        """Sanitized string for CLI display."""
         body_len = len(self.get_attack_payload())
         edit_flag = "[E]" if self.edited_body is not None else ""
         trunc_flag = " [T]" if self.truncated else ""
@@ -166,45 +114,24 @@ class CapturedRequest:
         return f"[{self.protocol}] {self.method:<6} {clean_url} ({body_len}b){edit_flag}{trunc_flag}"
 
     def _get_redacted_headers(self) -> str:
-        """
-        Returns a string representation of headers with sensitive values masked.
-
-        Returns:
-            str: A comma-separated string of headers with sensitive values redacted.
-        """
+        """Returns a string representation of headers with sensitive values masked."""
         lines = [] 
         for k, v in self.headers: 
-            if k.lower() in SENSITIVE_HEADERS: # [Security] Redact sensitive headers
+            if k.lower() in SENSITIVE_HEADERS:
                 lines.append(f"{k}: [REDACTED]") 
             else:
                 lines.append(f"{k}: {v}")
         return ", ".join(lines)
 
     def detailed_str(self) -> str:
-        """
-        Detailed string representation with full headers and body.
-
-        Returns:
-            str: A detailed string of the request including redacted headers and body.
-        """
+        """Detailed string representation with full headers and body."""
         return f"{self.display_str()}\n\nHeaders: {self._get_redacted_headers()}\nBody: {self.get_attack_payload().decode('utf-8', 'ignore')}"
 
     def __str__(self) -> str:
-        """
-        Returns a string representation of the CapturedRequest.
-
-        Returns:
-            str: The display string of the request.
-        """
         return self.display_str()
 
     def to_dict(self) -> Dict[str, Any]:
-        """
-        Converts the request to a dictionary format for logging or storage.
-
-        Returns:
-            Dict[str, Any]: A dictionary representation of the CapturedRequest.
-        """
+        """Converts the request to a dictionary format for logging or storage."""
         return {
             'id': self.id,
             'method': self.method,
@@ -216,8 +143,6 @@ class CapturedRequest:
             'edited_body': self.edited_body.decode('utf-8', 'ignore') if self.edited_body else None
         }
 
-# --- Preserved Data Structures (From Original Source) ---
-
 class RaceResult:
     """
     Represents the result of a complete race (multiple probes).
@@ -228,23 +153,6 @@ class RaceResult:
                  'final_truncated', 'final_edited_body')
     
     def __init__(self, id: int, scan_results: List[ScanResult], final_status_code: int, final_body_hash: Optional[str] = None, final_body_snippet: Optional[str] = None, final_error: Optional[str] = None, final_duration: Optional[float] = None, final_protocol: Optional[str] = None, final_headers: Optional[Dict[str, str]] = None, final_body: Optional[bytes] = None, final_truncated: bool = False, final_edited_body: Optional[bytes] = None):
-        """
-        Initializes a RaceResult object.
-
-        Args:
-            id (int): The unique identifier of the race.
-            scan_results (List[ScanResult]): A list of results from individual probes.
-            final_status_code (int): The status code of the final combined result (if applicable).
-            final_body_hash (Optional[str]): The hash of the final response body.
-            final_body_snippet (Optional[str]): A snippet of the final response body.
-            final_error (Optional[str]): An error message if the race failed overall.
-            final_duration (Optional[float]): The total duration of the race.
-            final_protocol (Optional[str]): The protocol used in the final response.
-            final_headers (Optional[Dict[str, str]]): Headers from the final response.
-            final_body (Optional[bytes]): The body of the final response.
-            final_truncated (bool): Whether the final body was truncated.
-            final_edited_body (Optional[bytes]): An optional edited version of the final body.
-        """
         self.id = id
         self.scan_results = scan_results
         self.final_status_code = final_status_code
@@ -259,39 +167,15 @@ class RaceResult:
         self.final_edited_body = final_edited_body
 
     def get_final_body(self) -> bytes:
-        """
-        Returns the final body if available, otherwise an empty byte string.
-
-        Returns:
-            bytes: The final response body.
-        """
         return self.final_body if self.final_body is not None else b""
 
     def get_final_headers(self) -> Dict[str, str]:
-        """
-        Returns the final headers if available, otherwise an empty dictionary.
-
-        Returns:
-            Dict[str, str]: The final response headers.
-        """
         return self.final_headers if self.final_headers is not None else {}
     
     def get_final_attack_payload(self) -> bytes:
-        """
-        Returns the edited body if available, otherwise the final body.
-
-        Returns:
-            bytes: The payload used in the final attack step.
-        """
         return self.final_edited_body if self.final_edited_body is not None else self.get_final_body()
 
     def to_dict(self) -> Dict[str, Any]:
-        """
-        Converts the race result to a dictionary format for logging or storage.
-
-        Returns:
-            Dict[str, Any]: A dictionary representation of the RaceResult.
-        """
         return {
             'id': self.id,
             'scan_results': [r.to_dict() for r in self.scan_results],
@@ -314,20 +198,6 @@ class RaceConfiguration:
                  'timeout', 'protocol', 'edited_body')
     
     def __init__(self, id: int, target_url: str, method: str, headers: List[Tuple[str, str]], body: bytes, num_probes: int, timeout: float, protocol: str = "HTTP/1.1", edited_body: Optional[bytes] = None):
-        """
-        Initializes a RaceConfiguration object.
-
-        Args:
-            id (int): A unique identifier for the race configuration.
-            target_url (str): The target URL for the race.
-            method (str): The HTTP method to use.
-            headers (List[Tuple[str, str]]): A list of header tuples to include in the requests.
-            body (bytes): The request body to send.
-            num_probes (int): The number of concurrent probes to send.
-            timeout (float): The timeout for each probe in seconds.
-            protocol (str): The protocol to use (e.g., 'HTTP/1.1').
-            edited_body (Optional[bytes]): An optional edited body to override the original body.
-        """
         self.id = id
         self.target_url = target_url
         self.method = method
@@ -339,12 +209,6 @@ class RaceConfiguration:
         self.edited_body = edited_body
 
     def to_dict(self) -> Dict[str, Any]:
-        """
-        Converts the race configuration to a dictionary format for logging or storage.
-
-        Returns:
-            Dict[str, Any]: A dictionary representation of the RaceConfiguration.
-        """
         return {
             'id': self.id,
             'target_url': self.target_url,
@@ -364,16 +228,6 @@ class ProxyManagerConfig:
     __slots__ = ('listen_port', 'upstream_proxy', 'max_connections', 'log_level', 'sensitive_headers')
     
     def __init__(self, listen_port: int, upstream_proxy: Optional[str] = None, max_connections: int = 100, log_level: str = "INFO", sensitive_headers: List[str] = None):
-        """
-        Initializes a ProxyManagerConfig object.
-
-        Args:
-            listen_port (int): The port on which the proxy listens.
-            upstream_proxy (Optional[str]): An optional upstream proxy URL.
-            max_connections (int): The maximum number of concurrent connections.
-            log_level (str): The logging level (e.g., 'INFO', 'DEBUG').
-            sensitive_headers (List[str]): A list of headers to redact in logs.
-        """
         self.listen_port = listen_port
         self.upstream_proxy = upstream_proxy
         self.max_connections = max_connections
@@ -381,12 +235,6 @@ class ProxyManagerConfig:
         self.sensitive_headers = sensitive_headers if sensitive_headers else list(SENSITIVE_HEADERS)
 
     def to_dict(self) -> Dict[str, Any]:
-        """
-        Converts the Proxy Manager configuration to a dictionary format for logging or storage.
-
-        Returns:
-            Dict[str, Any]: A dictionary representation of the ProxyManagerConfig.
-        """
         return {
             'listen_port': self.listen_port,
             'upstream_proxy': self.upstream_proxy,
