@@ -544,31 +544,35 @@ class Http11ProxyHandler(BaseProxyHandler):
         self._buffer_offset += n
         return chunk
 
-    async def _handle_connect(self, target: str):
-        """Handles HTTP CONNECT tunneling."""
-        check_url = f"https://{target}/"
-        if not self._is_url_allowed(check_url, self.scope_pattern):
-            await self._send_error(403, "Forbidden by Proxy Scope")
-            return
+    async def _read_bytes(self, n: int) -> bytes:
+        """Reads a specific number of bytes from the stream."""
+        
+        # [VECTOR SECURITY] Pre-check allocation request
+        if n > MAX_CAPTURE_BODY_SIZE:
+             raise PayloadTooLargeError(f"Content-Length {n} exceeds capture limit.")
 
-        host, port = self._parse_target(target)
-        if self.ssl_context_factory:
-            # MITM Path
-            try:
-                ssl_ctx = self.ssl_context_factory(host)
-                self.writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                await self.writer.drain()
-                await self.writer.start_tls(ssl_ctx)
-                handler = DualProtocolHandler(
-                    self.reader, self.writer, target, self.callback, self.target_override, 
-                    self.scope_pattern, self.enable_tunneling, self.upstream_verify_ssl, 
-                    self.upstream_ca_bundle, self.ssl_context_factory, self.strict_mode
-                )
-                await handler.run()
-                return
-            except Exception as e:
-                self.log("ERROR", f"MITM Handshake Failed for {target}: {e}")
-                return
+        while (len(self.buffer) - self._buffer_offset) < n:
+            # [VECTOR SECURITY] Check buffer growth during accumulation
+            if len(self.buffer) > MAX_CAPTURE_BODY_SIZE + 4096:
+                 raise PayloadTooLargeError("Buffer limit exceeded.")
+
+            try: 
+                data = await asyncio.wait_for(self.reader.read(READ_CHUNK_SIZE), timeout=IDLE_TIMEOUT)
+            except asyncio.TimeoutError: 
+                raise ProxyError("Read Timeout (Idle) in Body")
+            if not data: 
+                raise ProxyError("Incomplete read")
+            
+            # Optimization: Lazy In-Place Compaction
+            if self._buffer_offset > COMPACTION_THRESHOLD and self._buffer_offset > (len(self.buffer) // 2):
+                  del self.buffer[:self._buffer_offset]
+                  self._buffer_offset = 0
+            self.buffer.extend(data)
+        
+        # [VECTOR] Zero-copy slicing
+        chunk = memoryview(self.buffer)[self._buffer_offset : self._buffer_offset + n].tobytes()
+        self._buffer_offset += n
+        return chunk
 
         # Blind Tunnel Path
         try:

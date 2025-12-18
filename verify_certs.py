@@ -118,24 +118,31 @@ class CertManager:
             with open(CA_CERT_PATH, "rb") as f:
                 self.ca_cert = x509.load_pem_x509_certificate(f.read())
 
-    def get_context_for_host(self, hostname: str) -> ssl.SSLContext:
+def get_context_for_host(self, hostname: str) -> ssl.SSLContext:
         """
         Returns an SSLContext configured with a certificate for the specific hostname.
         Uses a read-through cache and shared key optimization.
+        [SECURED] Input sanitization prevents Arbitrary File Write (Path Traversal).
         """
         with self.lock:
             if hostname in self.cache:
                 return self.cache[hostname]
 
+            # [SECURITY FIX] Sanitize input to prevent Path Traversal
+            safe_hostname = os.path.basename(hostname)
+            
+            # Fallback for empty/malicious edge cases
+            if not safe_hostname or safe_hostname in ('.', '..'):
+                safe_hostname = "unknown_host"
+
             # [VECTOR OPTIMIZATION] Use shared key if available
             key = self.shared_leaf_key
             
             subject = x509.Name([
-                x509.NameAttribute(NameOID.COMMON_NAME, hostname),
+                x509.NameAttribute(NameOID.COMMON_NAME, safe_hostname),
             ])
             
             # Build the leaf certificate
-            # Valid from 1 hour ago (clock skew safety) to 1 year in future
             builder = x509.CertificateBuilder().subject_name(
                 subject
             ).issuer_name(
@@ -150,10 +157,9 @@ class CertManager:
                 datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=365)
             )
             
-            # Add SAN (Subject Alternative Name) extension
-            # This is mandatory for modern browsers/clients
+            # Add SAN (Subject Alternative Name)
             builder = builder.add_extension(
-                x509.SubjectAlternativeName([x509.DNSName(hostname)]),
+                x509.SubjectAlternativeName([x509.DNSName(safe_hostname)]),
                 critical=False,
             )
             
@@ -167,21 +173,12 @@ class CertManager:
             )
             cert_pem = cert.public_bytes(serialization.Encoding.PEM)
 
-            # Save to 'certs/' directory
-            key_path = os.path.join(CERTS_DIR, f"{hostname}.key")
-            cert_path = os.path.join(CERTS_DIR, f"{hostname}.crt")
+            # [SECURITY] Use safe_hostname for filesystem paths
+            key_path = os.path.join(CERTS_DIR, f"{safe_hostname}.key")
+            cert_path = os.path.join(CERTS_DIR, f"{safe_hostname}.crt")
             
-            # Secure write for private key
-            fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            try:
-                f = os.fdopen(fd, "wb")
-            except Exception:
-                os.close(fd)
-                raise
-
-            with f:
+            with open(key_path, "wb") as f:
                 f.write(key_pem)
-
             with open(cert_path, "wb") as f:
                 f.write(cert_pem)
 
@@ -194,7 +191,6 @@ class CertManager:
             
             self.cache[hostname] = ctx
             return ctx
-
 def install_to_trust_store():
     """
     Installs the generated CA certificate to the system trust store.
