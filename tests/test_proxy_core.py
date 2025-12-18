@@ -381,10 +381,12 @@ class TestNativeProxyHandler:
         ]
         safe_headers, protocol = handler._prepare_forwarded_headers(raw_headers, is_upstream=True)
         safe_dict = {k: v for k, v in safe_headers}
-        assert 'connection' not in safe_dict
-        assert 'upgrade' not in safe_dict
-        assert safe_dict.get('te') == 'trailers'
-        assert ':method' in safe_dict
+
+        # [UPDATED] Assertions must now check for BYTES, not STRINGS
+        assert b'connection' not in safe_dict
+        assert b'upgrade' not in safe_dict
+        assert safe_dict.get(b'te') == b'trailers'
+        assert b':method' in safe_dict
 
     @pytest.mark.asyncio
     async def test_h2_connect_protocol_disabled(self, mock_h2_setup):
