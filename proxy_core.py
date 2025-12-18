@@ -426,6 +426,59 @@ class Http11ProxyHandler(BaseProxyHandler):
              return False
         return True
 
+    async def _handle_connect(self, target: str):
+        """
+        Handles the HTTP CONNECT method.
+        Supports both Blind Tunneling and MITM Interception (via start_tls).
+        """
+        host, port = self._parse_target(target)
+
+        # [MITM PATH] - If we are configured to verify/intercept SSL
+        if self.ssl_context_factory:
+            try:
+                # 1. Acknowledge the tunnel to the client
+                self.writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await self.writer.drain()
+                
+                # 2. Generate/Get Certificate for the target host
+                ssl_ctx = self.ssl_context_factory(host)
+                
+                # 3. Upgrade the client connection to TLS (Server-side handshake)
+                # The writer now wraps the encrypted stream
+                await self.writer.start_tls(ssl_ctx, server_side=True)
+                
+                # 4. Hand off to DualProtocolHandler to parse the inner (decrypted) traffic
+                # Recursion allows handling H1/H2 inside the tunnel
+                handler = DualProtocolHandler(
+                    self.reader, self.writer, target, self.callback, 
+                    self.target_override, self.scope_pattern, 
+                    self.enable_tunneling, self.upstream_verify_ssl, 
+                    self.upstream_ca_bundle, self.ssl_context_factory
+                )
+                await handler.run()
+                return
+            except Exception as e:
+                self.log("ERROR", f"MITM Upgrade Failed: {e}")
+                return
+
+        # [BLIND TUNNEL PATH] - Passthrough for when we don't have certs (or disabled)
+        try:
+            u_reader, u_writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), 
+                timeout=UPSTREAM_CONNECT_TIMEOUT
+            )
+            self.writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await self.writer.drain()
+            await asyncio.gather(
+                self._pipe(self.reader, u_writer, flush_buffer=True),
+                self._pipe(u_reader, self.writer),
+                return_exceptions=True
+            )
+        except Exception:
+            await self._send_error(502, "Bad Gateway")
+        finally:
+             pass
+
     async def _send_error(self, code, message):
         """Sends an HTTP error response to the client."""
         try:
@@ -528,24 +581,6 @@ class Http11ProxyHandler(BaseProxyHandler):
     
     async def _read_bytes(self, n: int) -> bytes:
         """Reads a specific number of bytes from the stream."""
-        while (len(self.buffer) - self._buffer_offset) < n:
-            try: data = await asyncio.wait_for(self.reader.read(READ_CHUNK_SIZE), timeout=IDLE_TIMEOUT)
-            except asyncio.TimeoutError: raise ProxyError("Read Timeout (Idle) in Body")
-            if not data: raise ProxyError("Incomplete read")
-            
-            # Optimization: Lazy In-Place Compaction
-            if self._buffer_offset > COMPACTION_THRESHOLD and self._buffer_offset > (len(self.buffer) // 2):
-                  del self.buffer[:self._buffer_offset]
-                  self._buffer_offset = 0
-            self.buffer.extend(data)
-        
-        # [VECTOR] Zero-copy slicing
-        chunk = memoryview(self.buffer)[self._buffer_offset : self._buffer_offset + n].tobytes()
-        self._buffer_offset += n
-        return chunk
-
-    async def _read_bytes(self, n: int) -> bytes:
-        """Reads a specific number of bytes from the stream."""
         
         # [VECTOR SECURITY] Pre-check allocation request
         if n > MAX_CAPTURE_BODY_SIZE:
@@ -573,14 +608,6 @@ class Http11ProxyHandler(BaseProxyHandler):
         chunk = memoryview(self.buffer)[self._buffer_offset : self._buffer_offset + n].tobytes()
         self._buffer_offset += n
         return chunk
-
-        # Blind Tunnel Path
-        try:
-            u_reader, u_writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=UPSTREAM_CONNECT_TIMEOUT)
-            self.writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            await self.writer.drain()
-            await asyncio.gather(self._pipe(self.reader, u_writer, flush_buffer=True), self._pipe(u_reader, self.writer), return_exceptions=True)
-        except Exception: await self._send_error(502, "Bad Gateway")
 
     async def _pipe(self, r, w, flush_buffer=False):
         """Pipes data between streams."""
