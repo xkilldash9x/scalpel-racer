@@ -11,6 +11,7 @@ import socket
 import struct
 import binascii
 import sys
+import os
 import proxy_core
 from typing import Optional, Dict, List, Any, Union, Tuple
 
@@ -216,11 +217,21 @@ class QuicServer:
     async def start(self):
         loop = asyncio.get_running_loop()
         log.info(f"QUIC (H3) UDP Listener starting on {self.host}:{self.port}")
+        
         if HAS_AIOQUIC:
             log.info("AioQuic detected. Enabling full HTTP/3 Proxying.")
             configuration = QuicConfiguration(is_client=False)
-            try: configuration.load_cert_chain("server.crt", "server.key")
-            except Exception: log.warning("Could not load 'server.crt/key'.")
+            
+            # [FIX] Load certs from the 'certs/' directory
+            cert_path = os.path.join("certs", "server.crt")
+            key_path = os.path.join("certs", "server.key")
+            
+            try: 
+                configuration.load_cert_chain(cert_path, key_path)
+            except Exception as e: 
+                log.warning(f"Could not load QUIC certificates from '{cert_path}'/'{key_path}'. Error: {e}")
+                log.warning("Please ensure you have run 'verify_certs.py' to generate the static listener certificates.")
+                
             def create_protocol(*args, **kwargs):
                 p = QuicInterceptor(*args, **kwargs); p.callback = self.callback; return p
             await serve(self.host, self.port, configuration=configuration, create_protocol=create_protocol)
