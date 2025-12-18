@@ -17,17 +17,18 @@ from typing import Optional, Dict, List, Any, Union, Tuple
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("ProxyManager")
 
-# Check for aioquic availability
+# -- Check for aioquic availability --
 HAS_AIOQUIC = False
 try:
     from aioquic.asyncio import QuicConnectionProtocol, serve, connect
     from aioquic.quic.configuration import QuicConfiguration
-    from aioquic.quic.events import StreamDataReceived, HandshakeCompleted, ConnectionTerminated, PingReceived, QuicEvent
+    from aioquic.quic.events import StreamDataReceived, HandshakeCompleted, ConnectionTerminated, QuicEvent
     from aioquic.h3.connection import H3Connection
     from aioquic.h3.events import DataReceived, HeadersReceived, H3Event
     HAS_AIOQUIC = True
-except ImportError:
-    log.warning("aioquic not found. HTTP/3 Proxying will be disabled.")
+except ImportError as e:
+    # We log the specific error 'e' so we know if it's a missing package or a missing shared library
+    log.warning(f"aioquic import failed: {e}. HTTP/3 Proxying will be disabled.")
 
 class CapturedRequest:
     def __init__(self, protocol: str, method: str, url: str, headers: Any, body: bytes = b""):
@@ -250,9 +251,10 @@ if HAS_AIOQUIC:
             headers = [(b":status", str(status_code).encode())]
             self._h3_conn.send_headers(stream_id, headers, end_stream=True)
             self.transmit()
+
 else:
     # Fallback if aioquic is not available
-    # This prevents ImportError when importing H3ProxyInterceptor in tests or other modules
+    # This ensures tests and other modules can import these names without crashing
     UpstreamBridge = None
     H3ProxyInterceptor = None
 

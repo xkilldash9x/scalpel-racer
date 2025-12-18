@@ -445,7 +445,7 @@ class Http11ProxyHandler(BaseProxyHandler):
                 
                 # 3. Upgrade the client connection to TLS (Server-side handshake)
                 # The writer now wraps the encrypted stream
-                await self.writer.start_tls(ssl_ctx, server_side=True)
+                await self.writer.start_tls(ssl_ctx)
                 
                 # 4. Hand off to DualProtocolHandler to parse the inner (decrypted) traffic
                 # Recursion allows handling H1/H2 inside the tunnel
