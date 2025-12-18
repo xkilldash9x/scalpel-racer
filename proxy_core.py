@@ -4,6 +4,10 @@
 [VECTOR] ASYNC PROXY CORE - SCALPEL RACER
 RFC-Compliant Dual-Stack (HTTP/1.1 and HTTP/2) Proxy Handler.
 
+Refactored for Manager Integration and Scalpel Racer MITM capabilities.
+Includes full logic for recursive TLS upgrading, strict HTTP parsing,
+and defense-in-depth security measures against Request Smuggling and DoS.
+
 VECTOR OPTIMIZATIONS:
 - IO: TCP_NODELAY enabled on upstream sockets.
 - MEMORY: Zero-Copy slicing in strict line reader via memoryview.
@@ -11,6 +15,7 @@ VECTOR OPTIMIZATIONS:
 - MEMORY: __slots__ usage for high-frequency objects.
 - ALGO: Switched to `find()` for buffer scanning (Zero-Exception overhead).
 - EVENT LOOP: Queue Batching in _stream_sender.
+- SECURITY: Bounded Queues to prevent OOM DoS.
 """
 
 import asyncio
@@ -21,27 +26,43 @@ import time
 from typing import Dict, Optional, Callable, Tuple, List, Any, Set, TypedDict, TYPE_CHECKING
 from urllib.parse import urljoin, urlunparse, urlparse
 
-# --- Data Structures & Imports ---
+# -- Data Structures & Imports --
 try:
     from structures import CapturedRequest, CapturedHeaders, HOP_BY_HOP_HEADERS, SENSITIVE_HEADERS
 except ImportError:
     from dataclasses import dataclass
+    
     @dataclass
     class CapturedRequest:
-        id: int; method: str; url: str; headers: List[Tuple[str, str]]; body: bytes
-        truncated: bool = False; protocol: str = "HTTP/1.1"; edited_body: Optional[bytes] = None
+        id: int
+        method: str
+        url: str
+        headers: List[Tuple[str, str]]
+        body: bytes
+        truncated: bool = False
+        protocol: str = "HTTP/1.1"
+        edited_body: Optional[bytes] = None
+
     class CapturedHeaders(TypedDict):
-        pseudo: Dict[str, str]; headers: List[Tuple[str, str]]
+        pseudo: Dict[str, str]
+        headers: List[Tuple[str, str]]
+
+    # Headers that must be removed when forwarding (RFC 7230 / RFC 7540)
     HOP_BY_HOP_HEADERS = {
-        'connection', 'keep-alive', 'proxy-connection', 'te', 'transfer-encoding',
+        'connection', 'keep-alive', 'proxy-connection', 'te', 'transfer-encoding', 
         'upgrade', 'proxy-authenticate', 'proxy-authorization', 'trailers'
     }
-    SENSITIVE_HEADERS = {'authorization', 'proxy-authorization', 'cookie', 'set-cookie'}
+    
+    SENSITIVE_HEADERS = {'authorization', 'proxy-authorization', 'cookie', 'set-cookie', 'x-auth-token'}
 
 if TYPE_CHECKING:
     from h2.connection import H2Connection
     from h2.config import H2Configuration
-    from h2.events import RequestReceived, DataReceived, StreamEnded, StreamReset, WindowUpdated, SettingsAcknowledged, ConnectionTerminated, TrailersReceived, ResponseReceived, RemoteSettingsChanged, PingReceived, PriorityUpdated
+    from h2.events import (
+        RequestReceived, DataReceived, StreamEnded, StreamReset, WindowUpdated, 
+        SettingsAcknowledged, ConnectionTerminated, TrailersReceived, ResponseReceived, 
+        RemoteSettingsChanged, PingReceived, PriorityUpdated
+    )
     from h2.errors import ErrorCodes
     from h2.exceptions import FlowControlError, ProtocolError, StreamClosedError
     from h2.settings import SettingCodes
@@ -49,11 +70,16 @@ if TYPE_CHECKING:
 try:
     from h2.connection import H2Connection
     from h2.config import H2Configuration
-    from h2.events import RequestReceived, DataReceived, StreamEnded, StreamReset, WindowUpdated, SettingsAcknowledged, ConnectionTerminated, TrailersReceived, ResponseReceived, RemoteSettingsChanged, PingReceived, PriorityUpdated
+    from h2.events import (
+        RequestReceived, DataReceived, StreamEnded, StreamReset, WindowUpdated, 
+        SettingsAcknowledged, ConnectionTerminated, TrailersReceived, ResponseReceived, 
+        RemoteSettingsChanged, PingReceived, PriorityUpdated
+    )
     from h2.errors import ErrorCodes
     from h2.exceptions import FlowControlError, ProtocolError, StreamClosedError
     from h2.settings import SettingCodes
 except ImportError:
+    # Allow import without h2 for testing/linting purposes
     H2Connection = None
 
 try:
@@ -61,25 +87,38 @@ try:
 except ImportError:
     hpack = None
 
-# --- Constants ---
+# -- Constants --
+
+# H2 Specific forbidden headers (RFC 7540)
 H2_FORBIDDEN_HEADERS = frozenset({
     'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade'
 })
 
+# Regex for strict header validation (No whitespace before colon, strict tokens)
 STRICT_HEADER_PATTERN = re.compile(rb'^([!#$%&\'*+\-.^_`|~0-9a-zA-Z]+):[ \t]*(.*)$')
+
+# Security & Performance Limits
 UPSTREAM_CONNECT_TIMEOUT = 10.0
 IDLE_TIMEOUT = 60.0
 KEEPALIVE_INTERVAL = 10.0
 FLOW_CONTROL_TIMEOUT = 30.0
-MAX_HEADER_LIST_SIZE = 262144
-MAX_CAPTURE_BODY_SIZE = 10 * 1024 * 1024
-STREAM_QUEUE_SIZE = 1024
+MAX_HEADER_LIST_SIZE = 262144        # 256KB
+MAX_CAPTURE_BODY_SIZE = 10 * 1024 * 1024 # 10MB
+STREAM_QUEUE_SIZE = 1024             # [DEFENSE IN DEPTH] Cap queue size to prevent Memory DoS
+
+# Protocol Constants
 H2_PREFACE = b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
 GOAWAY_MAX_FRAME = b'\x00\x00\x08\x07\x00\x00\x00\x00\x00\x7f\xff\xff\xff\x00\x00\x00\x00'
-READ_CHUNK_SIZE = 65536
-COMPACTION_THRESHOLD = 65536   # [VECTOR] 64KB Threshold for lazy compaction
+
+# IO Tuning
+READ_CHUNK_SIZE = 65536              # 64KB Read Buffer
+COMPACTION_THRESHOLD = 65536         # [VECTOR] 64KB Threshold for lazy compaction
 
 class StreamContext:
+    """
+    Maintains state for a single HTTP/2 stream.
+    Optimized for memory with __slots__ to handle high concurrency.
+    """
     __slots__ = (
         'stream_id', 'scheme', 'downstream_closed', 'upstream_closed',
         'upstream_flow_event', 'downstream_flow_event',
@@ -92,24 +131,45 @@ class StreamContext:
         self.scheme = scheme
         self.downstream_closed = False
         self.upstream_closed = False
-        self.upstream_flow_event = asyncio.Event(); self.upstream_flow_event.set()
-        self.downstream_flow_event = asyncio.Event(); self.downstream_flow_event.set()
+        
+        # Flow control events - Start set to True (open)
+        self.upstream_flow_event = asyncio.Event()
+        self.upstream_flow_event.set()
+        self.downstream_flow_event = asyncio.Event()
+        self.downstream_flow_event.set()
+        
+        # [DEFENSE IN DEPTH] Bounded Queues to prevent OOM
         self.upstream_queue = asyncio.Queue(maxsize=STREAM_QUEUE_SIZE) 
         self.downstream_queue = asyncio.Queue(maxsize=STREAM_QUEUE_SIZE) 
+        
         self.sender_tasks: List[asyncio.Task] = [] 
         self.captured_headers = {"pseudo": {}, "headers": []} 
         self.request_body = bytearray() 
         self.capture_finalized = False 
         self.truncated = False
+    
+    def __repr__(self):
+        return f"<StreamContext id={self.stream_id} scheme={self.scheme}>"
 
-    def __repr__(self): return f"<StreamContext id={self.stream_id} scheme={self.scheme}>"
+class ProxyError(Exception):
+    """Base class for proxy-related errors."""
+    pass
 
-class ProxyError(Exception): pass
-class PayloadTooLargeError(ProxyError): pass
+class PayloadTooLargeError(ProxyError):
+    """Raised when the payload exceeds the maximum allowed size."""
+    pass
 
 class BaseProxyHandler:
-    __slots__ = ('explicit_host', 'upstream_verify_ssl', 'upstream_ca_bundle', 'callback', 'ssl_context_factory', 'upstream_host', 'upstream_port')
-    def __init__(self, explicit_host: str, upstream_verify_ssl: bool, upstream_ca_bundle: Optional[str], manager_callback: Callable, ssl_context_factory: Optional[Callable] = None):
+    """
+    Shared logic for Upstream Connection and Logging.
+    """
+    __slots__ = (
+        'explicit_host', 'upstream_verify_ssl', 'upstream_ca_bundle', 
+        'callback', 'ssl_context_factory', 'upstream_host', 'upstream_port'
+    )
+
+    def __init__(self, explicit_host: str, upstream_verify_ssl: bool, upstream_ca_bundle: Optional[str], 
+                 manager_callback: Callable, ssl_context_factory: Optional[Callable] = None):
         self.explicit_host = explicit_host
         self.upstream_verify_ssl = upstream_verify_ssl
         self.upstream_ca_bundle = upstream_ca_bundle
@@ -119,12 +179,20 @@ class BaseProxyHandler:
         self.upstream_port: int = 443
 
     def log(self, level: str, msg: Any):
+        """Logs a message using the manager callback."""
         if self.callback:
-            try: self.callback(level, msg)
-            except Exception: pass
+            try:
+                self.callback(level, msg)
+            except Exception:
+                pass 
 
     def _parse_target(self, explicit_host: str, default_port: int = 443) -> Tuple[str, int]:
+        """
+        Robust parsing of host:port strings, handling IPv6 brackets.
+        Accepts a dynamic default_port based on scheme (80 vs 443).
+        """
         if not explicit_host: return "", 0
+        
         if explicit_host.startswith('['):
             end = explicit_host.find(']')
             if end != -1:
@@ -134,20 +202,27 @@ class BaseProxyHandler:
                     try: return host, int(rem[1:])
                     except ValueError: pass
                 else: return host, default_port
+        
         if ':' in explicit_host:
             host, port_str = explicit_host.rsplit(':', 1)
             try: return host, int(port_str)
             except ValueError: pass
+            
         return explicit_host, default_port
 
     async def _connect_upstream(self, host: str, port: int, alpn_protocols: List[str] = None) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """
+        Establishes a connection to the upstream server.
+        """
         ctx = ssl.create_default_context()
         if self.upstream_verify_ssl:
             ctx.verify_mode = ssl.CERT_REQUIRED
             ctx.check_hostname = True
-            if self.upstream_ca_bundle: ctx.load_verify_locations(cafile=self.upstream_ca_bundle)
+            if self.upstream_ca_bundle:
+                ctx.load_verify_locations(cafile=self.upstream_ca_bundle)
         else:
-            ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
         
         if alpn_protocols:
             try: ctx.set_alpn_protocols(alpn_protocols)
@@ -161,15 +236,27 @@ class BaseProxyHandler:
                 if sock: sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except Exception: pass
             return reader, writer
-        except asyncio.TimeoutError: raise
+        except asyncio.TimeoutError:
+            raise
 
     def _is_url_allowed(self, url: str, scope_pattern: Optional[Any]) -> bool:
+        """Checks if a URL is allowed based on the scope pattern."""
         if not scope_pattern: return True
         return bool(scope_pattern.search(url))
 
 class Http11ProxyHandler(BaseProxyHandler):
-    __slots__ = ('reader', 'writer', 'target_override', 'scope_pattern', 'buffer', '_buffer_offset', 'enable_tunneling', 'strict_mode', '_previous_byte_was_cr')
-    def __init__(self, reader, writer, explicit_host, manager_callback, target_override, scope_pattern, upstream_verify_ssl=False, upstream_ca_bundle=None, initial_data=b"", ssl_context_factory=None, enable_tunneling=True, strict_mode=True):
+    """
+    HTTP/1.1 Proxy Handler.
+    """
+    __slots__ = (
+        'reader', 'writer', 'target_override', 'scope_pattern', 
+        'buffer', '_buffer_offset', 'enable_tunneling', 
+        'strict_mode', '_previous_byte_was_cr'
+    )
+
+    def __init__(self, reader, writer, explicit_host, manager_callback, target_override, 
+                 scope_pattern, upstream_verify_ssl=False, upstream_ca_bundle=None, 
+                 initial_data=b"", ssl_context_factory=None, enable_tunneling=True, strict_mode=True):
         super().__init__(explicit_host, upstream_verify_ssl, upstream_ca_bundle, manager_callback, ssl_context_factory)
         self.reader = reader
         self.writer = writer
@@ -184,26 +271,30 @@ class Http11ProxyHandler(BaseProxyHandler):
     async def _read_strict_line(self) -> bytes:
         """
         Reads a line strictly terminated by CRLF, but allows lenient fallback.
-        [VECTOR] OPTIMIZATION: Switched to find() instead of index() to avoid
-        Exception overhead on partial reads.
+        [VECTOR] OPTIMIZATION: Switched to find() instead of index() to avoid 
+        Exception overhead on partial reads, and uses memoryview slicing.
         """
         while True:
             # Returns -1 if not found (faster than raising ValueError)
             lf_index = self.buffer.find(b'\n', self._buffer_offset)
-
+            
             if lf_index == -1:
+                # LF not found in current buffer
                 if len(self.buffer) - self._buffer_offset > 0:
                     self._previous_byte_was_cr = (self.buffer[-1] == 0x0D)
+                
                 if (len(self.buffer) - self._buffer_offset) > MAX_HEADER_LIST_SIZE:
                     raise ProxyError("Header Line Exceeded Max Length")
                 
+                # Optimization: Lazy In-Place Compaction
                 if self._buffer_offset > COMPACTION_THRESHOLD and self._buffer_offset > (len(self.buffer) // 2):
-                     del self.buffer[:self._buffer_offset]
-                     self._buffer_offset = 0
+                      del self.buffer[:self._buffer_offset]
+                      self._buffer_offset = 0
 
                 try:
                     data = await asyncio.wait_for(self.reader.read(READ_CHUNK_SIZE), timeout=IDLE_TIMEOUT)
-                except asyncio.TimeoutError: raise ProxyError("Read Timeout (Idle)")
+                except asyncio.TimeoutError:
+                    raise ProxyError("Read Timeout (Idle)")
                 
                 if not data:
                     if len(self.buffer) - self._buffer_offset > 0: raise ProxyError("Incomplete message")
@@ -211,6 +302,7 @@ class Http11ProxyHandler(BaseProxyHandler):
                 self.buffer.extend(data)
                 continue
             
+            # LF found
             line_len = lf_index - self._buffer_offset
             if line_len > MAX_HEADER_LIST_SIZE: raise ProxyError("Header Line Exceeded Max Length")
 
@@ -220,6 +312,7 @@ class Http11ProxyHandler(BaseProxyHandler):
             elif lf_index == self._buffer_offset:
                 if self._previous_byte_was_cr: is_crlf = True
             
+            # Lenient Mode: Strip CR if present, otherwise handle bare LF
             line_end = lf_index - 1 if is_crlf else lf_index
             
             # [VECTOR] Optimization: Use memoryview to avoid copying when slicing
@@ -233,13 +326,17 @@ class Http11ProxyHandler(BaseProxyHandler):
             return line
 
     async def run(self):
+        """Runs the HTTP/1.1 proxy loop."""
         try:
             while True:
-                try: line = await self._read_strict_line()
+                try:
+                    line = await self._read_strict_line()
                 except ProxyError as e:
                     self.log("ERROR", f"Framing Error: {e}")
-                    if "Timeout" not in str(e) and "Incomplete" not in str(e): await self._send_error(400, "Bad Request")
+                    if "Timeout" not in str(e) and "Incomplete" not in str(e): 
+                        await self._send_error(400, "Bad Request")
                     return
+                
                 if not line: break 
 
                 try:
@@ -255,13 +352,17 @@ class Http11ProxyHandler(BaseProxyHandler):
 
                 headers = []
                 headers_dict = {}
+                
+                # Header Parsing Loop
                 try:
                     while True:
                         h_line = await self._read_strict_line()
                         if not h_line: break 
                         if h_line[0] in (0x20, 0x09): raise ProxyError("Obsolete Line Folding Rejected")
+                        
                         match = STRICT_HEADER_PATTERN.match(h_line)
                         if not match: raise ProxyError("Invalid Header Syntax")
+                        
                         key = match.group(1).decode('ascii')
                         val = match.group(2).decode('ascii').strip() 
                         headers.append((key, val))
@@ -272,14 +373,17 @@ class Http11ProxyHandler(BaseProxyHandler):
 
                 if not await self._validate_request(method, headers_dict): return
 
+                # Transfer-Encoding & Content-Length Logic (Anti-Smuggling)
                 te_header = headers_dict.get('transfer-encoding')
                 cl_header = headers_dict.get('content-length')
                 
                 if te_header:
                     if cl_header:
                         if self.strict_mode:
+                            # Security: Remove CL to avoid ambiguity downstream (Safe Mode)
                             headers = [h for h in headers if h[0].lower() != 'content-length']
                             if 'content-length' in headers_dict: del headers_dict['content-length']
+                    
                     encodings = [e.strip().lower() for e in te_header.split(',')]
                     if 'chunked' in encodings and encodings[-1] != 'chunked':
                         await self._send_error(400, "Bad Transfer-Encoding")
@@ -310,6 +414,7 @@ class Http11ProxyHandler(BaseProxyHandler):
             if not self.writer.is_closing(): self.writer.close()
 
     async def _validate_request(self, method: str, headers_dict: Dict[str, str]) -> bool:
+        """Validates specific protocol requirements."""
         if method == 'CONNECT' and 'host' not in headers_dict:
             await self._send_error(400, "CONNECT requires Host header")
             return False
@@ -319,12 +424,14 @@ class Http11ProxyHandler(BaseProxyHandler):
         return True
 
     async def _send_error(self, code, message):
+        """Sends an HTTP error response to the client."""
         try:
             self.writer.write(f"HTTP/1.1 {code} {message}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".encode())
             await self.writer.drain()
         except Exception: pass
 
     async def _handle_request(self, method, target, version_b, headers, headers_dict):
+        """Handles a standard HTTP request."""
         req_host = self.explicit_host
         if not req_host:
             parsed = urlparse(target)
@@ -357,7 +464,7 @@ class Http11ProxyHandler(BaseProxyHandler):
             try:
                 length = int(content_length)
                 body = await self._read_bytes(length)
-            except ValueError: pass
+            except ValueError: pass 
 
         self._record_capture(method, target, headers, body, scheme, host)
 
@@ -367,6 +474,7 @@ class Http11ProxyHandler(BaseProxyHandler):
             await self.writer.drain()
             return
 
+        # Upstream Connection
         try:
             u_reader, u_writer = await self._connect_upstream(host, port)
         except asyncio.TimeoutError:
@@ -376,6 +484,7 @@ class Http11ProxyHandler(BaseProxyHandler):
             await self._send_error(502, "Bad Gateway")
             return
 
+        # Forwarding
         req_line = f"{method} {target} {version_b.decode()}\r\n".encode()
         u_writer.write(req_line)
         
@@ -395,6 +504,7 @@ class Http11ProxyHandler(BaseProxyHandler):
         u_writer.close()
 
     async def _read_chunked_body(self) -> bytes:
+        """Reads a chunked HTTP body."""
         body_parts = []
         while True:
             line = await self._read_strict_line()
@@ -414,13 +524,16 @@ class Http11ProxyHandler(BaseProxyHandler):
         return b"".join(body_parts)
     
     async def _read_bytes(self, n: int) -> bytes:
+        """Reads a specific number of bytes from the stream."""
         while (len(self.buffer) - self._buffer_offset) < n:
             try: data = await asyncio.wait_for(self.reader.read(READ_CHUNK_SIZE), timeout=IDLE_TIMEOUT)
             except asyncio.TimeoutError: raise ProxyError("Read Timeout (Idle) in Body")
             if not data: raise ProxyError("Incomplete read")
+            
+            # Optimization: Lazy In-Place Compaction
             if self._buffer_offset > COMPACTION_THRESHOLD and self._buffer_offset > (len(self.buffer) // 2):
-                 del self.buffer[:self._buffer_offset]
-                 self._buffer_offset = 0
+                  del self.buffer[:self._buffer_offset]
+                  self._buffer_offset = 0
             self.buffer.extend(data)
         
         # [VECTOR] Zero-copy slicing
@@ -429,6 +542,7 @@ class Http11ProxyHandler(BaseProxyHandler):
         return chunk
 
     async def _handle_connect(self, target: str):
+        """Handles HTTP CONNECT tunneling."""
         check_url = f"https://{target}/"
         if not self._is_url_allowed(check_url, self.scope_pattern):
             await self._send_error(403, "Forbidden by Proxy Scope")
@@ -436,14 +550,15 @@ class Http11ProxyHandler(BaseProxyHandler):
 
         host, port = self._parse_target(target)
         if self.ssl_context_factory:
+            # MITM Path
             try:
                 ssl_ctx = self.ssl_context_factory(host)
                 self.writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 await self.writer.drain()
                 await self.writer.start_tls(ssl_ctx)
                 handler = DualProtocolHandler(
-                    self.reader, self.writer, target, self.callback, self.target_override,
-                    self.scope_pattern, self.enable_tunneling, self.upstream_verify_ssl,
+                    self.reader, self.writer, target, self.callback, self.target_override, 
+                    self.scope_pattern, self.enable_tunneling, self.upstream_verify_ssl, 
                     self.upstream_ca_bundle, self.ssl_context_factory, self.strict_mode
                 )
                 await handler.run()
@@ -452,6 +567,7 @@ class Http11ProxyHandler(BaseProxyHandler):
                 self.log("ERROR", f"MITM Handshake Failed for {target}: {e}")
                 return
 
+        # Blind Tunnel Path
         try:
             u_reader, u_writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=UPSTREAM_CONNECT_TIMEOUT)
             self.writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -460,6 +576,7 @@ class Http11ProxyHandler(BaseProxyHandler):
         except Exception: await self._send_error(502, "Bad Gateway")
 
     async def _pipe(self, r, w, flush_buffer=False):
+        """Pipes data between streams."""
         try:
             if flush_buffer and (len(self.buffer) - self._buffer_offset) > 0:
                 w.write(self.buffer[self._buffer_offset:])
@@ -471,24 +588,32 @@ class Http11ProxyHandler(BaseProxyHandler):
                 if not data: break
                 w.write(data)
                 await w.drain()
-        except (ConnectionResetError, BrokenPipeError): pass
+        except (ConnectionResetError, BrokenPipeError): pass 
         except Exception as e: self.log("ERROR", f"Pipe transfer error: {e}")
         finally:
             try: w.close(); await w.wait_closed()
             except Exception: pass
 
     def _record_capture(self, method, path, headers, body, scheme, authority):
+        """Records a captured request."""
         url = urljoin(self.target_override, path.lstrip('/')) if self.target_override else f"{scheme}://{authority}{path}"
         if self.scope_pattern and not self.scope_pattern.search(url): return
         captured = CapturedRequest(0, method, url, headers, body, (len(body) > MAX_CAPTURE_BODY_SIZE), "HTTP/1.1")
         self.log("CAPTURE", captured)
 
 class NativeProxyHandler(BaseProxyHandler):
-    __slots__ = ('client_reader', 'client_writer', 'target_override', 'scope_pattern',
-                 'enable_tunneling', 'initial_data', 'upstream_reader', 'upstream_writer',
-                 'upstream_scheme', 'ds_h2_lock', 'us_h2_lock', 'ds_socket_lock',
-                 'us_socket_lock', 'downstream_conn', 'upstream_conn', 'streams',
-                 'closed', 'draining')
+    """
+    Native HTTP/2 Proxy Handler.
+    Manages complex state machinery for H2 frames, streams, and flow control.
+    Supports Tunneling, Capture, and MITM.
+    """
+    __slots__ = (
+        'client_reader', 'client_writer', 'target_override', 'scope_pattern',
+        'enable_tunneling', 'initial_data', 'upstream_reader', 'upstream_writer',
+        'upstream_scheme', 'ds_h2_lock', 'us_h2_lock', 'ds_socket_lock',
+        'us_socket_lock', 'downstream_conn', 'upstream_conn', 'streams',
+        'closed', 'draining'
+    )
 
     def __init__(self, client_reader, client_writer, explicit_host, manager_callback, 
                  target_override, scope_pattern, enable_tunneling=True, 
@@ -498,7 +623,7 @@ class NativeProxyHandler(BaseProxyHandler):
         self.client_reader = client_reader; self.client_writer = client_writer
         self.target_override = target_override; self.scope_pattern = scope_pattern
         self.enable_tunneling = enable_tunneling; self.initial_data = initial_data
-        self.upstream_reader = None; self.upstream_writer = None; self.upstream_scheme = "https"
+        self.upstream_reader = None; self.upstream_writer = None; self.upstream_scheme = "https" 
         self.ds_h2_lock = asyncio.Lock(); self.us_h2_lock = asyncio.Lock()
         self.ds_socket_lock = asyncio.Lock(); self.us_socket_lock = asyncio.Lock()
 
@@ -515,6 +640,10 @@ class NativeProxyHandler(BaseProxyHandler):
         self.upstream_conn = None; self.streams = {}; self.closed = asyncio.Event(); self.draining = False
 
     async def run(self):
+        """
+        Main execution loop for the HTTP/2 proxy.
+        Handles connection setup, event loops, and cleanup.
+        """
         try:
             try: self.upstream_host, self.upstream_port = self._parse_target(self.explicit_host)
             except ValueError: pass
@@ -527,7 +656,7 @@ class NativeProxyHandler(BaseProxyHandler):
 
                 try:
                     await self.connect_upstream()
-                    us_config = H2Configuration(client_side=True, header_encoding='utf-8',
+                    us_config = H2Configuration(client_side=True, header_encoding='utf-8', 
                         validate_inbound_headers=True, validate_outbound_headers=True,
                         normalize_inbound_headers=True, normalize_outbound_headers=True)
                     self.upstream_conn = H2Connection(config=us_config)
@@ -567,6 +696,7 @@ class NativeProxyHandler(BaseProxyHandler):
         finally: await self.cleanup()
 
     async def connect_upstream(self):
+        """Connects to the upstream server using HTTP/2 ALPN."""
         self.upstream_reader, self.upstream_writer = await self._connect_upstream(
             self.upstream_host, self.upstream_port, alpn_protocols=["h2"]
         )
@@ -575,10 +705,12 @@ class NativeProxyHandler(BaseProxyHandler):
             raise ConnectionError("Upstream did not negotiate HTTP/2")
 
     async def _read_loop_wrapper(self, reader, conn, h2_lock, writer, socket_lock, handler):
+        """Wraps the read loop to handle exceptions and close signaling."""
         try: await self.read_loop(reader, conn, h2_lock, writer, socket_lock, handler)
         except Exception: self.closed.set()
 
     async def read_loop(self, reader, conn, h2_lock, writer, socket_lock, event_handler):
+        """Continuously reads data from the reader, updates H2 state, and triggers events."""
         while not self.closed.is_set():
             try: data = await asyncio.wait_for(reader.read(65536), timeout=IDLE_TIMEOUT)
             except asyncio.TimeoutError:
@@ -598,7 +730,10 @@ class NativeProxyHandler(BaseProxyHandler):
     async def _stream_sender(self, stream_id, conn, writer, queue, flow_event, h2_lock, socket_lock, 
                              ack_conn, ack_h2_lock, ack_writer, ack_socket_lock):
         """
+        Consumes payloads from a queue and sends them to the respective connection.
+        Handles Flow Control Backpressure correctly.
         [VECTOR OPTIMIZATION] Implements Queue Batching to reduce await overhead.
+        [BUGFIX] Explicitly handles available <= 0 to clear event inside lock.
         """
         while not self.closed.is_set():
             try:
@@ -622,6 +757,7 @@ class NativeProxyHandler(BaseProxyHandler):
                                 try: writer.write(conn_data); await writer.drain()
                                 except: break
                     else:
+                        # Data Body with Robust Flow Control
                         data = payload; view = memoryview(data); offset = 0; total_len = len(data)
                         while offset < total_len or (total_len == 0 and end_stream):
                             if self.closed.is_set(): break
@@ -675,6 +811,7 @@ class NativeProxyHandler(BaseProxyHandler):
         except: pass
 
     async def handle_request_received(self, event):
+        """Handles an incoming request stream from the client."""
         stream_id = event.stream_id
         if stream_id in self.streams:
              async with self.ds_h2_lock: self.downstream_conn.reset_stream(stream_id, ErrorCodes.PROTOCOL_ERROR); return
@@ -712,6 +849,7 @@ class NativeProxyHandler(BaseProxyHandler):
             if self.enable_tunneling: ctx.upstream_queue.put_nowait(None)
 
     async def handle_downstream_event(self, event):
+        """Dispatches events received from the client/downstream."""
         if isinstance(event, RequestReceived): await self.handle_request_received(event)
         elif isinstance(event, DataReceived):
             if event.stream_id in self.streams:
@@ -723,16 +861,18 @@ class NativeProxyHandler(BaseProxyHandler):
                 if self.enable_tunneling and self.upstream_conn:
                     try:
                         ctx.upstream_queue.put_nowait((event.data, event.stream_ended, event.flow_controlled_length))
+                        # [FIX] Zombie Stream Cleanup: Handle implicit stream end on DATA frame
                         if event.stream_ended:
                             ctx.downstream_closed = True
                             if ctx.upstream_closed: self._cleanup_stream(event.stream_id)
                     except asyncio.QueueFull:
-                         async with self.ds_h2_lock: self.downstream_conn.reset_stream(event.stream_id, ErrorCodes.INTERNAL_ERROR)
+                          async with self.ds_h2_lock: self.downstream_conn.reset_stream(event.stream_id, ErrorCodes.INTERNAL_ERROR)
         elif isinstance(event, TrailersReceived):
             if event.stream_id in self.streams and self.enable_tunneling and self.upstream_conn:
                 try:
                     safe_headers, _ = self._prepare_forwarded_headers(event.headers, is_upstream=True)
                     ctx = self.streams[event.stream_id]; ctx.upstream_queue.put_nowait((safe_headers, event.stream_ended, 0))
+                    # [FIX] Zombie Stream Cleanup: Handle implicit stream end on Trailers
                     if event.stream_ended:
                         ctx.downstream_closed = True
                         if ctx.upstream_closed: self._cleanup_stream(event.stream_id)
@@ -745,11 +885,13 @@ class NativeProxyHandler(BaseProxyHandler):
         elif isinstance(event, RemoteSettingsChanged): await self.flush(self.downstream_conn, self.client_writer, self.ds_h2_lock, self.ds_socket_lock)
 
     async def handle_upstream_event(self, event):
+        """Dispatches events received from the server/upstream."""
         if isinstance(event, ResponseReceived):
             if event.stream_id in self.streams and self.enable_tunneling and self.upstream_conn:
                 try:
                     safe_headers, _ = self._prepare_forwarded_headers(event.headers, is_upstream=False)
                     ctx = self.streams[event.stream_id]; ctx.downstream_queue.put_nowait((safe_headers, event.stream_ended, 0))
+                    # [FIX] Zombie Stream Cleanup: Handle implicit stream end on RESPONSE frame
                     if event.stream_ended: self._cleanup_stream(event.stream_id, upstream_closed=True)
                 except (ValueError, asyncio.QueueFull): self._cleanup_stream(event.stream_id, force_close=True)
         elif isinstance(event, DataReceived):
@@ -762,6 +904,7 @@ class NativeProxyHandler(BaseProxyHandler):
                 if self.enable_tunneling and self.upstream_conn:
                     try:
                         ctx.downstream_queue.put_nowait((event.data, event.stream_ended, event.flow_controlled_length))
+                        # [FIX] Zombie Stream Cleanup: Handle implicit stream end on DATA frame
                         if event.stream_ended: self._cleanup_stream(event.stream_id, upstream_closed=True)
                     except asyncio.QueueFull: self._cleanup_stream(event.stream_id, force_close=True)
         elif isinstance(event, TrailersReceived): 
@@ -769,6 +912,7 @@ class NativeProxyHandler(BaseProxyHandler):
                 try:
                     safe_headers, _ = self._prepare_forwarded_headers(event.headers, is_upstream=False)
                     ctx = self.streams[event.stream_id]; ctx.downstream_queue.put_nowait((safe_headers, event.stream_ended, 0))
+                    # [FIX] Zombie Stream Cleanup: Handle implicit stream end on TRAILERS
                     if event.stream_ended: self._cleanup_stream(event.stream_id, upstream_closed=True)
                 except (ValueError, asyncio.QueueFull): self._cleanup_stream(event.stream_id, force_close=True)
         elif isinstance(event, StreamEnded):
@@ -780,6 +924,7 @@ class NativeProxyHandler(BaseProxyHandler):
         await self.flush(self.downstream_conn, self.client_writer, self.ds_h2_lock, self.ds_socket_lock)
 
     def _prepare_forwarded_headers(self, headers, is_upstream=True):
+        """Sanitizes and prepares headers for forwarding."""
         decoded = []; method = None; protocol = None; host_val = None
         for k, v in headers:
             k_s = k.decode('utf-8') if isinstance(k, bytes) else k
@@ -799,7 +944,12 @@ class NativeProxyHandler(BaseProxyHandler):
             else:
                 seen_regular = True
                 if k_s.lower() in H2_FORBIDDEN_HEADERS: continue
-                if k_s.lower() == 'te' and v_s.lower() == 'trailers': out.append((k_s, v_s)); continue
+                
+                # [UPDATED] Strict TE Header Processing
+                if k_s.lower() == 'te':
+                    if v_s.lower() == 'trailers': out.append((k_s, v_s))
+                    continue # Stop processing 'te' here so it doesn't fall through to append
+                
                 if k_s.lower() == 'host': continue
                 out.append((k_s, v_s))
         final = []
@@ -818,12 +968,13 @@ class NativeProxyHandler(BaseProxyHandler):
         return self._wrap_security(final), protocol
 
     def _process_headers_for_capture(self, headers: List[Tuple[Any, Any]]) -> CapturedHeaders:
+        """Processes headers for capturing purposes."""
         pseudo = {}; normal = []; cookies = []; authority = None
         for k, v in headers:
             k_s = k.decode('utf-8') if isinstance(k, bytes) else k
             v_s = v.decode('utf-8') if isinstance(v, bytes) else v
             if k_s.lower() == 'host' and not authority: authority = v_s
-            if k_s.lower() in H2_FORBIDDEN_HEADERS: continue
+            if k_s.lower() in H2_FORBIDDEN_HEADERS: continue 
             if k_s.startswith(':'):
                 pseudo[k_s] = v_s
                 if k_s == ':authority': authority = v_s
@@ -834,10 +985,12 @@ class NativeProxyHandler(BaseProxyHandler):
         return {"pseudo": pseudo, "headers": normal}
 
     def _wrap_security(self, headers):
+        """Wraps headers in HPack security structures for sensitive headers."""
         if not hpack: return headers
         return [hpack.NeverIndexedHeaderTuple(k, v) if k.lower() in SENSITIVE_HEADERS else (k, v) for k, v in headers]
 
     async def handle_window_updated(self, event, direction):
+        """Handles flow control window updates."""
         sid = event.stream_id
         snapshot = list(self.streams.values())
         if sid == 0:
@@ -850,6 +1003,7 @@ class NativeProxyHandler(BaseProxyHandler):
             else: ctx.downstream_flow_event.set()
 
     def finalize_capture(self, ctx: StreamContext):
+        """Finalizes the capture of a stream's request."""
         if ctx.capture_finalized: return
         ctx.capture_finalized = True
         pseudo = ctx.captured_headers["pseudo"]
@@ -862,6 +1016,7 @@ class NativeProxyHandler(BaseProxyHandler):
         self.log("CAPTURE", captured)
 
     async def _monitor_shutdown(self):
+        """Monitors for shutdown signals and unblocks queues."""
         await self.closed.wait()
         for ctx in list(self.streams.values()):
             try: ctx.upstream_queue.put_nowait(None)
@@ -870,6 +1025,7 @@ class NativeProxyHandler(BaseProxyHandler):
             except asyncio.QueueFull: pass
 
     async def _keepalive_loop(self):
+        """Sends keep-alive pings periodically."""
         while not self.closed.is_set():
             await asyncio.sleep(KEEPALIVE_INTERVAL)
             if self.upstream_conn:
@@ -883,6 +1039,7 @@ class NativeProxyHandler(BaseProxyHandler):
             await self.flush(self.downstream_conn, self.client_writer, self.ds_h2_lock, self.ds_socket_lock)
 
     async def cleanup(self):
+        """Cleans up resources and closes connections."""
         self.closed.set()
         for w in [self.client_writer, self.upstream_writer]:
             if w:
@@ -892,6 +1049,7 @@ class NativeProxyHandler(BaseProxyHandler):
             for t in ctx.sender_tasks: t.cancel()
 
     async def terminate(self, code):
+        """Terminates the proxy session with a specific error code."""
         self.closed.set()
         async with self.ds_h2_lock:
             try: self.downstream_conn.close_connection(code)
@@ -899,6 +1057,7 @@ class NativeProxyHandler(BaseProxyHandler):
         await self.flush(self.downstream_conn, self.client_writer, self.ds_h2_lock, self.ds_socket_lock)
         
     async def graceful_shutdown(self):
+        """Initiates a graceful shutdown (GOAWAY)."""
         if self.draining or self.closed.is_set(): return
         self.draining = True
         async with self.ds_socket_lock:
@@ -915,6 +1074,7 @@ class NativeProxyHandler(BaseProxyHandler):
         await self.flush(self.downstream_conn, self.client_writer, self.ds_h2_lock, self.ds_socket_lock)
 
     async def flush(self, conn, writer, h2_lock, socket_lock):
+        """Flushes pending data from H2 connection to the socket."""
         if self.closed.is_set(): return
         bytes_to_send = None
         async with h2_lock:
@@ -926,6 +1086,7 @@ class NativeProxyHandler(BaseProxyHandler):
                 except: self.closed.set()
 
     def _cleanup_stream(self, stream_id: int, downstream_closed=False, upstream_closed=False, force_close=False):
+        """Cleans up stream resources."""
         if stream_id not in self.streams: return
         ctx = self.streams[stream_id]
         if downstream_closed: ctx.downstream_closed = True
@@ -937,7 +1098,12 @@ class NativeProxyHandler(BaseProxyHandler):
             del self.streams[stream_id]
 
 class DualProtocolHandler:
+    """
+    Handles initial connection and protocol detection (HTTP/1.1 vs HTTP/2).
+    Dispatches to the appropriate proxy handler.
+    """
     __slots__ = ('reader', 'writer', 'explicit_host', 'callback', 'target_override', 'scope_pattern', 'enable_tunneling', 'upstream_verify_ssl', 'upstream_ca_bundle', 'ssl_context_factory', 'strict_mode')
+    
     def __init__(self, reader, writer, explicit_host, manager_callback, target_override, scope_pattern, enable_tunneling=True, upstream_verify_ssl=False, upstream_ca_bundle=None, ssl_context_factory=None, strict_mode=True):
         self.reader = reader; self.writer = writer; self.explicit_host = explicit_host; self.callback = manager_callback
         self.target_override = target_override; self.scope_pattern = scope_pattern; self.enable_tunneling = enable_tunneling
@@ -945,6 +1111,7 @@ class DualProtocolHandler:
         self.ssl_context_factory = ssl_context_factory; self.strict_mode = strict_mode
 
     async def run(self):
+        """Detects protocol and runs the appropriate handler."""
         protocol, initial_data = await self._detect_protocol()
         if protocol == "h2":
             await NativeProxyHandler(self.reader, self.writer, self.explicit_host, self.callback, self.target_override, self.scope_pattern, self.enable_tunneling, self.upstream_verify_ssl, self.upstream_ca_bundle, initial_data=initial_data, ssl_context_factory=self.ssl_context_factory).run()
@@ -952,6 +1119,7 @@ class DualProtocolHandler:
             await Http11ProxyHandler(self.reader, self.writer, self.explicit_host, self.callback, self.target_override, self.scope_pattern, self.upstream_verify_ssl, self.upstream_ca_bundle, initial_data=initial_data, ssl_context_factory=self.ssl_context_factory, enable_tunneling=self.enable_tunneling, strict_mode=self.strict_mode).run()
 
     async def _detect_protocol(self) -> Tuple[str, bytes]:
+        """Detects the protocol by peeking at the first few bytes or ALPN."""
         try:
             ssl_obj = self.writer.get_extra_info('ssl_object')
             if ssl_obj:
@@ -967,6 +1135,7 @@ class DualProtocolHandler:
         except Exception: return "http/1.1", b""
 
 async def start_proxy_server(host, port, manager_callback, target_override=None, scope_pattern=None, ssl_context_factory=None, strict_mode=True):
+    """Starts the TCP proxy server."""
     async def _handle(r, w):
         await DualProtocolHandler(r, w, "", manager_callback, target_override, scope_pattern, ssl_context_factory=ssl_context_factory, strict_mode=strict_mode).run()
     server = await asyncio.start_server(_handle, host, port)

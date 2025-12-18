@@ -95,14 +95,19 @@ class QuicFrameParser:
                     if offset + data_len > len(payload): frames.append({"type": "MALFORMED_FRAME", "error": "Truncated Data"}); break
                     frame["len"] = data_len; frame["data"] = payload[offset:offset+data_len]; offset += data_len; frames.append(frame)
                 elif frame_type == 0x18:
-                    frame["type"] = "NEW_CONNECTION_ID"; seq, s_len = decode_varint(payload, offset)
+                    frame["type"] = "NEW_CONNECTION_ID";
+                    seq, s_len = decode_varint(payload, offset)
                     if seq is None: break
-                    offset += s_len; frame["seq"] = seq
-                    _, r_len = decode_varint(payload, offset); offset += r_len
+                    offset += s_len;
+                    frame["seq"] = seq
+                    frame["retire_prior"], r_len = decode_varint(payload, offset);
+                    offset += r_len
                     if offset >= len(payload): break
-                    cid_len = payload[offset]; offset += 1
+                    cid_len = payload[offset];
+                    offset += 1
                     if offset + cid_len > len(payload): break
-                    frame["cid"] = binascii.hexlify(payload[offset:offset+cid_len]).decode(); offset += cid_len + 16
+                    frame["cid"] = binascii.hexlify(payload[offset:offset+cid_len]).decode();
+                    offset += cid_len + 16
                     frames.append(frame)
                 else: frame["type"] = f"UNKNOWN_0x{frame_type:02x}"; frames.append(frame); break
             except Exception as e: frames.append({"type": "MALFORMED_FRAME", "error": str(e)}); break
