@@ -82,7 +82,7 @@ class TestNativeProxyHandler(unittest.TestCase):
             self.handler.downstream_conn.local_settings = MagicMock()
 
     def test_stream_context_slots(self):
-        ctx = StreamContext(1, "https")
+        ctx = StreamContext(1, "https", None)
         with self.assertRaises(AttributeError):
             ctx.new_attr = 1
 
@@ -105,7 +105,7 @@ class TestNativeProxyHandler(unittest.TestCase):
         self.assertIn(b"te", keys)
 
     def test_cleanup_stream(self):
-        ctx = StreamContext(1, "https")
+        ctx = StreamContext(1, "https", None)
         t = MagicMock()
         ctx.sender_tasks.append(t)
         self.handler.streams[1] = ctx

@@ -253,6 +253,12 @@ class CertManager:
             # Create and Config Context
             ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
             ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+
+            # [CRITICAL UPDATE] Inject Key Logging Hook Here
+            # This enables Wireshark to decrypt traffic intercepted by this context
+            if os.environ.get("SSLKEYLOGFILE"):
+                ctx.keylog_filename = os.environ["SSLKEYLOGFILE"]
+                # print(f"[DEBUG] Keylogging enabled for intercepted host: {hostname}")
             
             # Support HTTP/3 (h3), HTTP/2 (h2) and HTTP/1.1
             # "h3" is required for QUIC

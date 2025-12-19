@@ -137,6 +137,7 @@ class TestHTTP2RaceEngine:
     def test_process_stream_accounting(self, sample_req):
         engine = HTTP2RaceEngine(sample_req, concurrency=2)
         
+        # [FIX] Removed extraneous 3rd argument 'None'
         s1 = StreamContext(1, 0)
         s3 = StreamContext(3, 1)
         
@@ -175,6 +176,7 @@ class TestHTTP2RaceEngine:
         # Verify that _finalize correctly handles raw byte headers
         engine = HTTP2RaceEngine(sample_req, concurrency=1)
         
+        # [FIX] Removed extraneous 3rd argument 'None'
         s1 = StreamContext(1, 0)
         s1.finished = True
         s1.start_time = 1000.0
