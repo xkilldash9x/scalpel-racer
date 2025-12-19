@@ -155,4 +155,4 @@ sudo python3 scalpel_racer.py --strategy first-seq
     *   **Fix**: Ensure your browser proxy is set to `127.0.0.1:8080` (or your custom port) for both HTTP and HTTPS. Check your `--scope` argument.
 
 ---
-_Crafted with precision by Scalpel Team._
+_Crafted with precision by Project Scalpel Team._
