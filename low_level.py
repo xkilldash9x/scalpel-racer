@@ -113,7 +113,7 @@ class HTTP2RaceEngine:
     """
     Direct socket manipulation for HTTP/2 race conditions (SPA).
     """
-    def __init__(self, request: CapturedRequest, concurrency: int, strategy="spa"):
+    def __init__(self, request: CapturedRequest, concurrency: int, strategy="spa", warmup: int = 0):
         """
         Initializes the HTTP2RaceEngine.
 
@@ -121,10 +121,12 @@ class HTTP2RaceEngine:
             request (CapturedRequest): The request to attack with.
             concurrency (int): The number of concurrent requests.
             strategy (str): The attack strategy ('spa' or 'first-seq').
+            warmup (int): Warmup time in milliseconds.
         """
         self.request = request
         self.concurrency = concurrency
         self.strategy = strategy
+        self.warmup = warmup  # Store the warmup value
         self.target_host: Optional[str] = None
         self.target_port = 443
         self.conn: Optional[H2Connection] = None
@@ -314,7 +316,10 @@ class HTTP2RaceEngine:
                         self.conn.send_data(sid, partial, end_stream=False)
             
             self.sock.sendall(self.conn.data_to_send())
-            time.sleep(0.1) # Stabilization wait to allow frames to settle
+            
+            # Use the passed warmup value (convert ms to seconds)
+            wait_time = self.warmup / 1000.0 if self.warmup > 0 else 0.1
+            time.sleep(wait_time) 
             
             # Vector Optimization: Pre-calculate stream IDs to avoid dict iteration in hot path
             stream_ids = list(self.streams.keys())

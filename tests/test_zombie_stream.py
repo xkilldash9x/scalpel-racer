@@ -41,7 +41,7 @@ class TestProxyZombieStreams(unittest.IsolatedAsyncioTestCase):
         
         # 2. Simulate an active stream where Client (Downstream) has ALREADY finished
         stream_id = 1
-        ctx = StreamContext(stream_id, "https")
+        ctx = StreamContext(stream_id, "https", None)
         ctx.downstream_closed = True 
         ctx.upstream_closed = False
         handler.streams[stream_id] = ctx
@@ -73,7 +73,7 @@ class TestProxyZombieStreams(unittest.IsolatedAsyncioTestCase):
         handler.upstream_conn = MagicMock()
         
         stream_id = 1
-        ctx = StreamContext(stream_id, "https")
+        ctx = StreamContext(stream_id, "https", None)
         handler.streams[stream_id] = ctx
         
         # Simulate 200 OK from upstream (Bytes on the wire)

@@ -1,6 +1,7 @@
 import asyncio
 import pytest
 from unittest.mock import AsyncMock, Mock, patch, MagicMock
+import time
 from proxy_core import Http11ProxyHandler
 
 @pytest.mark.asyncio
@@ -19,5 +20,5 @@ async def test_fallback_to_host_header():
             headers = [("Host", "fallback-host.com")]
             headers_dict = {"host": "fallback-host.com"}
             version = b"HTTP/1.1"
-            await handler._handle_request("GET", target, version, headers, headers_dict)
+            await handler._handle_request("GET", target, version, headers, headers_dict, time.time())
             mock_conn.assert_called_with("fallback-host.com", 80)

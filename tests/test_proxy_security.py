@@ -112,7 +112,7 @@ class TestH1Security:
             await handler.run()
             
             # Access last argument for headers_dict (robust against presence of self)
-            headers_dict = mock_handle.call_args[0][-1]
+            headers_dict = mock_handle.call_args[0][-2]
             assert "content-length" not in headers_dict
             assert "transfer-encoding" in headers_dict
 
@@ -232,7 +232,7 @@ class TestH2Security:
         """[SECURITY] Resilience against WindowUpdate floods."""
         handler, _ = h2_env
         stream_id = 1
-        ctx = StreamContext(stream_id, "https")
+        ctx = StreamContext(stream_id, "https", None)
         ctx.upstream_flow_event.clear()
         handler.streams[stream_id] = ctx
 

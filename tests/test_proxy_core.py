@@ -324,7 +324,7 @@ class TestNativeProxyHandler:
     async def test_flow_control_blocking(self, mock_h2_setup):
         handler, _, _, _ = mock_h2_setup
         stream_id = 1
-        ctx = StreamContext(stream_id, "https")
+        ctx = StreamContext(stream_id, "https", None)
         ctx.upstream_flow_event.clear()
         
         mock_conn = MagicMock()
@@ -356,7 +356,7 @@ class TestNativeProxyHandler:
     @pytest.mark.asyncio
     async def test_window_update_event_propagation(self, mock_h2_setup):
         handler, _, _, _ = mock_h2_setup
-        ctx1 = StreamContext(1, "https")
+        ctx1 = StreamContext(1, "https", None)
         ctx1.upstream_flow_event.clear()
         handler.streams[1] = ctx1
         
@@ -540,7 +540,7 @@ class TestH2ResourceCleanup:
     async def test_upstream_disconnect_propagation(self, mock_h2_setup):
         handler = mock_h2_setup
         sid = 1
-        ctx = StreamContext(sid, "https")
+        ctx = StreamContext(sid, "https", None)
         handler.streams[sid] = ctx
         handler._cleanup_stream(sid, upstream_closed=True, force_close=True)
         assert sid not in handler.streams
@@ -550,7 +550,7 @@ class TestH2ResourceCleanup:
     async def test_downstream_disconnect_propagation(self, mock_h2_setup):
         handler = mock_h2_setup
         sid = 1
-        ctx = StreamContext(sid, "https")
+        ctx = StreamContext(sid, "https", None)
         handler.streams[sid] = ctx
         handler._cleanup_stream(sid, upstream_closed=False, force_close=True)
         assert sid not in handler.streams
@@ -559,7 +559,7 @@ class TestH2ResourceCleanup:
     async def test_stream_cleanup_on_error(self, mock_h2_setup):
         handler = mock_h2_setup
         sid = 1
-        ctx = StreamContext(sid, "https")
+        ctx = StreamContext(sid, "https", None)
         handler.streams[sid] = ctx
         
         # Use our own Exception class so we can catch it reliably
@@ -579,7 +579,7 @@ class TestH2ResourceCleanup:
     async def test_stream_cleanup_on_window_exhaustion(self, mock_h2_setup):
         handler = mock_h2_setup
         sid = 1
-        ctx = StreamContext(sid, "https")
+        ctx = StreamContext(sid, "https", None)
         handler.streams[sid] = ctx
         handler._cleanup_stream(sid, upstream_closed=False, force_close=True)
         assert sid not in handler.streams
@@ -588,7 +588,7 @@ class TestH2ResourceCleanup:
     async def test_stream_cleanup_on_trailers_received(self, mock_h2_setup):
         handler = mock_h2_setup
         sid = 1
-        ctx = StreamContext(sid, "https")
+        ctx = StreamContext(sid, "https", None)
         handler.streams[sid] = ctx
         
         evt = MockTrailersReceived()
@@ -602,7 +602,7 @@ class TestH2ResourceCleanup:
     async def test_stream_cleanup_on_response_received(self, mock_h2_setup):
         handler = mock_h2_setup
         sid = 1
-        ctx = StreamContext(sid, "https")
+        ctx = StreamContext(sid, "https", None)
         ctx.downstream_closed = True # [FIX] Pre-close downstream so upstream close triggers full cleanup
         handler.streams[sid] = ctx
 
