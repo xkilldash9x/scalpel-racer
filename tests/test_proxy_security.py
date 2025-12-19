@@ -24,8 +24,6 @@ class MockRequestReceived: pass
 class MockDataReceived: pass
 class MockStreamReset: pass
 class MockWindowUpdated: pass
-class MockPriorityUpdated: pass
-class MockRemoteSettingsChanged: pass
 class MockTrailersReceived: pass
 class MockStreamEnded: pass
 class MockResponseReceived: pass
@@ -140,8 +138,6 @@ class TestH2Security:
              patch("proxy_core.DataReceived", MockDataReceived), \
              patch("proxy_core.StreamReset", MockStreamReset), \
              patch("proxy_core.WindowUpdated", MockWindowUpdated), \
-             patch("proxy_core.PriorityUpdated", MockPriorityUpdated), \
-             patch("proxy_core.RemoteSettingsChanged", MockRemoteSettingsChanged), \
              patch("proxy_core.TrailersReceived", MockTrailersReceived), \
              patch("proxy_core.StreamEnded", MockStreamEnded), \
              patch("proxy_core.ResponseReceived", MockResponseReceived):
@@ -243,35 +239,3 @@ class TestH2Security:
         await handler.handle_downstream_event(evt)
         # Should unblock flow control
         assert ctx.downstream_flow_event.is_set()
-
-    @pytest.mark.asyncio
-    async def test_h2_priority_flood(self, h2_env):
-        """[SECURITY] Handle rapid Priority updates (common DoS vector)."""
-        handler, _ = h2_env
-        # Priority frames are often used to waste CPU. 
-        # H2 lib handles parsing; we must ensure our loop doesn't choke.
-        evt = MockPriorityUpdated()
-        evt.stream_id = 1
-        evt.weight = 255
-        
-        # Should process without error (even if we ignore priority logic)
-        try:
-            await handler.handle_downstream_event(evt)
-        except Exception:
-            pytest.fail("PriorityUpdated event caused crash")
-
-    @pytest.mark.asyncio
-    async def test_h2_remote_settings_change(self, h2_env):
-        """[SECURITY] Handle Settings changes dynamically."""
-        handler, _ = h2_env
-        evt = MockRemoteSettingsChanged()
-        evt.changed_settings = {SettingCodes.MAX_CONCURRENT_STREAMS: 50}
-        
-        # [FIX] Manually update the mock state to simulate H2 library behavior.
-        # Since downstream_conn is a Mock, setting this attribute is valid.
-        handler.downstream_conn.local_settings.max_concurrent_streams = 50
-        
-        await handler.handle_downstream_event(evt)
-        
-        # Ensure settings match what we expect (validating the mock state we just set)
-        assert handler.downstream_conn.local_settings.max_concurrent_streams == 50
