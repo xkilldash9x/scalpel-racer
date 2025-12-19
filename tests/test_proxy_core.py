@@ -28,7 +28,7 @@ class MockWindowUpdated: pass
 class MockTrailersReceived: pass
 class MockResponseReceived: pass
 class MockPingReceived: pass
-class MockRemoteSettingsChanged: pass
+
 
 # Dummy Exception for testing
 class MockProtocolError(Exception): pass
