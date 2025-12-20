@@ -56,15 +56,17 @@ venv\Scripts\activate
 ```
 
 ### 2. Install Dependencies
+**Linux Users (Prerequisite):** You must install system headers *before* installing Python packages to support the First-Seq strategy.
+
+```bash
+sudo apt-get install libnetfilter-queue-dev
+```
+
+**All Platforms:** Install the Python dependencies:
+
 ```bash
 pip install -r requirements.txt
 ```
-
-> **Note for Linux Users:** To use the **First-Seq** strategy, you must install system headers:
-> ```bash
-> sudo apt-get install libnetfilter-queue-dev
-> pip install NetfilterQueue scapy
-> ```
 
 ## Usage Guide
 
