@@ -85,6 +85,41 @@ BANNER = r"""
 
 # -- Helper Functions --
 
+def format_request_display(req) -> str:
+    """
+    Format request for display with colored method if UI is available.
+    """
+    if not UI_AVAILABLE or not hasattr(req, 'method'):
+        return req.display_str() if hasattr(req, 'display_str') else f"{req.method} {req.url}"
+
+    # Reconstruct the display string with colors
+    # Use getattr/safety checks even if __slots__ enforces existence, to be safe against mocks
+    payload = req.get_attack_payload() if hasattr(req, 'get_attack_payload') else (req.body if hasattr(req, 'body') else b"")
+    body_len = len(payload)
+
+    edited = getattr(req, 'edited_body', None)
+    truncated = getattr(req, 'truncated', False)
+    protocol = getattr(req, 'protocol', 'HTTP/1.1')
+
+    edit_flag = f"{Fore.MAGENTA}[E]{Style.RESET_ALL}" if edited is not None else ""
+    trunc_flag = f"{Fore.RED} [T]{Style.RESET_ALL}" if truncated else ""
+
+    clean_url = req.url
+    if len(clean_url) > 60:
+        clean_url = clean_url[:57] + "..."
+
+    m = req.method.upper()
+    if m == 'GET': method_color = Fore.GREEN
+    elif m == 'POST': method_color = Fore.CYAN
+    elif m == 'DELETE': method_color = Fore.RED
+    elif m in ('PUT', 'PATCH'): method_color = Fore.YELLOW
+    else: method_color = Fore.WHITE
+
+    method_str = f"{method_color}{req.method:<6}{Style.RESET_ALL}"
+    proto_str = f"{Style.DIM}[{protocol}]{Style.RESET_ALL}"
+
+    return f"{proto_str} {method_str} {clean_url} ({body_len}b){edit_flag}{trunc_flag}"
+
 def safe_spawn(tg: asyncio.TaskGroup, coro, result_list, index):
     """
     Supervisor wrapper to prevent fail-fast cascades in the TaskGroup.
@@ -351,8 +386,9 @@ class ScalpelApp:
             data.id = len(self.storage)
             self.storage.append(data)
             self.capture_count += 1
-            msg = data.display_str() if hasattr(data, 'display_str') else f"{data.method} {data.url}"
-            print_formatted_text(ANSI(f"{Fore.GREEN}[+] {msg}{Style.RESET_ALL}"))
+            msg = format_request_display(data)
+            # Avoid double coloring the prefix since format_request_display handles colors
+            print_formatted_text(ANSI(f"{Fore.GREEN}[+]{Style.RESET_ALL} {msg}"))
         elif protocol == "SYSTEM":
             print_formatted_text(ANSI(f"{Fore.BLUE}[SYS] {data}{Style.RESET_ALL}"))
         elif protocol == "ERROR":
@@ -390,8 +426,8 @@ class ScalpelApp:
                         else:
                             for i in range(max(0, len(self.storage) - 15), len(self.storage)):
                                 req = self.storage[i]
-                                txt = req.display_str() if hasattr(req, 'display_str') else f"{req.method} {req.url}"
-                                print_formatted_text(f"[{i}] {txt}")
+                                txt = format_request_display(req)
+                                print_formatted_text(ANSI(f"[{i}] {txt}"))
                     
                     elif cmd in ('help', '?'):
                         print_formatted_text(ANSI(f"\n{Fore.YELLOW}--- Available Commands ---{Style.RESET_ALL}"))
