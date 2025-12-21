@@ -1,3 +1,4 @@
+#Filename: verify_certs.py
 import os
 import sys
 import platform
@@ -9,11 +10,13 @@ import ssl
 import threading
 import atexit
 import stat
-from typing import Optional
+import hashlib
+import ipaddress
+from typing import Optional, Union, List
 
 # Cryptography Imports
 from cryptography import x509
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 
@@ -26,6 +29,8 @@ except ImportError:
     print("[!] Warning: 'permissions' module not found. Cleanup hooks may not run.")
 
 # -- Constants --
+# [ARCHITECTURE] Anchor paths to module location to prevent CWD drift
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CA_KEY_PATH = "scalpel_ca.key"
 CA_CERT_PATH = "scalpel_ca.pem"
 CERTS_DIR = "certs"
@@ -38,11 +43,11 @@ class CertManager:
     Includes optimization for Shared Ephemeral Keys and specific support
     for QUIC/HTTP3 listener certificates.
     """
-    def __init__(self):
-        self.ca_key = None
-        self.ca_cert = None
+    def __init__(self) -> None:
+        self.ca_key: Optional[ec.EllipticCurvePrivateKey] = None
+        self.ca_cert: Optional[x509.Certificate] = None
         self.lock = threading.Lock()
-        self.cache = {}
+        self.cache: dict[str, ssl.SSLContext] = {}
         
         # [VECTOR OPTIMIZATION] Shared Ephemeral Key
         # Pre-generating one key for all leaf certs saves massive overhead 
@@ -55,16 +60,19 @@ class CertManager:
         if not os.path.exists(CERTS_DIR):
             os.makedirs(CERTS_DIR, mode=0o700)
         else:
-            current_mode = stat.S_IMODE(os.stat(CERTS_DIR).st_mode)
-            if current_mode != 0o700:
-                os.chmod(CERTS_DIR, 0o700)
+            try:
+                current_mode = stat.S_IMODE(os.stat(CERTS_DIR).st_mode)
+                if current_mode != 0o700:
+                    os.chmod(CERTS_DIR, 0o700)
+            except OSError:
+                pass # Best effort if not owner
         
         self._load_or_generate_ca()
         
         # Generate the static server certs required for the QUIC listener
         self._generate_static_server_cert()
 
-    def _load_or_generate_ca(self):
+    def _load_or_generate_ca(self) -> None:
         """
         Loads the existing CA from disk or generates a new ECC P-256 CA.
         [SECURED] Includes 'Self-Healing' logic for corrupted key files.
@@ -80,7 +88,7 @@ class CertManager:
                 
                 # If successful, return early
                 return
-            except (ValueError, TypeError, AttributeError) as e:
+            except (ValueError, TypeError, AttributeError, OSError) as e:
                 print(f"[!] CA State Corrupted ({e}). Initiating Self-Healing...")
                 # Fall through to generation logic below
         
@@ -95,7 +103,10 @@ class CertManager:
             x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "Automated Security Testing"),
         ])
         
-        self.ca_cert = x509.CertificateBuilder().subject_name(
+        # [ROBUSTNESS] Backdate 1 hour to handle clock skew
+        now = datetime.datetime.now(datetime.timezone.utc)
+        
+        builder = x509.CertificateBuilder().subject_name(
             name
         ).issuer_name(
             name
@@ -104,12 +115,29 @@ class CertManager:
         ).serial_number(
             x509.random_serial_number()
         ).not_valid_before(
-            datetime.datetime.now(datetime.timezone.utc)
+            now - datetime.timedelta(hours=1)
         ).not_valid_after(
-            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650)
-        ).add_extension(
+            now + datetime.timedelta(days=3650)
+        )
+        
+        # [SECURITY] Critical Constraints for CA
+        builder = builder.add_extension(
             x509.BasicConstraints(ca=True, path_length=None), critical=True,
-        ).sign(self.ca_key, hashes.SHA256())
+        ).add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False
+            ), critical=True
+        )
+
+        self.ca_cert = builder.sign(self.ca_key, hashes.SHA256())
 
         # Write Private Key
         with open(CA_KEY_PATH, "wb") as f:
@@ -125,7 +153,19 @@ class CertManager:
             
         print(f"[+] CA Generated/Healed: {CA_CERT_PATH}")
 
-    def _generate_static_server_cert(self):
+    def _get_general_name(self, value: str) -> x509.GeneralName:
+        """
+        [HELPER] Determines if the value is an IP address or DNS Name.
+        RFC 5280 requires IP addresses to be encoded as OCTET strings (IPAddress),
+        not IA5Strings (DNSName).
+        """
+        try:
+            ip = ipaddress.ip_address(value)
+            return x509.IPAddress(ip)
+        except ValueError:
+            return x509.DNSName(value)
+
+    def _generate_static_server_cert(self) -> None:
         """
         Generates 'server.crt' and 'server.key' in the certs directory.
         These are required for the QUIC / HTTP/3 listener to bind initially.
@@ -150,6 +190,8 @@ class CertManager:
             x509.NameAttribute(NameOID.COMMON_NAME, common_name),
         ])
 
+        now = datetime.datetime.now(datetime.timezone.utc)
+
         builder = x509.CertificateBuilder().subject_name(
             subject
         ).issuer_name(
@@ -159,18 +201,26 @@ class CertManager:
         ).serial_number(
             x509.random_serial_number()
         ).not_valid_before(
-            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
+            now - datetime.timedelta(hours=1)
         ).not_valid_after(
-            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=365)
+            now + datetime.timedelta(days=365)
         )
 
+        # [FIX] Properly typed SANs for IPs
+        sans: List[x509.GeneralName] = [
+            x509.DNSName(common_name),
+            self._get_general_name("127.0.0.1"),
+            self._get_general_name("::1")
+        ]
+
         builder = builder.add_extension(
-            x509.SubjectAlternativeName([
-                x509.DNSName(common_name),
-                x509.DNSName("127.0.0.1"),
-                x509.DNSName("::1")
-            ]),
+            x509.SubjectAlternativeName(sans),
             critical=False,
+        )
+
+        # [SECURITY] Add ExtendedKeyUsage for ServerAuth
+        builder = builder.add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
         )
 
         cert = builder.sign(self.ca_key, hashes.SHA256())
@@ -189,27 +239,29 @@ class CertManager:
         """
         Returns an SSLContext configured with a certificate for the specific hostname.
         Uses a read-through cache and shared key optimization.
-        [SECURED] Input sanitization prevents Arbitrary File Write (Path Traversal).
+        [SECURED] Input sanitization via SHA-256 Hashing prevents Arbitrary File Write.
         """
         with self.lock:
             if hostname in self.cache:
                 return self.cache[hostname]
 
-            # [SECURITY FIX] Sanitize input to prevent Path Traversal
-            # validates that we aren't accepting "../../etc/passwd" as a hostname
-            safe_hostname = os.path.basename(hostname)
+            # [SECURITY FIX] Hash hostname to create safe, constant-length filename
+            # This handles wildcards (e.g. *.com), IPs, and prevents collision/traversal
+            host_hash = hashlib.sha256(hostname.encode('utf-8', errors='ignore')).hexdigest()
             
-            # Fallback for empty/malicious edge cases
-            if not safe_hostname or safe_hostname in ('.', '..'):
-                safe_hostname = "unknown_host"
-
             # [VECTOR OPTIMIZATION] Use shared key if available
             key = self.shared_leaf_key
             
+            # CommonName is limited to 64 chars. Hostnames can be longer.
+            # We truncate for CN, but the full identity is preserved in SAN.
+            cn_val = hostname[:64]
+
             subject = x509.Name([
-                x509.NameAttribute(NameOID.COMMON_NAME, safe_hostname),
+                x509.NameAttribute(NameOID.COMMON_NAME, cn_val),
             ])
             
+            now = datetime.datetime.now(datetime.timezone.utc)
+
             # Build the leaf certificate
             builder = x509.CertificateBuilder().subject_name(
                 subject
@@ -220,15 +272,32 @@ class CertManager:
             ).serial_number(
                 x509.random_serial_number()
             ).not_valid_before(
-                datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
+                now - datetime.timedelta(hours=1)
             ).not_valid_after(
-                datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=365)
+                now + datetime.timedelta(days=365)
             )
             
-            # Add SAN (Subject Alternative Name)
+            # [FIX] Add SAN with correct Type (IP vs DNS)
             builder = builder.add_extension(
-                x509.SubjectAlternativeName([x509.DNSName(safe_hostname)]),
+                x509.SubjectAlternativeName([self._get_general_name(hostname)]),
                 critical=False,
+            )
+            
+            # [SECURITY] Add KeyUsage and EKU for strict client compliance
+            builder = builder.add_extension(
+                x509.KeyUsage(
+                    digital_signature=True,
+                    key_encipherment=True,
+                    content_commitment=False,
+                    data_encipherment=False,
+                    key_agreement=False,
+                    key_cert_sign=False,
+                    crl_sign=False,
+                    encipher_only=False,
+                    decipher_only=False
+                ), critical=True
+            ).add_extension(
+                x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
             )
             
             cert = builder.sign(self.ca_key, hashes.SHA256())
@@ -241,33 +310,34 @@ class CertManager:
             )
             cert_pem = cert.public_bytes(serialization.Encoding.PEM)
 
-            # [SECURITY] Use safe_hostname for filesystem paths
-            key_path = os.path.join(CERTS_DIR, f"{safe_hostname}.key")
-            cert_path = os.path.join(CERTS_DIR, f"{safe_hostname}.crt")
+            # [SECURITY] Use hash for filesystem paths
+            key_path = os.path.join(CERTS_DIR, f"{host_hash}.key")
+            cert_path = os.path.join(CERTS_DIR, f"{host_hash}.crt")
             
-            with open(key_path, "wb") as f:
-                f.write(key_pem)
-            with open(cert_path, "wb") as f:
-                f.write(cert_pem)
+            try:
+                with open(key_path, "wb") as f:
+                    f.write(key_pem)
+                with open(cert_path, "wb") as f:
+                    f.write(cert_pem)
+            except OSError as e:
+                # If IO fails, we cannot serve a cert
+                raise OSError(f"Failed to cache certificate: {e}")
 
             # Create and Config Context
             ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
             ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
 
             # [CRITICAL UPDATE] Inject Key Logging Hook Here
-            # This enables Wireshark to decrypt traffic intercepted by this context
             if os.environ.get("SSLKEYLOGFILE"):
                 ctx.keylog_filename = os.environ["SSLKEYLOGFILE"]
-                # print(f"[DEBUG] Keylogging enabled for intercepted host: {hostname}")
             
             # Support HTTP/3 (h3), HTTP/2 (h2) and HTTP/1.1
-            # "h3" is required for QUIC
             ctx.set_alpn_protocols(["h3", "h2", "http/1.1"])
             
             self.cache[hostname] = ctx
             return ctx
 
-def install_to_trust_store():
+def install_to_trust_store() -> None:
     """
     Installs the generated CA certificate to the system trust store.
     Handles Linux (Debian/Ubuntu) and macOS.
@@ -319,7 +389,60 @@ def install_to_trust_store():
     except Exception as e:
         print(f"[!] Failed to install certificate: {e}")
 
+def install_to_chrome_nss(ca_cert_path: str) -> None:
+    """
+    Adds the Scalpel CA to the Chrome/NSS shared database.
+    This ensures Chrome trusts the intercepted traffic.
+    """
+    # This feature is only relevant on Linux
+    if platform.system() != "Linux":
+        return
+        
+    nss_db_path = os.path.expanduser("~/.pki/nssdb")
+    
+    # -- Check for certutil --
+    if not shutil.which("certutil"):
+        print("[!] 'certutil' command not found. Skipping NSS database installation.")
+        print("    Please install the 'libnss3-tools' package (or equivalent for your distro).")
+        return
+        
+    # -- Ensure NSS Directory Exists --
+    if not os.path.exists(nss_db_path):
+        print(f"[*] Creating NSS database directory at {nss_db_path}")
+        try:
+            os.makedirs(nss_db_path, mode=0o700)
+            # Initialize a new DB if it does not exist
+            subprocess.run(["certutil", "-N", "-d", f"sql:{nss_db_path}", "--empty-password"], check=True)
+        except (OSError, subprocess.CalledProcessError) as e:
+             print(f"[!] Failed to initialize NSS DB: {e}")
+             return
+
+    print(f"[*] Adding {ca_cert_path} to Chrome NSS database...")
+    
+    try:
+        # -- Add Certificate --
+        # -A: Add certificate
+        # -n: Nickname for the cert
+        # -t: Trust arguments ("CT,C,C" trust for SSL, email, and signing)
+        # -i: Input file
+        subprocess.run([
+            "certutil", "-d", f"sql:{nss_db_path}",
+            "-A", "-t", "CT,C,C",
+            "-n", "Scalpel Racer CA",
+            "-i", ca_cert_path
+        ], check=True, capture_output=True)
+        
+        print("[+] Successfully added Scalpel CA to Chrome NSS database.")
+        
+    except subprocess.CalledProcessError as e:
+        # Ignore error if cert is already in DB, otherwise print error
+        err_msg = e.stderr.decode() if e.stderr else str(e)
+        if "is already installed" not in err_msg:
+             print(f"[!] Failed to update NSS database: {err_msg}")
+
+
 if __name__ == "__main__":
     cm = CertManager()
     print(f"[+] CA Ready at: {os.path.abspath(CA_CERT_PATH)}")
     install_to_trust_store()
+    install_to_chrome_nss(CA_CERT_PATH)
