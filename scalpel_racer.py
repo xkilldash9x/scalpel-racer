@@ -23,6 +23,7 @@ try:
     from prompt_toolkit.patch_stdout import patch_stdout
     from prompt_toolkit.formatted_text import HTML, ANSI
     from prompt_toolkit.completion import WordCompleter
+    from prompt_toolkit.key_binding import KeyBindings
     UI_AVAILABLE = True
 except ImportError:
     UI_AVAILABLE = False
@@ -372,9 +373,32 @@ class ScalpelApp:
         self.strategy = strategy
         self.storage: List[CapturedRequest] = []
         self.command_completer = WordCompleter(['ls', 'last', 'race', 'exit', 'quit', 'q', 'help', '?'], ignore_case=True)
+
+        # [PALETTE] Register keyboard shortcuts for common actions
+        self.bindings = KeyBindings()
+
+        @self.bindings.add('f1')
+        def _(event):
+            """Help"""
+            event.app.current_buffer.text = "help"
+            event.app.current_buffer.validate_and_handle()
+
+        @self.bindings.add('f5')
+        def _(event):
+            """List History"""
+            event.app.current_buffer.text = "ls"
+            event.app.current_buffer.validate_and_handle()
+
+        @self.bindings.add('escape', 'r')
+        def _(event):
+            """Race Last (Alt-r)"""
+            event.app.current_buffer.text = "last"
+            event.app.current_buffer.validate_and_handle()
+
         self.session = PromptSession(
             completer=self.command_completer,
-            bottom_toolbar=self._get_toolbar_info
+            bottom_toolbar=self._get_toolbar_info,
+            key_bindings=self.bindings
         )
         self.mgr = None
         self.cert_mgr = None
@@ -387,7 +411,7 @@ class ScalpelApp:
             f' <b><style bg="ansiblue"> Proxy: :{self.port} </style></b>  '
             f'<b><style bg="ansimagenta"> Mode: {self.strategy} </style></b>  '
             f'<b><style bg="ansigreen"> Captures: {self.capture_count} </style></b> '
-            f'<style fg="gray">Type "help" for commands</style>'
+            f'<style fg="gray">[F1] Help [F5] List [Alt-r] Race Last</style>'
         )
 
     def _handler(self, protocol, data):
