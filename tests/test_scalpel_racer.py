@@ -274,6 +274,18 @@ class TestScalpelIntegration:
             assert app.storage[0].id == 0
             assert app.storage[0].method == "GET"
 
+    def test_get_toolbar_info(self):
+        """Verify the bottom toolbar generation."""
+        with patch("scalpel_racer.PromptSession", MagicMock()), \
+             patch("scalpel_racer.UI_AVAILABLE", True):
+            app = ScalpelApp(8080, "auto")
+            toolbar = app._get_toolbar_info()
+
+            assert toolbar is not None
+            # We expect an HTML object
+            from prompt_toolkit.formatted_text import HTML
+            assert isinstance(toolbar, HTML)
+
     @pytest.mark.asyncio
     async def test_safe_spawn_logic(self): 
         """Test safe_spawn supervisor wrapper."""

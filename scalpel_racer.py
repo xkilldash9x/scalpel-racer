@@ -372,10 +372,23 @@ class ScalpelApp:
         self.strategy = strategy
         self.storage: List[CapturedRequest] = []
         self.command_completer = WordCompleter(['ls', 'last', 'race', 'exit', 'quit', 'q', 'help', '?'], ignore_case=True)
-        self.session = PromptSession(completer=self.command_completer)
+        self.session = PromptSession(
+            completer=self.command_completer,
+            bottom_toolbar=self._get_toolbar_info
+        )
         self.mgr = None
         self.cert_mgr = None
         self.capture_count = 0
+
+    def _get_toolbar_info(self):
+        """Generates the bottom status toolbar."""
+        if not UI_AVAILABLE: return None
+        return HTML(
+            f' <b><style bg="ansiblue"> Proxy: :{self.port} </style></b>  '
+            f'<b><style bg="ansimagenta"> Mode: {self.strategy} </style></b>  '
+            f'<b><style bg="ansigreen"> Captures: {self.capture_count} </style></b> '
+            f'<style fg="gray">Type "help" for commands</style>'
+        )
 
     def _handler(self, protocol, data):
         """
