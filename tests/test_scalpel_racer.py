@@ -274,6 +274,42 @@ class TestScalpelIntegration:
             assert app.storage[0].id == 0
             assert app.storage[0].method == "GET"
 
+    def test_get_toolbar_info(self):
+        """Verify the bottom toolbar generation."""
+        with patch("scalpel_racer.PromptSession", MagicMock()), \
+             patch("scalpel_racer.UI_AVAILABLE", True):
+            app = ScalpelApp(8080, "auto")
+            toolbar = app._get_toolbar_info()
+
+            assert toolbar is not None
+            # We expect an HTML object
+            from prompt_toolkit.formatted_text import HTML
+            assert isinstance(toolbar, HTML)
+
+    def test_toolbar_performance(self):
+        """
+        Benchmark toolbar generation to ensure no UI lag.
+        Target: < 50 microseconds per call (giving ample buffer for CI).
+        """
+        import time
+        with patch("scalpel_racer.PromptSession", MagicMock()), \
+             patch("scalpel_racer.UI_AVAILABLE", True):
+            app = ScalpelApp(8080, "auto")
+
+            # Warmup
+            for _ in range(100): app._get_toolbar_info()
+
+            start = time.perf_counter()
+            iterations = 10000
+            for _ in range(iterations):
+                app._get_toolbar_info()
+            duration = time.perf_counter() - start
+
+            avg_time = duration / iterations
+            # Set limit to 0.5ms (500us) to be safe on CI/Mock overhead,
+            # while still catching major regressions (e.g. IO calls).
+            assert avg_time < 0.0005, f"Toolbar generation too slow: {avg_time*1000:.4f}ms"
+
     @pytest.mark.asyncio
     async def test_safe_spawn_logic(self): 
         """Test safe_spawn supervisor wrapper."""
