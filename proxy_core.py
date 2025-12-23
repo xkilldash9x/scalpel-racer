@@ -823,7 +823,8 @@ class NativeProxyHandler(BaseProxyHandler):
                                         chunk_size = max(0, min(total_len - offset, available))
                                         chunk = view[offset:offset+chunk_size]
                                         is_last = (offset + chunk_size == total_len) and end_stream
-                                        conn.send_data(stream_id, chunk.tobytes(), end_stream=is_last)
+                                        # Bolt: Optimization - Pass memoryview slice directly to avoid copy
+                                        conn.send_data(stream_id, chunk, end_stream=is_last)
                                         bytes_to_send = conn.data_to_send()
                                         offset += chunk_size
                                         if offset >= total_len: break_loop = True
