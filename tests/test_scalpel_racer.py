@@ -275,7 +275,7 @@ class TestScalpelIntegration:
             assert app.storage[0].method == "GET"
 
     def test_get_toolbar_info(self):
-        """Verify the bottom toolbar generation."""
+        """Verify the bottom toolbar generation and shortcuts."""
         with patch("scalpel_racer.PromptSession", MagicMock()), \
              patch("scalpel_racer.UI_AVAILABLE", True):
             app = ScalpelApp(8080, "auto")
@@ -285,6 +285,9 @@ class TestScalpelIntegration:
             # We expect an HTML object
             from prompt_toolkit.formatted_text import HTML
             assert isinstance(toolbar, HTML)
+            # Verify shortcut hints are present
+            assert "[F1]" in toolbar.value
+            assert "[Alt-r]" in toolbar.value
 
     @pytest.mark.asyncio
     async def test_safe_spawn_logic(self): 
