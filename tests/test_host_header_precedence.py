@@ -17,8 +17,8 @@ async def test_fallback_to_host_header():
         
         with patch.object(Http11ProxyHandler, '_connect_upstream', return_value=(AsyncMock(), u_writer_mock)) as mock_conn:
             target = "/path"
-            headers = [("Host", "fallback-host.com")]
-            headers_dict = {"host": "fallback-host.com"}
+            headers = [(b"Host", b"fallback-host.com")]
+            headers_dict = {b"host": b"fallback-host.com"}
             version = b"HTTP/1.1"
             await handler._handle_request("GET", target, version, headers, headers_dict, time.time())
             mock_conn.assert_called_with("fallback-host.com", 80)

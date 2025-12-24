@@ -61,12 +61,15 @@ class TestProxyFixes(unittest.IsolatedAsyncioTestCase):
     async def test_h1_extensions(self):
         """Verifies H1 chunk streaming implementation."""
         handler = Http11ProxyHandler(AsyncMock(), MagicMock(), "", None, None, None)
-        # Verify _read_bytes_raw exists and works
-        await handler._read_bytes_raw(10)
+        # Verify _read_bytes exists and works (renamed from _read_bytes_raw)
+        # We must setup the reader to return data
+        handler.reader.read.return_value = b"1234567890"
+        await handler._read_bytes(10)
         
-        # Verify _stream_chunked_body exists
-        handler._read_strict_line = AsyncMock(side_effect=[b"0", b""])
-        await handler._stream_chunked_body(MagicMock())
+        # Verify _read_chunked_body exists (renamed/logic changed)
+        # Use patch.object for slotted class
+        with patch.object(Http11ProxyHandler, '_read_strict_line', side_effect=[b"0", b""]):
+            await handler._read_chunked_body()
 
     async def test_h2_extensions(self):
         """Verifies H2 stream processing refactor."""
@@ -74,11 +77,15 @@ class TestProxyFixes(unittest.IsolatedAsyncioTestCase):
         event = MagicMock()
         event.stream_id = 1
         event.headers = []
+        event.stream_ended = True
         
-        with patch.object(handler, '_process_headers_for_capture'), \
-             patch.object(handler, '_prepare_forwarded_headers', return_value=([], None)):
-             # Verify _process_stream_request exists
-             await handler._process_stream_request(event)
+        # Patch CLASS methods due to __slots__
+        with patch.object(NativeProxyHandler, '_process_headers_for_capture') as mock_proc, \
+             patch.object(NativeProxyHandler, '_prepare_forwarded_headers', return_value=([], None)):
+             # _process_stream_request was likely renamed to handle_request_received or similar
+             # Looking at proxy_core.py, it calls handle_request_received.
+             await handler.handle_request_received(event)
+             mock_proc.assert_called()
 
 if __name__ == '__main__':
     unittest.main()
