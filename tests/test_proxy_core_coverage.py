@@ -48,14 +48,14 @@ class TestHttp11ProxyHandler(unittest.TestCase):
 
     def test_validate_request_pseudo_headers(self):
         async def run():
-            headers = {':method': 'GET'}
+            headers = {b':method': b'GET'}
             valid = await self.handler._validate_request('GET', headers)
             self.assertFalse(valid)
         asyncio.run(run())
 
     def test_validate_request_connect_no_host(self):
         async def run():
-            headers = {'user-agent': 'test'}
+            headers = {b'user-agent': b'test'}
             valid = await self.handler._validate_request('CONNECT', headers)
             self.assertFalse(valid)
         asyncio.run(run())

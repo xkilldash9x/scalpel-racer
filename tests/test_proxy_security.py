@@ -111,8 +111,8 @@ class TestH1Security:
             
             # Access last argument for headers_dict (robust against presence of self)
             headers_dict = mock_handle.call_args[0][-2]
-            assert "content-length" not in headers_dict
-            assert "transfer-encoding" in headers_dict
+            assert b"content-length" not in headers_dict
+            assert b"transfer-encoding" in headers_dict
 
     @pytest.mark.asyncio
     async def test_recursive_connect_attempt(self):

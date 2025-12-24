@@ -92,8 +92,8 @@ class TestHttp11Proxy:
             call_args = mock_handle.call_args
             if call_args:
                 headers_dict = call_args[0][4]
-                assert 'content-length' not in headers_dict
-                assert 'transfer-encoding' in headers_dict
+                assert b'content-length' not in headers_dict
+                assert b'transfer-encoding' in headers_dict
 
     @pytest.mark.asyncio
     async def test_obsolete_line_folding(self):
@@ -247,8 +247,8 @@ class TestHttp11Proxy:
              await handler.run()
              
              headers_dict = mock_handle.call_args[0][4]
-             assert "content-length" not in headers_dict
-             assert "transfer-encoding" in headers_dict
+             assert b"content-length" not in headers_dict
+             assert b"transfer-encoding" in headers_dict
 
     @pytest.mark.asyncio
     async def test_recursive_connect_attempt(self):
