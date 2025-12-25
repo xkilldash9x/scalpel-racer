@@ -12,7 +12,7 @@ from structures import CapturedRequest
 @pytest.fixture
 def mock_captured_request():
     return CapturedRequest(
-        id=1,
+        request_id=1,
         method="POST",
         url="http://example.com/api",
         headers=[("User-Agent", "TestAgent")],
@@ -38,7 +38,7 @@ class TestHTTP11SyncEngine:
         assert engine.ssl_context is not None
 
     def test_parse_target_fallback_headers(self):
-        req = CapturedRequest(id=1, method="GET", body=b"", url="/path", headers=[("host", "internal.local:8080")])
+        req = CapturedRequest(request_id=1, method="GET", body=b"", url="/path", headers=[("host", "internal.local:8080")])
         engine = HTTP11SyncEngine(req, concurrency=1)
         assert engine.target_host == "internal.local"
         assert engine.target_port == 8080

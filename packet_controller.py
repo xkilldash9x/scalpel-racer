@@ -1,9 +1,8 @@
-# packet_controller.py
+#Filename: packet_controller.py
 """
 [VECTOR] KERNEL INTERFACE
 Manages Linux NetfilterQueue for 'First Sequence Sync' (Packet Bunching).
-Requires: sudo apt install libnetfilter-queue-dev && pip install NetfilterQueue
-Now uses nftables (nft) for modern rule management.
+Strictly typed and refactored to use compat.py for robust imports.
 """
 
 import sys
@@ -13,91 +12,87 @@ import subprocess
 import logging
 import struct
 import atexit
-import signal
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Protocol, cast, Any
+
+# [APEX] Use Compat Layer for safety
+from compat import NFQUEUE_AVAILABLE, NetfilterQueue
 
 logger = logging.getLogger(__name__)
 
-NFQUEUE_AVAILABLE = False
-if sys.platform.startswith("linux"):
-    try:
-        from netfilterqueue import NetfilterQueue
-        NFQUEUE_AVAILABLE = True
-    except ImportError:
-        pass
+# -- TCP/IP Constants --
+REORDER_DELAY: float = 0.010  # 10ms
+QUEUE_NUM: int = 99
+IP_HEADER_MIN_LEN: int = 20
+IP_VERSION_4: int = 4
+PROTOCOL_TCP: int = 6
 
-# -- Constants --
-REORDER_DELAY = 0.010  # 10ms
-QUEUE_NUM = 99
-_STRUCT_H = struct.Struct("!H")
-_STRUCT_I = struct.Struct("!I")
+# Structs for binary parsing (Big Endian Network Order)
+_STRUCT_H = struct.Struct("!H")  # Unsigned short (2 bytes)
+_STRUCT_I = struct.Struct("!I")  # Unsigned int (4 bytes)
+
+# -- Protocols --
+
+class NFPacket(Protocol):
+    """Protocol defining the interface of a NetfilterQueue packet."""
+    def get_payload(self) -> bytes: ...
+    def accept(self) -> None: ...
+    def drop(self) -> None: ...
+    def get_fd(self) -> int: ...
+
 
 class PacketController:
     """
     Manages interception and reordering of TCP packets using NetfilterQueue.
-    Uses nftables for rule management.
+    Uses nftables for modern rule management.
     """
     def __init__(self, target_ip: str, target_port: int, source_port: int):
         """
         Initializes the PacketController.
-        
-        Args:
-            target_ip (str): The destination IP address to filter.
-            target_port (int): The destination port to filter.
-            source_port (int): The source port to filter.
-            
-        Raises:
-            ImportError: If NetfilterQueue is not available and not running in a test environment.
         """
+        # Runtime safety check - warns but allows instantiation for testing
         if not NFQUEUE_AVAILABLE and 'unittest' not in sys.modules:
-            raise ImportError("NetfilterQueue not available (Linux Only). Cannot use first-seq strategy.")
+            logger.warning("Initializing PacketController without NetfilterQueue support.")
 
-        self.target_ip = target_ip
-        self.target_port = target_port
-        self.source_port = source_port
-        self.queue_num = QUEUE_NUM
+        self.target_ip: str = target_ip
+        self.target_port: int = target_port
+        self.source_port: int = source_port
+        self.queue_num: int = QUEUE_NUM
 
-        self.nfqueue = None
-        self.active = False
-        self.lock = threading.Lock()
+        self.nfqueue: Optional[Any] = None 
+        self.active: bool = False
+        self.lock: threading.Lock = threading.Lock()
 
-        # Thread handles
         self.listener_thread: Optional[threading.Thread] = None
         self.release_thread: Optional[threading.Thread] = None
 
-        self.first_packet_info: Optional[Tuple[int, object]] = None
+        # State Tracking
+        self.first_packet_info: Optional[Tuple[int, NFPacket]] = None
         self.expected_next_seq: Optional[int] = None
 
-        self.first_packet_held = threading.Event()
-        self.subsequent_packets_released = threading.Event()
+        self.first_packet_held: threading.Event = threading.Event()
+        self.subsequent_packets_released: threading.Event = threading.Event()
         
         atexit.register(self.stop)
 
-    def _signal_handler(self, signum, frame):
+    def start(self) -> None:
         """
-        Handles shutdown signals (SIGINT) to ensure proper cleanup.
-        
-        Args:
-            signum (int): The signal number.
-            frame (frame): The current stack frame.
+        Starts the packet interception.
         """
-        self.stop()
-        sys.exit(0)
+        if not NFQUEUE_AVAILABLE or NetfilterQueue is None:
+            logger.error("NetfilterQueue unavailable. Cannot start interception.")
+            return
 
-    def start(self):
-        """
-        Starts the packet interception and release threads.
-        It sets up the nftables rules, binds the NetfilterQueue, and starts
-        the listener and release threads.
-        """
         self._manage_nftables(action='add')
-        self.nfqueue = NetfilterQueue()
+        
         try:
+            self.nfqueue = NetfilterQueue()
             self.nfqueue.bind(self.queue_num, self._queue_callback)
-        except OSError:
+        except OSError as e:
+            logger.error("Failed to bind NFQueue %s: %s", self.queue_num, e)            
             self._manage_nftables(action='delete')
-            raise
-
+             # Do not raise here to prevent crashing the main app, just log failure
+            return
+        
         self.active = True
 
         self.listener_thread = threading.Thread(target=self._listener_loop, daemon=True)
@@ -106,184 +101,147 @@ class PacketController:
         self.release_thread = threading.Thread(target=self._delayed_release, daemon=True)
         self.release_thread.start()
 
-    def stop(self):
-        """
-        Stops the packet controller and cleans up resources.
-        It disables the nftables rules, unbinds the NetfilterQueue,
-        releases any held packets, and stops the threads.
-        """
+    def stop(self) -> None:
+        """Stops interception and cleans up rules."""
         if not self.active:
             return
             
         self.active = False
+        logger.info("Stopping PacketController...")
 
         with self.lock:
             if self.first_packet_info:
-                try:
+                try: 
                     self.first_packet_info[1].accept()
-                except Exception:
+                except Exception: 
                     pass
                 self.first_packet_info = None
 
         if self.nfqueue:
-            try:
+            try: 
                 self.nfqueue.unbind()
-            except Exception:
+            except Exception: 
                 pass
-            # Explicitly close to ensure recv loop unblocks if supported
             try:
-                self.nfqueue.get_fd()
-            except Exception:
+                if hasattr(self.nfqueue, 'get_fd'): 
+                    self.nfqueue.get_fd() 
+            except Exception: 
                 pass
 
         self._manage_nftables(action='delete')
         self.first_packet_held.set()
         self.subsequent_packets_released.set()
 
-        # Explicitly join threads to ensure they are dead before 
-        # checking is_alive() in tests.
         if self.listener_thread and self.listener_thread.is_alive():
-            try:
-                self.listener_thread.join(timeout=1.0)
-            except RuntimeError:
-                pass
-
+            self.listener_thread.join(timeout=1.0)
         if self.release_thread and self.release_thread.is_alive():
-            try:
-                self.release_thread.join(timeout=1.0)
-            except RuntimeError:
-                pass
+            self.release_thread.join(timeout=1.0)
+        logger.info("PacketController stopped.")
 
-    def _manage_nftables(self, action: str):
-        """
-        Manages nftables rules.
-        Creates a dedicated table 'scalpel_racer' to avoid polluting the global filter table.
-        
-        Args:
-            action (str): The action to perform ('add' or 'delete').
-        """
+    def _manage_nftables(self, action: str) -> None:
         table_name = "scalpel_racer_ctx"
         chain_name = "output_hook"
-
+        
         if action == 'add':
-            # 1. Create the table
             cmd_table = ['nft', 'add', 'table', 'ip', table_name]
-
-            # 2. Create the chain attached to the output hook
-            # Note: The syntax { type filter ... } requires careful arg passing in subprocess
             cmd_chain = [
-                'nft', 'add', 'chain', 'ip', table_name, chain_name,
+                'nft', 'add', 'chain', 'ip', table_name, chain_name, 
                 '{', 'type', 'filter', 'hook', 'output', 'priority', '0', ';', '}'
             ]
-
-            # 3. Add the rule to send matching TCP traffic to the queue
-            cmd_rule = [
+            
+            rule_args = [
                 'nft', 'add', 'rule', 'ip', table_name, chain_name,
-                'ip', 'protocol', 'tcp',
-                'ip', 'daddr', self.target_ip,
-                'tcp', 'dport', str(self.target_port),
-                'tcp', 'sport', str(self.source_port),
-                'counter', 'queue', 'num', str(self.queue_num)
+                'ip', 'protocol', 'tcp', 'ip', 'daddr', self.target_ip,
+                'tcp', 'dport', str(self.target_port)
             ]
+            if self.source_port != 0:
+                rule_args.extend(['tcp', 'sport', str(self.source_port)])
+            
+            rule_args.extend(['counter', 'queue', 'num', str(self.queue_num)])
 
             try:
-                subprocess.call(cmd_table, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-                subprocess.call(cmd_chain, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-                subprocess.call(cmd_rule, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-            except Exception:
-                pass
-
+                subprocess.run(
+                    cmd_table, check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
+                )
+                subprocess.run(
+                    cmd_chain, check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
+                )
+                subprocess.run(
+                    rule_args, check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
+                )
+            except subprocess.CalledProcessError: 
+                logger.error("Failed to add nftables rule")
         elif action == 'delete':
-            # Atomic cleanup: deleting the table removes the chain and rules contained within
-            cmd_del = ['nft', 'delete', 'table', 'ip', table_name]
-            try:
-                subprocess.call(cmd_del, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-            except Exception:
+            try: 
+                subprocess.run(
+                    ['nft', 'delete', 'table', 'ip', table_name], 
+                    check=False, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
+                )
+            except Exception: 
                 pass
 
-    def _listener_loop(self):
-        """
-        The main loop that listens for packets on the NetfilterQueue.
-        It keeps running as long as the controller is active.
-        """
-        # Loop while active to ensure thread stays alive in tests where run() is mocked to return instantly
-        while self.active:
-            try:
+    def _listener_loop(self) -> None:
+        while self.active and self.nfqueue:
+            try: 
                 self.nfqueue.run()
-            except Exception:
+            except Exception: 
                 pass
-            # Avoid busy loop CPU spike if run() returns immediately (e.g. in tests or error)
             time.sleep(0.1)
 
-    def _queue_callback(self, pkt):
-        """
-        Callback function invoked for each packet intercepted by NetfilterQueue.
-        It determines whether to hold the packet (if it's the first data packet)
-        or release it (if it's a subsequent packet).
-        
-        Args:
-            pkt: The intercepted packet object.
-        """
-        if not self.active:
-            pkt.accept()
+    def _queue_callback(self, pkt: Any) -> None:
+        # Cast to protocol for type safety
+        packet = cast(NFPacket, pkt)
+        if not self.active: 
+            packet.accept()
             return
-
+        
         try:
-            raw = pkt.get_payload()
-            # Basic IPv4 TCP Sanity Check
-            # Check length (20 bytes min for IP)
-            # Check Version (4 for IPv4)
-            # Check Protocol (6 for TCP)
-            if len(raw) < 20 or (raw[0] >> 4) != 4 or raw[9] != 6:
-                pkt.accept()
+            raw = packet.get_payload()
+            if len(raw) < 40: 
+                packet.accept()
                 return
-
+            
             ihl = (raw[0] & 0x0F) * 4
             total_len = _STRUCT_H.unpack_from(raw, 2)[0]
             tcp_start = ihl
             seq = _STRUCT_I.unpack_from(raw, tcp_start + 4)[0]
             data_off = (raw[tcp_start + 12] >> 4) * 4
+            payload_len = total_len - ihl - data_off
 
-            # Check if packet has payload
-            if total_len - ihl - data_off <= 0:
-                pkt.accept()
+            if payload_len <= 0: 
+                packet.accept()
                 return
 
             with self.lock:
                 if self.first_packet_info is None:
-                    # Hold the first data packet
-                    self.first_packet_info = (seq, pkt)
-                    self.expected_next_seq = seq + (total_len - ihl - data_off)
+                    self.first_packet_info = (seq, packet)
+                    self.expected_next_seq = seq + payload_len
                     self.first_packet_held.set()
-                elif seq == self.expected_next_seq:
-                    # Release subsequent immediately
-                    pkt.accept()
-                    self.expected_next_seq += (total_len - ihl - data_off)
+                elif self.expected_next_seq is not None and seq == self.expected_next_seq:
+                    packet.accept()
+                    self.expected_next_seq += payload_len
                     self.subsequent_packets_released.set()
                 else:
-                    pkt.accept()
-        except Exception:
-            pkt.accept()
+                    packet.accept()
+        except Exception as e:
+            logger.error("Error in queue callback: %s", e)
+            packet.accept()
 
-    def _delayed_release(self):
-        """
-        Thread that waits for a specific condition (subsequent packets released)
-        or a timeout before releasing the held first packet.
-        """
-        if not self.first_packet_held.wait(timeout=5):
-            return
-
-        # Wait for subsequent packets or short timeout
-        if self.subsequent_packets_released.wait(timeout=0.5):
-            time.sleep(REORDER_DELAY)
-
-        with self.lock:
-            if self.first_packet_info:
-                try:
-                    self.first_packet_info[1].accept()
-                except Exception:
-                    pass
-                self.first_packet_info = None
+    def _delayed_release(self) -> None:
+        while self.active:
+            if not self.first_packet_held.wait(timeout=0.1): 
+                continue
+            
+            if self.subsequent_packets_released.wait(timeout=5.0): 
+                time.sleep(REORDER_DELAY)
+            
+            with self.lock:
+                if self.first_packet_info:
+                    try: 
+                        self.first_packet_info[1].accept()
+                    except Exception: 
+                        pass
+                    self.first_packet_info = None
                 self.first_packet_held.clear()
                 self.subsequent_packets_released.clear()
                 self.expected_next_seq = None

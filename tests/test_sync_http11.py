@@ -13,7 +13,7 @@ class TestHTTP11SyncEngine:
     @pytest.fixture
     def sample_req(self):
         return CapturedRequest(
-            id=1, method="POST", url="https://target.com/api",
+            request_id=1, method="POST", url="https://target.com/api",
             headers=[("User-Agent", "Test"), ("Content-Type", "application/json"), ("Set-Cookie", "a=1"), ("Set-Cookie", "b=2")],
             body=b"part1{{SYNC}}part2"
         )
@@ -31,7 +31,7 @@ class TestHTTP11SyncEngine:
 
     def test_init_invalid_scheme(self):
         """Ensure non-HTTP/HTTPS schemes raise ValueError."""
-        req = CapturedRequest(id=0, method="GET", headers=[], url="ftp://target.com", body=b"")
+        req = CapturedRequest(request_id=0, method="GET", headers=[], url="ftp://target.com", body=b"")
         with pytest.raises(ValueError, match="Unsupported URL scheme"):
             HTTP11SyncEngine(req, 1)
 
@@ -42,7 +42,7 @@ class TestHTTP11SyncEngine:
         [UPDATED] Ensure missing {{SYNC}} marker triggers Implicit Last-Byte-Sync.
         Previously expected to raise ValueError, now expects auto-split.
         """
-        req = CapturedRequest(id=0, method="GET", headers=[], url="http://a.com", body=b"nosync")
+        req = CapturedRequest(request_id=0, method="GET", headers=[], url="http://a.com", body=b"nosync")
         engine = HTTP11SyncEngine(req, 1)
         
         # Should split "nosync" into "nosyn" and "c"
