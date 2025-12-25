@@ -805,7 +805,9 @@ class NativeProxyHandler(BaseProxyHandler):
                             await writer.drain()
                     else:
                         # Data - Flow Control Loop
-                        data = payload; view = memoryview(data); offset = 0; total_len = len(data)
+                        data = payload; offset = 0; total_len = len(data)
+                        view = None # Bolt: Lazy memoryview creation
+
                         while offset < total_len or (total_len == 0 and end_stream):
                             if self.closed.is_set(): break
                             bytes_to_send = None; break_loop = False; wait_for_flow = False
@@ -821,9 +823,17 @@ class NativeProxyHandler(BaseProxyHandler):
                                         wait_for_flow = True
                                     else:
                                         chunk_size = max(0, min(total_len - offset, available))
-                                        chunk = view[offset:offset+chunk_size]
+
+                                        # Bolt: Optimization - avoid memoryview for single-shot small sends
+                                        # And pass memoryview/bytes directly to send_data (Zero Copy)
+                                        if offset == 0 and chunk_size == total_len:
+                                            chunk = data
+                                        else:
+                                            if view is None: view = memoryview(data)
+                                            chunk = view[offset:offset+chunk_size]
+
                                         is_last = (offset + chunk_size == total_len) and end_stream
-                                        conn.send_data(stream_id, chunk.tobytes(), end_stream=is_last)
+                                        conn.send_data(stream_id, chunk, end_stream=is_last)
                                         bytes_to_send = conn.data_to_send()
                                         offset += chunk_size
                                         if offset >= total_len: break_loop = True
