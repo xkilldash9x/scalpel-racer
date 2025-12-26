@@ -5,10 +5,10 @@ Handles automatic permission restoration for sudo executed scripts.
 """
 
 import os
-import atexit 
-import sys 
+import atexit
+import sys
 
-def restore_ownership(): 
+def restore_ownership():
     """
     Called on exit. Checks if the script was run via sudo.
     If so, recursively changes ownership of the current directory back to the
@@ -23,17 +23,17 @@ def restore_ownership():
         try:
             uid = int(sudo_uid)
             gid = int(sudo_gid)
-            
+
             # Use the directory where this script resides
             project_dir = os.path.dirname(os.path.abspath(__file__))
-            
+
             # Walk the directory and fix everything
             # We silently ignore errors for special files (sockets, etc.)
-            for root, dirs, files in os.walk(project_dir):
+            for root, _, files in os.walk(project_dir):
                 # Fix directory itself. Operating on the link directly is safer.
-                try: 
+                try:
                     os.lchown(root, uid, gid)
-                except OSError: 
+                except OSError:
                     pass
 
                 for name in files:
@@ -43,12 +43,12 @@ def restore_ownership():
                         # This modifies the symlink, NOT the target file.
                         os.lchown(filepath, uid, gid)
                     except OSError:
-                        pass 
+                        pass
 
             # Feedback so the user knows why the script hangs for a split second at the end
             print(f"[*] Ownership restored to user ID {uid} (Secure Mode).")
 
-        except Exception as e:
+        except (ValueError, OSError) as e:
             print(f"[!] Failed to restore ownership: {e}")
 
 # Automatically register the cleanup when this module is imported

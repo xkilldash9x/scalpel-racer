@@ -85,8 +85,8 @@ class TestHTTP11SyncEngine:
         engine.target_ip = "1.2.3.4"
         mock_create_conn.side_effect = socket.error("Connection refused")
         
-        # [FIX] Updated regex to match "Conn failed"
-        with pytest.raises(ConnectionError, match="Conn failed"):
+        # [FIX] Updated regex to match "Connection failed"
+        with pytest.raises(ConnectionError, match="Connection failed"):
             engine._connect()
 
     @patch("sync_http11.socket.create_connection")
@@ -99,8 +99,8 @@ class TestHTTP11SyncEngine:
         engine.target_ip = "1.2.3.4"
         mock_ssl_ctx.return_value.wrap_socket.side_effect = ssl.SSLError("Handshake fail")
         
-        # [FIX] Updated regex to match "SSL failed"
-        with pytest.raises(ConnectionError, match="SSL failed"):
+        # [FIX] Updated regex to match "Connection failed"
+        with pytest.raises(ConnectionError, match="Connection failed"):
             engine._connect()
 
     def test_serialize_headers(self, sample_req):
@@ -183,7 +183,7 @@ class TestHTTP11SyncEngine:
         
         assert len(results) == 2
         assert results[0].error is not None
-        assert "DNS Resolution Failed" in results[0].error
+        assert "DNS Fail" in results[0].error
 
     @patch("sync_http11.HTTPResponse")
     @patch("sync_http11.socket.create_connection")

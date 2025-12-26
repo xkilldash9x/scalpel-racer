@@ -44,8 +44,8 @@ class TestHTTP2RaceEngine:
         # Check :path construction
         headers = engine_port._build_headers(0)
         h_dict = dict(headers)
-        assert h_dict[':path'] == "/v1/metrics"
-        assert h_dict[':authority'] == "example.com:8080"
+        assert h_dict[b':path'] == b"/v1/metrics"
+        assert h_dict[b':authority'] == b"example.com:8080"
 
     def test_build_headers_compliance(self, sample_req):
         engine = HTTP2RaceEngine(sample_req, concurrency=1)
@@ -62,18 +62,18 @@ class TestHTTP2RaceEngine:
         h_dict = dict(headers)
         
         # Pseudo-headers
-        assert h_dict[":path"] == "/api?id=1"
-        assert h_dict[":authority"] == "target.com"
+        assert h_dict[b":path"] == b"/api?id=1"
+        assert h_dict[b":authority"] == b"target.com"
         
         # Stripping checks
-        assert "connection" not in h_dict
-        assert "te" not in h_dict
+        assert b"connection" not in h_dict
+        assert b"te" not in h_dict
         
         # Content-Length (Must be the calculated one)
-        assert h_dict["content-length"] == "50"
+        assert h_dict[b"content-length"] == b"50"
         
         # Default Content-Type logic
-        assert "content-type" in h_dict 
+        assert b"content-type" in h_dict 
 
     @patch("low_level.socket.create_connection")
     @patch("low_level.ssl.create_default_context")

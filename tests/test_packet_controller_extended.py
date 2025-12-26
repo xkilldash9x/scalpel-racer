@@ -16,11 +16,11 @@ class TestPacketController(unittest.TestCase):
     def setUp(self):
         # Patch dependencies
         self.patch_which = patch('shutil.which', return_value='/usr/bin/nft')
-        self.patch_call = patch('subprocess.call')
+        self.patch_run = patch('subprocess.run')
         self.patch_nfq = patch('packet_controller.NetfilterQueue')
         
         self.mock_which = self.patch_which.start()
-        self.mock_call = self.patch_call.start()
+        self.mock_run = self.patch_run.start()
         self.mock_nfq = self.patch_nfq.start()
         
         # Setup controller with mocked queue
@@ -33,7 +33,7 @@ class TestPacketController(unittest.TestCase):
     def tearDown(self):
         self.controller.stop()
         self.patch_which.stop()
-        self.patch_call.stop()
+        self.patch_run.stop()
         self.patch_nfq.stop()
 
     def create_packet(self, seq, payload_len=0, flags=0x10): 
@@ -123,7 +123,10 @@ class TestPacketController(unittest.TestCase):
         # Assert
         self.assertFalse(self.controller.active)
         # Verify nftables cleanup was called
-        self.mock_call.assert_any_call(['nft', 'delete', 'table', 'ip', 'scalpel_racer_ctx'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        self.mock_run.assert_any_call(
+            ['nft', 'delete', 'table', 'ip', 'scalpel_racer_ctx'], 
+            check=False, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
+        )
 
 if __name__ == '__main__':
     unittest.main()

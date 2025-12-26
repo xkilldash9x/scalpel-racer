@@ -34,10 +34,17 @@ _STRUCT_I = struct.Struct("!I")  # Unsigned int (4 bytes)
 
 class NFPacket(Protocol):
     """Protocol defining the interface of a NetfilterQueue packet."""
-    def get_payload(self) -> bytes: ...
-    def accept(self) -> None: ...
-    def drop(self) -> None: ...
-    def get_fd(self) -> int: ...
+    def get_payload(self) -> bytes:
+        """Retrieve the raw payload bytes from the packet."""
+
+    def accept(self) -> None:
+        """Accept the packet, allowing it to proceed through the kernel."""
+
+    def drop(self) -> None:
+        """Drop the packet, discarding it from the kernel queue."""
+
+    def get_fd(self) -> int:
+        """Retrieve the file descriptor associated with the queue."""
 
 
 class PacketController:
@@ -58,7 +65,7 @@ class PacketController:
         self.source_port: int = source_port
         self.queue_num: int = QUEUE_NUM
 
-        self.nfqueue: Optional[Any] = None 
+        self.nfqueue: Optional[Any] = None
         self.active: bool = False
         self.lock: threading.Lock = threading.Lock()
 
@@ -71,7 +78,7 @@ class PacketController:
 
         self.first_packet_held: threading.Event = threading.Event()
         self.subsequent_packets_released: threading.Event = threading.Event()
-        
+
         atexit.register(self.stop)
 
     def start(self) -> None:
@@ -83,16 +90,16 @@ class PacketController:
             return
 
         self._manage_nftables(action='add')
-        
+
         try:
             self.nfqueue = NetfilterQueue()
             self.nfqueue.bind(self.queue_num, self._queue_callback)
         except OSError as e:
-            logger.error("Failed to bind NFQueue %s: %s", self.queue_num, e)            
+            logger.error("Failed to bind NFQueue %s: %s", self.queue_num, e)
             self._manage_nftables(action='delete')
              # Do not raise here to prevent crashing the main app, just log failure
             return
-        
+
         self.active = True
 
         self.listener_thread = threading.Thread(target=self._listener_loop, daemon=True)
@@ -105,27 +112,27 @@ class PacketController:
         """Stops interception and cleans up rules."""
         if not self.active:
             return
-            
+
         self.active = False
         logger.info("Stopping PacketController...")
 
         with self.lock:
             if self.first_packet_info:
-                try: 
+                try:
                     self.first_packet_info[1].accept()
-                except Exception: 
+                except (OSError, RuntimeError):
                     pass
                 self.first_packet_info = None
 
         if self.nfqueue:
-            try: 
+            try:
                 self.nfqueue.unbind()
-            except Exception: 
+            except (OSError, RuntimeError):
                 pass
             try:
-                if hasattr(self.nfqueue, 'get_fd'): 
-                    self.nfqueue.get_fd() 
-            except Exception: 
+                if hasattr(self.nfqueue, 'get_fd'):
+                    self.nfqueue.get_fd()
+            except (OSError, RuntimeError):
                 pass
 
         self._manage_nftables(action='delete')
@@ -141,14 +148,14 @@ class PacketController:
     def _manage_nftables(self, action: str) -> None:
         table_name = "scalpel_racer_ctx"
         chain_name = "output_hook"
-        
+
         if action == 'add':
             cmd_table = ['nft', 'add', 'table', 'ip', table_name]
             cmd_chain = [
-                'nft', 'add', 'chain', 'ip', table_name, chain_name, 
+                'nft', 'add', 'chain', 'ip', table_name, chain_name,
                 '{', 'type', 'filter', 'hook', 'output', 'priority', '0', ';', '}'
             ]
-            
+
             rule_args = [
                 'nft', 'add', 'rule', 'ip', table_name, chain_name,
                 'ip', 'protocol', 'tcp', 'ip', 'daddr', self.target_ip,
@@ -156,7 +163,7 @@ class PacketController:
             ]
             if self.source_port != 0:
                 rule_args.extend(['tcp', 'sport', str(self.source_port)])
-            
+
             rule_args.extend(['counter', 'queue', 'num', str(self.queue_num)])
 
             try:
@@ -169,38 +176,38 @@ class PacketController:
                 subprocess.run(
                     rule_args, check=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
                 )
-            except subprocess.CalledProcessError: 
+            except subprocess.CalledProcessError:
                 logger.error("Failed to add nftables rule")
         elif action == 'delete':
-            try: 
+            try:
                 subprocess.run(
-                    ['nft', 'delete', 'table', 'ip', table_name], 
+                    ['nft', 'delete', 'table', 'ip', table_name],
                     check=False, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
                 )
-            except Exception: 
+            except (OSError, subprocess.SubprocessError):
                 pass
 
     def _listener_loop(self) -> None:
         while self.active and self.nfqueue:
-            try: 
+            try:
                 self.nfqueue.run()
-            except Exception: 
+            except (OSError, RuntimeError):
                 pass
             time.sleep(0.1)
 
     def _queue_callback(self, pkt: Any) -> None:
         # Cast to protocol for type safety
         packet = cast(NFPacket, pkt)
-        if not self.active: 
+        if not self.active:
             packet.accept()
             return
-        
+
         try:
             raw = packet.get_payload()
-            if len(raw) < 40: 
+            if len(raw) < 40:
                 packet.accept()
                 return
-            
+
             ihl = (raw[0] & 0x0F) * 4
             total_len = _STRUCT_H.unpack_from(raw, 2)[0]
             tcp_start = ihl
@@ -208,7 +215,7 @@ class PacketController:
             data_off = (raw[tcp_start + 12] >> 4) * 4
             payload_len = total_len - ihl - data_off
 
-            if payload_len <= 0: 
+            if payload_len <= 0:
                 packet.accept()
                 return
 
@@ -223,23 +230,27 @@ class PacketController:
                     self.subsequent_packets_released.set()
                 else:
                     packet.accept()
-        except Exception as e:
+        except Exception as e: # pylint: disable=broad-exception-caught
+            # Exception guard required to prevent thread death in callback loop.
             logger.error("Error in queue callback: %s", e)
-            packet.accept()
+            try:
+                packet.accept()
+            except (OSError, RuntimeError):
+                pass
 
     def _delayed_release(self) -> None:
         while self.active:
-            if not self.first_packet_held.wait(timeout=0.1): 
+            if not self.first_packet_held.wait(timeout=0.1):
                 continue
-            
-            if self.subsequent_packets_released.wait(timeout=5.0): 
+
+            if self.subsequent_packets_released.wait(timeout=5.0):
                 time.sleep(REORDER_DELAY)
-            
+
             with self.lock:
                 if self.first_packet_info:
-                    try: 
+                    try:
                         self.first_packet_info[1].accept()
-                    except Exception: 
+                    except (OSError, RuntimeError):
                         pass
                     self.first_packet_info = None
                 self.first_packet_held.clear()

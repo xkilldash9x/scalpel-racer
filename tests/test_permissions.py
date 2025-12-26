@@ -38,10 +38,11 @@ def test_restore_ownership_with_sudo(mock_sudo_env, temp_project_dir):
     # The implementation uses rglob, not walk.
     # We also mock atexit so it doesn't run automatically
     with patch('os.lchown') as mock_lchown, \
-         patch('atexit.register'):
+         patch('atexit.register'), \
+         patch('os.path.dirname', return_value=str(temp_project_dir)): # Patch dirname to return temp dir
 
-        # Call the function with base_path
-        permissions.restore_ownership(base_path=str(temp_project_dir))
+        # Call the function without arguments
+        permissions.restore_ownership()
 
         # Check that lchown was called for the directory and file
         expected_calls = [
@@ -62,9 +63,10 @@ def test_restore_ownership_without_sudo(temp_project_dir):
     with patch.dict(os.environ, {}, clear=True):
         with patch('os.chown') as mock_chown, \
              patch('os.lchown') as mock_lchown, \
-             patch('os.walk') as mock_walk:
+             patch('os.walk') as mock_walk, \
+             patch('os.path.dirname', return_value=str(temp_project_dir)):
             
-            permissions.restore_ownership(base_path=str(temp_project_dir))
+            permissions.restore_ownership()
 
             # Assertions
             mock_walk.assert_not_called()

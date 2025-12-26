@@ -20,15 +20,15 @@ SYNC_MARKER: bytes = b"{{SYNC}}"               # Marker for splitting payloads
 # [VECTOR OPTIMIZATION] Use set for O(1) lookup speed in hot paths
 HOP_BY_HOP_HEADERS: Set[str] = {
     'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
-    'te', 'trailers', 'transfer-encoding', 'upgrade', 'host', 
-    'accept-encoding', 'upgrade-insecure-requests', 'proxy-connection', 
+    'te', 'trailers', 'transfer-encoding', 'upgrade', 'host',
+    'accept-encoding', 'upgrade-insecure-requests', 'proxy-connection',
     'content-length', 'http2-settings'
 }
 
 # OpSec: Headers to redact in UI logs
 # Use set for O(1) lookup speed
 SENSITIVE_HEADERS: Set[str] = {
-    'authorization', 'proxy-authorization', 'cookie', 'set-cookie', 
+    'authorization', 'proxy-authorization', 'cookie', 'set-cookie',
     'x-auth-token', 'x-api-key', 'access_token', 'authentication', 'bearer'
 }
 
@@ -56,9 +56,9 @@ class ScanResult:
         self,
         index: int,
         status_code: int,
-        duration: float, 
-        body_hash: Optional[str] = None, 
-        body_snippet: Optional[str] = None, 
+        duration: float,
+        body_hash: Optional[str] = None,
+        body_snippet: Optional[str] = None,
         error: Optional[str] = None
     ) -> None:
         self.index = index
@@ -84,26 +84,26 @@ class ScanResult:
 
 class CapturedRequest:
     """
-    Standardized request object. 
+    Standardized request object.
     Used by Proxy to capture, and Race Engines to replay.
     Optimized: __slots__ lowers instantiation overhead.
     Aligned with PCAPNG Enhanced Packet Blocks for 5-tuple tracking.
     """
     # pylint: disable=redefined-builtin
     __slots__ = (
-        'id', 'method', 'url', 'headers', 'body', 'truncated', 'protocol', 
+        'id', 'method', 'url', 'headers', 'body', 'truncated', 'protocol',
         'edited_body', 'timestamp_start', 'timestamp_end', 'client_addr', 'server_addr'
     )
-    
+
     def __init__(
-        self, 
-        request_id: int, 
-        method: str, 
-        url: str, 
-        headers: List[Tuple[str, str]], 
-        body: bytes, 
-        truncated: bool = False, 
-        protocol: str = "HTTP/1.1", 
+        self,
+        request_id: int,
+        method: str,
+        url: str,
+        headers: List[Tuple[str, str]],
+        body: bytes,
+        truncated: bool = False,
+        protocol: str = "HTTP/1.1",
         edited_body: Optional[bytes] = None,
         timestamp_start: float = 0.0,
         timestamp_end: float = 0.0,
@@ -119,24 +119,24 @@ class CapturedRequest:
         self.id: int = request_id
         self.method: str = method
         self.url: str = url
-        
+
         # Strict type check for headers
         if not isinstance(headers, list):
             raise TypeError(f"Headers must be List[Tuple[str, str]], got {type(headers).__name__}")
         self.headers: List[Tuple[str, str]] = headers
-        
+
         # Strict type check for body
         if not isinstance(body, bytes):
             raise TypeError(f"Request body must be bytes, got {type(body).__name__}")
         self.body: bytes = body
-        
+
         self.truncated: bool = truncated
         self.protocol: str = protocol
-        
+
         if edited_body is not None and not isinstance(edited_body, bytes):
             raise TypeError(f"edited_body must be bytes, got {type(edited_body).__name__}")
         self.edited_body: Optional[bytes] = edited_body
-        
+
         # Telemetry Logic: If 0.0 is passed, we assume capture time is NOW.
         self.timestamp_start: float = timestamp_start if timestamp_start > 0 else time.time()
         self.timestamp_end: float = timestamp_end
@@ -157,19 +157,20 @@ class CapturedRequest:
         body_len = len(payload)
         edit_flag = "[E]" if self.edited_body is not None else ""
         trunc_flag = " [T]" if self.truncated else ""
-        
+
         clean_url = self.url
         if len(clean_url) > 60:
             clean_url = clean_url[:57] + "..."
-            
-        return f"[{self.protocol}] {self.method:<6} {clean_url} ({body_len}b){edit_flag}{trunc_flag}"
+
+        return (f"[{self.protocol}] {self.method:<6} {clean_url} "
+                f"({body_len}b){edit_flag}{trunc_flag}")
 
     def _get_redacted_headers(self) -> str:
         """Returns a string representation of headers with sensitive values masked."""
-        lines: List[str] = [] 
-        for k, v in self.headers: 
-            if k.lower() in SENSITIVE_HEADERS: 
-                lines.append(f"{k}: [REDACTED]") 
+        lines: List[str] = []
+        for k, v in self.headers:
+            if k.lower() in SENSITIVE_HEADERS:
+                lines.append(f"{k}: [REDACTED]")
             else:
                 lines.append(f"{k}: {v}")
         return ", ".join(lines)
@@ -190,7 +191,7 @@ class CapturedRequest:
         """Converts the request to a dictionary format for logging or storage."""
         payload = self.get_attack_payload()
         edited_str = self.edited_body.decode('utf-8', 'ignore') if self.edited_body else None
-        
+
         return {
             'id': self.id,
             'method': self.method,

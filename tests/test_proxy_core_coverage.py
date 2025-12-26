@@ -1,11 +1,19 @@
-
+# tests/test_proxy_core_coverage.py
+"""
+Coverage tests for proxy core modules.
+"""
 import asyncio
 import unittest
 from unittest.mock import MagicMock, patch, AsyncMock
-from proxy_core import Http11ProxyHandler, PayloadTooLargeError, ProxyError, NativeProxyHandler, StreamContext
 import pytest
+from proxy_core import Http11ProxyHandler, PayloadTooLargeError
+from proxy_h2 import NativeProxyHandler
+from proxy_common import H2StreamContext as StreamContext
+
+# pylint: disable=protected-access
 
 class TestHttp11ProxyHandler(unittest.TestCase):
+    """Tests for Http11ProxyHandler."""
     def setUp(self):
         self.mock_reader = AsyncMock()
         self.mock_writer = MagicMock()
@@ -16,6 +24,7 @@ class TestHttp11ProxyHandler(unittest.TestCase):
         )
 
     def test_read_strict_line_normal(self):
+        """Test normal line reading."""
         self.handler.buffer = bytearray(b"Line1\r\nLine2\n")
 
         async def run():
@@ -28,6 +37,7 @@ class TestHttp11ProxyHandler(unittest.TestCase):
         self.assertEqual(l2, b"Line2")
 
     def test_read_strict_line_compaction(self):
+        """Test buffer compaction during read."""
         self.handler.buffer = bytearray(b"A" * 70000)
         self.handler._buffer_offset = 66000
         self.mock_reader.read.return_value = b"\n"
@@ -41,12 +51,14 @@ class TestHttp11ProxyHandler(unittest.TestCase):
         self.assertTrue(len(self.handler.buffer) < 10000)
 
     def test_read_bytes_too_large(self):
+        """Test reading bytes exceeding limit."""
         async def run():
             with self.assertRaises(PayloadTooLargeError):
                 await self.handler._read_bytes(11 * 1024 * 1024)
         asyncio.run(run())
 
     def test_validate_request_pseudo_headers(self):
+        """Test rejection of pseudo-headers in H1."""
         async def run():
             headers = {':method': 'GET'}
             valid = await self.handler._validate_request('GET', headers)
@@ -54,6 +66,7 @@ class TestHttp11ProxyHandler(unittest.TestCase):
         asyncio.run(run())
 
     def test_validate_request_connect_no_host(self):
+        """Test CONNECT request validation."""
         async def run():
             headers = {'user-agent': 'test'}
             valid = await self.handler._validate_request('CONNECT', headers)
@@ -61,6 +74,7 @@ class TestHttp11ProxyHandler(unittest.TestCase):
         asyncio.run(run())
 
     def test_chunked_body_read(self):
+        """Test reading chunked body."""
         self.handler.buffer = bytearray(b"4\r\nTest\r\n0\r\n\r\n")
         async def run():
             return await self.handler._read_chunked_body()
@@ -69,24 +83,31 @@ class TestHttp11ProxyHandler(unittest.TestCase):
         self.assertEqual(body, b"Test")
 
 class TestNativeProxyHandler(unittest.TestCase):
+    """Tests for NativeProxyHandler."""
     def setUp(self):
         self.mock_reader = AsyncMock()
         self.mock_writer = MagicMock()
         self.mock_callback = MagicMock()
-        with patch('proxy_core.H2Connection') as MockH2:
+        # pylint: disable=unused-variable
+        with patch('proxy_h2.H2Connection') as mock_h2:
             self.handler = NativeProxyHandler(
                 self.mock_reader, self.mock_writer, "example.com", self.mock_callback,
                 None, None
             )
             self.handler.downstream_conn = MagicMock()
             self.handler.downstream_conn.local_settings = MagicMock()
+        # pylint: enable=unused-variable
 
     def test_stream_context_slots(self):
+        """Test StreamContext slots enforcement."""
         ctx = StreamContext(1, "https", None)
         with self.assertRaises(AttributeError):
+            # pylint: disable=assigning-non-slot
             ctx.new_attr = 1
+            # pylint: enable=assigning-non-slot
 
     def test_prepare_forwarded_headers(self):
+        """Test header preparation and filtering."""
         headers = [
             (b":method", b"GET"),
             (b":scheme", b"https"),
@@ -97,7 +118,9 @@ class TestNativeProxyHandler(unittest.TestCase):
             (b"te", b"deflate"),
             (b"accept", b"*/*")
         ]
+        # pylint: disable=unused-variable
         out, protocol = self.handler._prepare_forwarded_headers(headers)
+        # pylint: enable=unused-variable
 
         keys = [k for k, v in out]
         self.assertIn(b":method", keys)
@@ -105,6 +128,7 @@ class TestNativeProxyHandler(unittest.TestCase):
         self.assertIn(b"te", keys)
 
     def test_cleanup_stream(self):
+        """Test stream cleanup logic."""
         ctx = StreamContext(1, "https", None)
         t = MagicMock()
         ctx.sender_tasks.append(t)
