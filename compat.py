@@ -7,7 +7,10 @@ Eliminates duplicate try/except blocks and ensures type safety across modules.
 """
 
 import sys
-from typing import List, Tuple, Optional, Dict, Any, Callable, TYPE_CHECKING, Literal
+from typing import (
+    List, Tuple, Optional, Dict, Any, Callable, TYPE_CHECKING,
+    Protocol, cast, Union, Type
+)
 
 # -- Export definitions for Facade Pattern --
 __all__ = [
@@ -15,8 +18,41 @@ __all__ = [
     'SettingCodes', 'ErrorCodes', 'Event', 'RequestReceived',
     'DataReceived', 'StreamEnded', 'StreamReset', 'WindowUpdated',
     'ConnectionTerminated', 'TrailersReceived', 'ResponseReceived',
-    'NFQUEUE_AVAILABLE', 'NetfilterQueue', 'MockPacketController'
+    'NFQUEUE_AVAILABLE', 'NetfilterQueue', 'MockPacketController',
+    'PacketControllerProtocol', 'H2ConnectionProtocol'
 ]
+
+
+# -- Protocols for Strict Typing --
+
+class PacketControllerProtocol(Protocol):
+    """Protocol for PacketController to enforce interface."""
+    def start(self) -> None: ...
+    def stop(self) -> None: ...
+
+
+class H2ConnectionProtocol(Protocol):
+    """Protocol for H2Connection to enforce interface."""
+    config: Any
+    local_settings: Dict[int, int]
+    outbound_flow_control_window: int
+    remote_flow_control_window: Callable[[int], int]
+    remote_settings: Dict[int, int]
+
+    def initiate_connection(self) -> None: ...
+    def data_to_send(self, amount: Optional[int] = None) -> bytes: ...
+    def send_headers(
+        self, stream_id: int, headers: List[Tuple[bytes, bytes]], **kwargs: Any
+    ) -> None: ...
+    def send_data(self, stream_id: int, data: bytes, **kwargs: Any) -> None: ...
+    def receive_data(self, data: bytes) -> List[Any]: ...
+    def acknowledge_received_data(self, acknowledged_size: int, stream_id: int) -> None: ...
+    def get_next_available_stream_id(self) -> int: ...
+    def reset_stream(self, stream_id: int, error_code: int = 0) -> None: ...
+    def ping(self, opaque_data: bytes) -> None: ...
+    def close_connection(self, error_code: int = 0, **kwargs: Any) -> None: ...
+    def update_settings(self, new_settings: Dict[int, int]) -> None: ...
+
 
 # -- HTTP/2 (h2) Support --
 
@@ -40,6 +76,7 @@ if TYPE_CHECKING:
 
     # Type Aliases for static analysis
     hpack = _hpack_lib
+    # Use Protocol for H2Connection to ensure strictness even if lib is untyped
     H2Connection = _H2Connection
     H2Configuration = _H2Configuration
     RequestReceived = _RequestReceived
@@ -117,14 +154,13 @@ else:
                     SettingCodes.ENABLE_CONNECT_PROTOCOL: 0,
                 }
                 self.outbound_flow_control_window = 65535
-                # Explicitly typed lambda
                 self.remote_flow_control_window: Callable[[int], int] = lambda stream_id: 65535
                 self.remote_settings: Dict[int, int] = {}
 
             def initiate_connection(self) -> None:
                 pass
 
-            def data_to_send(self) -> bytes:
+            def data_to_send(self, amount: Optional[int] = None) -> bytes:
                 return b""
 
             def send_headers(
@@ -151,6 +187,9 @@ else:
                 pass
 
             def close_connection(self, error_code: int = 0, **kwargs: Any) -> None:
+                pass
+
+            def update_settings(self, new_settings: Dict[int, int]) -> None:
                 pass
 
         # -- Event Mocks --
