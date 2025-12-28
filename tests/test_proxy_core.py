@@ -322,6 +322,22 @@ class TestHttp11Proxy:
 
 class TestNativeProxyHandler:
     """Tests for NativeProxyHandler."""
+
+    @pytest.fixture
+    def mock_h2_setup(self):
+        """Setup H2 environment for TestNativeProxyHandler."""
+        reader = AsyncMock()
+        writer = MagicMock()
+        writer.drain = AsyncMock()
+        cb = MagicMock()
+
+        with patch("proxy_h2.H2Connection") as mock_h2:
+            mock_h2.return_value.local_settings = MagicMock()
+            handler = NativeProxyHandler(
+                reader, writer, "h2.target", cb, None, None, enable_tunneling=False
+            )
+            return handler, reader, writer, cb
+
     @pytest.mark.asyncio
     async def test_h2_request_capture(self, mock_h2_setup):
         """Test H2 capture."""
