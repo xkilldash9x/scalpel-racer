@@ -12,19 +12,25 @@ import logging
 import gc
 import hashlib
 from urllib.parse import urlparse
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple, TYPE_CHECKING, cast, Type, Union
 
 # [APEX] Imports from Foundation & Compat
 from structures import ScanResult, CapturedRequest
 from compat import (
     H2Connection, H2Configuration, DataReceived, StreamEnded, StreamReset,
-    ResponseReceived, NFQUEUE_AVAILABLE, MockPacketController
+    ResponseReceived, NFQUEUE_AVAILABLE, MockPacketController,
+    PacketControllerProtocol, H2ConnectionProtocol
 )
 
-try:
-    from packet_controller import PacketController
-except ImportError:
-    PacketController = MockPacketController  # type: ignore
+if TYPE_CHECKING:
+    from packet_controller import PacketController as RealPacketController
+    # Runtime variable PacketController will be a class (Type[Protocol])
+    PacketController: Union[Type[RealPacketController], Type[MockPacketController]]
+else:
+    try:
+        from packet_controller import PacketController
+    except ImportError:
+        PacketController = MockPacketController  # type: ignore
 
 logger = logging.getLogger(__name__)
 _SSL_CONTEXT_CACHE: Dict[str, ssl.SSLContext] = {}
@@ -44,7 +50,7 @@ class StreamContext:
         self.index = index
         self.body = bytearray()
         self.finished = False
-        self.headers: List[Any] = []
+        self.headers: List[Tuple[bytes, bytes]] = []
         self.start_time = 0.0
         self.end_time = 0.0
         self.error: Optional[str] = None
@@ -63,7 +69,8 @@ class HTTP2RaceEngine:
         self.warmup = warmup
         self.target_host: Optional[str] = None
         self.target_port = 443
-        self.conn: H2Connection
+        # Use Protocol for strict typing of the connection object
+        self.conn: H2ConnectionProtocol
         self.sock: Optional[ssl.SSLSocket] = None
         self.streams: Dict[int, StreamContext] = {}
         self.lock = threading.Lock()
@@ -79,6 +86,7 @@ class HTTP2RaceEngine:
         if not self.target_host:
             # Fallback to Host header
             for k, v in self.request.headers:
+                # CapturedRequest headers are strings (Tuple[str, str])
                 if k.lower() == 'host':
                     # Handle host:port
                     if ':' in v and not v.strip().startswith('['):
@@ -113,7 +121,7 @@ class HTTP2RaceEngine:
         if self.target_port not in (80, 443):
             authority = f"{authority}:{self.target_port}"
 
-        headers = [
+        headers: List[Tuple[bytes, bytes]] = [
             (b':method', self.request.method.encode()),
             (b':path', path.encode()),
             (b':scheme', b'https'),
@@ -125,9 +133,11 @@ class HTTP2RaceEngine:
             'transfer-encoding', 'host', 'content-length', 'te'
         }
 
+        # Handle user-supplied headers
         for k, v in self.request.headers:
-            if k.lower() not in skip:
-                headers.append((k.lower().encode(), v.encode()))
+            k_lower = k.lower()
+            if k_lower not in skip:
+                headers.append((k_lower.encode(), v.encode()))
 
         if cl is not None:
             headers.append((b'content-length', str(cl).encode()))
@@ -176,12 +186,18 @@ class HTTP2RaceEngine:
                 raw, server_hostname=self.target_host
             )
 
-            self.conn = H2Connection(
-                config=H2Configuration(client_side=True, header_encoding=None)
+            # Cast H2Connection to the Protocol to ensure type safety
+            self.conn = cast(
+                H2ConnectionProtocol,
+                H2Connection(
+                    config=H2Configuration(client_side=True, header_encoding=None)
+                )
             )
             self.conn.initiate_connection()
             if self.sock:
-                self.sock.sendall(self.conn.data_to_send())
+                data_to_send = self.conn.data_to_send()
+                if data_to_send:
+                    self.sock.sendall(data_to_send)
         except Exception as e:
             if isinstance(e, ValueError):
                 raise
@@ -194,7 +210,7 @@ class HTTP2RaceEngine:
         Executes the race condition attack.
         Sends initial headers, waits (warmup), then sends the final payload for all streams.
         """
-        pc: Optional[PacketController] = None
+        pc: Optional[PacketControllerProtocol] = None
         try:
             self.connect()
             if (
@@ -205,7 +221,11 @@ class HTTP2RaceEngine:
                 and self.sock
             ):
                 ip = socket.gethostbyname(self.target_host)
-                pc = PacketController(ip, self.target_port, self.sock.getsockname()[1])
+                # Instantiate and assign to Protocol-typed variable
+                pc_instance = PacketController(
+                    ip, self.target_port, self.sock.getsockname()[1]
+                )
+                pc = pc_instance
                 pc.start()
 
             threading.Thread(target=self._recv, daemon=True).start()
@@ -224,7 +244,9 @@ class HTTP2RaceEngine:
                     self.conn.send_headers(sid, headers, end_stream=not payload)
 
             if self.sock:
-                self.sock.sendall(self.conn.data_to_send())
+                data = self.conn.data_to_send()
+                if data:
+                    self.sock.sendall(data)
 
             time.sleep(self.warmup / 1000.0)
 
@@ -235,10 +257,10 @@ class HTTP2RaceEngine:
                     stream.start_time = t0
                     if payload:
                         self.conn.send_data(sid, payload, end_stream=True)
-                data = self.conn.data_to_send()
+                final_data = self.conn.data_to_send()
 
-            if self.sock:
-                self.sock.sendall(data)
+            if self.sock and final_data:
+                self.sock.sendall(final_data)
 
             self.finished.wait(timeout=10)
             return self._finalize()
@@ -257,6 +279,7 @@ class HTTP2RaceEngine:
     def _process_events(self, events: List[Any]) -> None:
         """Process H2 events received from the connection."""
         for e in events:
+            # Explicitly checking types using classes imported from compat
             if isinstance(e, (StreamEnded, StreamReset)):
                 s = self.streams.get(e.stream_id)
                 if s:
@@ -271,11 +294,11 @@ class HTTP2RaceEngine:
             elif isinstance(e, ResponseReceived):
                 s = self.streams.get(e.stream_id)
                 if s:
-                    s.headers = e.headers
+                    # Cast headers to the expected Tuple[bytes, bytes] type
+                    headers_list = cast(List[Tuple[bytes, bytes]], e.headers)
+                    s.headers = headers_list
 
         # Check if all initiated streams have finished.
-        # B05 FIX: Ensure we check against the expected concurrency count.
-        # This prevents premature termination if _process_events is called before all streams are initialized in _prepare_requests.
         finished_count = sum(1 for s in self.streams.values() if s.finished)
 
         if finished_count >= self.concurrency:
@@ -291,7 +314,8 @@ class HTTP2RaceEngine:
                 try:
                     if not sel.select(0.1):
                         continue
-                    data = self.sock.recv(65536)  # type: ignore
+                    # Cast recv return to bytes
+                    data = cast(bytes, self.sock.recv(65536))
                     if not data:
                         break
                     with self.lock:
@@ -312,12 +336,15 @@ class HTTP2RaceEngine:
             self.finished.set()
 
     def _finalize(self) -> List[ScanResult]:
-        res = []
+        res: List[ScanResult] = []
         for s in sorted(self.streams.values(), key=lambda x: x.index):
             status = 0
             for k, v in s.headers:
                 if k == b':status':
-                    status = int(v)
+                    try:
+                        status = int(v)
+                    except ValueError:
+                        pass
                     break
 
             if status == 0 and s.finished and not s.error:
