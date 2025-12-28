@@ -262,6 +262,8 @@ class HTTP2RaceEngine:
                 if s:
                     s.finished = True
                     s.end_time = time.perf_counter()
+                    if isinstance(e, StreamReset):
+                        s.error = f"Stream reset by server (Error code: {e.error_code})"
             elif isinstance(e, DataReceived):
                 s = self.streams.get(e.stream_id)
                 if s:
@@ -271,7 +273,12 @@ class HTTP2RaceEngine:
                 if s:
                     s.headers = e.headers
 
-        if self.streams and all(s.finished for s in self.streams.values()):
+        # Check if all initiated streams have finished.
+        # B05 FIX: Ensure we check against the expected concurrency count.
+        # This prevents premature termination if _process_events is called before all streams are initialized in _prepare_requests.
+        finished_count = sum(1 for s in self.streams.values() if s.finished)
+
+        if finished_count >= self.concurrency:
             self.finished.set()
 
     def _recv(self) -> None:
