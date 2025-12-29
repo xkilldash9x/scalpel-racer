@@ -73,8 +73,9 @@ class Http11ProxyHandler(BaseProxyHandler):
         Reads a single line from the buffer/stream, strictly adhering to RFC limits.
         Detects line folding or excessive length.
         """
+        search_start = self._buffer_offset
         while True:
-            lf_index = self.buffer.find(b'\n', self._buffer_offset)
+            lf_index = self.buffer.find(b'\n', search_start)
             if lf_index == -1:
                 if len(self.buffer) - self._buffer_offset > 0:
                     # [FIX] C0325: Removed superfluous parens
@@ -89,6 +90,10 @@ class Http11ProxyHandler(BaseProxyHandler):
                 ):
                     del self.buffer[:self._buffer_offset]
                     self._buffer_offset = 0
+
+                # [BOLT] Optimization: Start next search from the current end of the buffer
+                # to avoid re-scanning bytes we've already checked.
+                search_start = len(self.buffer)
 
                 try:
                     data = await asyncio.wait_for(
