@@ -117,8 +117,9 @@ class TestHttp11Proxy:
             call_args = mock_handle.call_args
             if call_args:
                 headers_dict = call_args[0][4]
-                assert 'content-length' not in headers_dict
-                assert 'transfer-encoding' in headers_dict
+                # Headers are now BYTES
+                assert b'content-length' not in headers_dict
+                assert b'transfer-encoding' in headers_dict
         # pylint: enable=protected-access
 
     @pytest.mark.asyncio
@@ -173,7 +174,8 @@ class TestHttp11Proxy:
             instance = mock_dual.return_value
             instance.run = AsyncMock()
             # pylint: disable=protected-access
-            await handler._handle_connect("secure.com:443")
+            # [FIX] Pass bytes to _handle_connect
+            await handler._handle_connect(b"secure.com:443")
             # pylint: enable=protected-access
             writer.write.assert_any_call(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             writer.start_tls.assert_awaited()
@@ -302,8 +304,9 @@ class TestHttp11Proxy:
              await handler.run()
              
              headers_dict = mock_handle.call_args[0][4]
-             assert "content-length" not in headers_dict
-             assert "transfer-encoding" in headers_dict
+             # Headers are now BYTES
+             assert b"content-length" not in headers_dict
+             assert b"transfer-encoding" in headers_dict
         # pylint: enable=protected-access
 
     @pytest.mark.asyncio
@@ -314,7 +317,8 @@ class TestHttp11Proxy:
         handler = Http11ProxyHandler(reader, writer, "127.0.0.1:8080", None, None, None)
         with patch("proxy_core.asyncio.open_connection") as mock_conn:
             # pylint: disable=protected-access
-            await handler._handle_connect("127.0.0.1:22")
+            # [FIX] Pass bytes to _handle_connect
+            await handler._handle_connect(b"127.0.0.1:22")
             # pylint: enable=protected-access
             assert mock_conn.called
 
