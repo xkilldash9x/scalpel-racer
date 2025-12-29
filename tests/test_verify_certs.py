@@ -41,11 +41,17 @@ class TestCertManager:
             getattr(mock_builder_inst, method).return_value = mock_builder_inst
 
         # Mock filesystem to say files do NOT exist
-        # We patch os.open but do not assert on it, as python's open() is used
+        # We patch os.open for secure writes
         with patch("os.path.exists", return_value=False), \
              patch("builtins.open", MagicMock()) as mock_file, \
+             patch("os.open") as mock_os_open, \
+             patch("os.fdopen") as mock_fdopen, \
              patch("os.makedirs"):
             
+            # Mock os.open to return a file descriptor
+            mock_os_open.return_value = 123
+            mock_fdopen.return_value.__enter__.return_value = mock_file.return_value
+
             # Use real class to test the _load_or_generate_ca logic
             # We patch _generate_static_server_cert here so we only test the CA logic
             with patch.object(CertManager, "_generate_static_server_cert"):
@@ -55,8 +61,11 @@ class TestCertManager:
             # Once for shared leaf key, Once for CA key
             assert mock_ec.call_count >= 2
             
-            # [FIXED ASSERTION] Verify we opened the files using standard open()
-            mock_file.assert_any_call(CA_KEY_PATH, "wb")
+            # Verify we opened CA_KEY_PATH via secure write (os.open)
+            # 0o600 is 384
+            mock_os_open.assert_any_call(CA_KEY_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+
+            # Verify CA cert opened via standard open
             mock_file.assert_any_call(CA_CERT_PATH, "wb")
             
             # Verify CA cert builder was invoked
@@ -161,7 +170,9 @@ class TestCertManager:
 
         host = "secure-test.com"
 
-        with patch("builtins.open", MagicMock()):
+        with patch("builtins.open", MagicMock()), \
+             patch("os.open", MagicMock()), \
+             patch("os.fdopen", MagicMock()):
             manager.get_context_for_host(host)
 
         # 1. Verify Public Key setting

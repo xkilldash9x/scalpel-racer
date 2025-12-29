@@ -72,6 +72,23 @@ class CertManager:
         # Generate the static server certs required for the QUIC listener
         self._generate_static_server_cert()
 
+    def _secure_write(self, path: str, data: bytes) -> None:
+        """
+        Writes data to a file with 600 permissions (Owner Read/Write only).
+        Uses os.open to ensure the file is created with strict permissions
+        to prevent race conditions or exposure.
+        """
+        # Remove existing file to ensure we create with new permissions
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+
     def _load_or_generate_ca(self) -> None:
         """
         Loads the existing CA from disk or generates a new ECC P-256 CA.
@@ -140,13 +157,12 @@ class CertManager:
         self.ca_cert = builder.sign(self.ca_key, hashes.SHA256())
 
         # Write Private Key
-        with open(CA_KEY_PATH, "wb") as f:
-            f.write(self.ca_key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.TraditionalOpenSSL,
-                encryption_algorithm=serialization.NoEncryption(),
-            ))
-            
+        self._secure_write(CA_KEY_PATH, self.ca_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        ))
+
         # Write Certificate
         with open(CA_CERT_PATH, "wb") as f:
             f.write(self.ca_cert.public_bytes(serialization.Encoding.PEM))
@@ -225,13 +241,12 @@ class CertManager:
 
         cert = builder.sign(self.ca_key, hashes.SHA256())
 
-        with open(server_key_path, "wb") as f:
-            f.write(key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.TraditionalOpenSSL,
-                encryption_algorithm=serialization.NoEncryption(),
-            ))
-        
+        self._secure_write(server_key_path, key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        ))
+
         with open(server_crt_path, "wb") as f:
             f.write(cert.public_bytes(serialization.Encoding.PEM))
 
@@ -313,10 +328,9 @@ class CertManager:
             # [SECURITY] Use hash for filesystem paths
             key_path = os.path.join(CERTS_DIR, f"{host_hash}.key")
             cert_path = os.path.join(CERTS_DIR, f"{host_hash}.crt")
-            
+
             try:
-                with open(key_path, "wb") as f:
-                    f.write(key_pem)
+                self._secure_write(key_path, key_pem)
                 with open(cert_path, "wb") as f:
                     f.write(cert_pem)
             except OSError as e:
