@@ -13,7 +13,7 @@ from typing import Optional, Callable, Tuple, List, Dict
 from urllib.parse import urljoin, urlparse
 
 # [APEX] Modular Imports
-from structures import CapturedRequest, HOP_BY_HOP_HEADERS, MAX_CAPTURE_BODY_SIZE
+from structures import CapturedRequest, HOP_BY_HOP_HEADERS, MAX_CAPTURE_BODY_SIZE, HOP_BY_HOP_HEADERS_BYTES
 from proxy_common import (
     BaseProxyHandler, ProxyError, PayloadTooLargeError,
     STRICT_HEADER_PATTERN, UPSTREAM_CONNECT_TIMEOUT, IDLE_TIMEOUT,
@@ -147,8 +147,7 @@ class Http11ProxyHandler(BaseProxyHandler):
                     if len(parts) != 3:
                         raise ValueError
                     method_b, target_b, version_b = parts
-                    method = method_b.decode('ascii')
-                    target = target_b.decode('ascii')
+                    # [OPTIMIZATION] Keep method/target as bytes to avoid decode overhead
                 except ValueError:
                     await self._send_error(400, "Malformed Request Line")
                     return
@@ -165,27 +164,28 @@ class Http11ProxyHandler(BaseProxyHandler):
                         match = STRICT_HEADER_PATTERN.match(h_line)
                         if not match:
                             raise ProxyError("Invalid Header Syntax")
-                        key = match.group(1).decode('ascii')
-                        val = match.group(2).decode('ascii').strip()
-                        headers.append((key, val))
-                        headers_dict[key.lower()] = val
+                        # [OPTIMIZATION] Keep headers as bytes
+                        key_b = match.group(1)
+                        val_b = match.group(2).strip()
+                        headers.append((key_b, val_b))
+                        headers_dict[key_b.lower()] = val_b
                 except ProxyError as e:
                     await self._send_error(400, str(e))
                     return
 
-                if not await self._validate_request(method, headers_dict):
+                if not await self._validate_request(method_b, headers_dict):
                     return
 
                 # Transfer-Encoding & Content-Length handling
-                te = headers_dict.get('transfer-encoding')
-                cl = headers_dict.get('content-length')
+                te = headers_dict.get(b'transfer-encoding')
+                cl = headers_dict.get(b'content-length')
                 if te:
                     if cl and self.strict_mode:
-                        headers = [h for h in headers if h[0].lower() != 'content-length']
-                        if 'content-length' in headers_dict:
-                            del headers_dict['content-length']
-                    enc = [e.strip().lower() for e in te.split(',')]
-                    if 'chunked' in enc and enc[-1] != 'chunked':
+                        headers = [h for h in headers if h[0].lower() != b'content-length']
+                        if b'content-length' in headers_dict:
+                            del headers_dict[b'content-length']
+                    enc = [e.strip().lower() for e in te.split(b',')]
+                    if b'chunked' in enc and enc[-1] != b'chunked':
                         await self._send_error(400, "Bad Transfer-Encoding")
                         return
                 elif cl:
@@ -196,12 +196,12 @@ class Http11ProxyHandler(BaseProxyHandler):
                         await self._send_error(400, "Invalid Content-Length")
                         return
 
-                if method == 'CONNECT':
-                    await self._handle_connect(target)
+                if method_b == b'CONNECT':
+                    await self._handle_connect(target_b)
                     return
 
                 keep_alive = await self._handle_request(
-                    method, target, version_b, headers, headers_dict, start_ts
+                    method_b, target_b, version_b, headers, headers_dict, start_ts
                 )
                 if not keep_alive:
                     break
@@ -211,19 +211,20 @@ class Http11ProxyHandler(BaseProxyHandler):
             if not self.writer.is_closing():
                 self.writer.close()
 
-    async def _validate_request(self, method: str, headers_dict: Dict[str, str]) -> bool:
+    async def _validate_request(self, method: bytes, headers_dict: Dict[bytes, bytes]) -> bool:
         """Validates the request method and headers."""
-        if method == 'CONNECT' and 'host' not in headers_dict:
+        if method == b'CONNECT' and b'host' not in headers_dict:
             await self._send_error(400, "CONNECT requires Host header")
             return False
-        if any(k.startswith(':') for k in headers_dict):
+        if any(k.startswith(b':') for k in headers_dict):
             await self._send_error(400, "Pseudo-header in HTTP/1.1")
             return False
         return True
 
-    async def _handle_connect(self, target: str) -> None:
+    async def _handle_connect(self, target: bytes) -> None:
         """Handles a CONNECT request for tunneling."""
-        host, port = self._parse_target(target)
+        target_str = target.decode('ascii', errors='ignore')
+        host, port = self._parse_target(target_str)
         if self.enable_tunneling:
             factory = self.ssl_context_factory
             if factory:
@@ -234,7 +235,7 @@ class Http11ProxyHandler(BaseProxyHandler):
                     await self.writer.start_tls(ssl_ctx)
                     rem = self.buffer[self._buffer_offset:] if self.buffer else b""
                     handler = DualProtocolHandler(
-                        self.reader, self.writer, target, self.callback,
+                        self.reader, self.writer, target_str, self.callback,
                         self.target_override, self.scope_pattern, self.enable_tunneling,
                         self.upstream_verify_ssl, self.upstream_ca_bundle,
                         self.ssl_context_factory, initial_data=bytes(rem)
@@ -274,27 +275,34 @@ class Http11ProxyHandler(BaseProxyHandler):
             pass
 
     async def _handle_request(
-        self, method: str, target: str, version_b: bytes,
-        headers: List[Tuple[str, str]], headers_dict: Dict[str, str], start_ts: float
+        self, method: bytes, target: bytes, version_b: bytes,
+        headers: List[Tuple[bytes, bytes]], headers_dict: Dict[bytes, bytes], start_ts: float
     ) -> bool:
         """Handles a standard HTTP/1.1 request."""
-        req_host = self.explicit_host
-        if not req_host:
+        # [OPTIMIZATION] Bytes everywhere
+        req_host_b = self.explicit_host.encode('ascii') if self.explicit_host else None
+
+        if not req_host_b:
             p = urlparse(target)
             if p.scheme and p.netloc:
-                req_host = p.netloc
-        if not req_host:
-            req_host = headers_dict.get('host')
-        if not req_host:
+                req_host_b = p.netloc
+        if not req_host_b:
+            req_host_b = headers_dict.get(b'host')
+        if not req_host_b:
             p = urlparse(target)
-            req_host = p.netloc or ""
+            req_host_b = p.netloc or b""
 
+        # Resolve host/port for upstream connection
+        # We need strings for socket/SSL calls
+        req_host_str = req_host_b.decode('ascii', errors='ignore')
         scheme = "https" if self.upstream_verify_ssl else "http"
         default_port = 443 if scheme == "https" else 80
-        host, port = self._parse_target(req_host if req_host else "", default_port=default_port)
+        host, port = self._parse_target(req_host_str if req_host_str else "", default_port=default_port)
 
-        full_url = urljoin(self.target_override, target.lstrip('/')) if self.target_override else (
-            target if target.startswith("http") else f"{scheme}://{host}:{port}{target}"
+        # Checking scope
+        target_str = target.decode('ascii', errors='ignore')
+        full_url = urljoin(self.target_override, target_str.lstrip('/')) if self.target_override else (
+            target_str if target_str.startswith("http") else f"{scheme}://{host}:{port}{target_str}"
         )
 
         if not self._is_url_allowed(full_url, self.scope_pattern):
@@ -302,10 +310,10 @@ class Http11ProxyHandler(BaseProxyHandler):
             return False
 
         body = b""
-        te = headers_dict.get('transfer-encoding', '').lower()
-        cl = headers_dict.get('content-length')
+        te = headers_dict.get(b'transfer-encoding', b'').lower()
+        cl = headers_dict.get(b'content-length')
 
-        if 'chunked' in te:
+        if b'chunked' in te:
             body = await self._read_chunked_body()
         elif cl:
             try:
@@ -313,11 +321,17 @@ class Http11ProxyHandler(BaseProxyHandler):
             except ValueError:
                 pass
 
-        self._record_capture(method, target, headers, body, scheme, host, start_ts)
+        # Defer decoding for logging until inside _record_capture if possible,
+        # or just decode here for the signature. _record_capture expects strings for now.
+        headers_str = [(k.decode('latin1'), v.decode('latin1')) for k, v in headers]
 
-        conn = headers_dict.get('connection', '').lower()
+        self._record_capture(
+            method.decode('ascii'), target_str, headers_str, body, scheme, host, start_ts
+        )
+
+        conn = headers_dict.get(b'connection', b'').lower()
         keep_alive = True
-        if 'close' in conn or version_b == b'HTTP/1.0':
+        if b'close' in conn or version_b == b'HTTP/1.0':
             keep_alive = False
 
         if not self.enable_tunneling:
@@ -338,17 +352,37 @@ class Http11ProxyHandler(BaseProxyHandler):
             await self._send_error(502, "Bad Gateway")
             return False
 
-        up_path = target
-        if target.startswith("http"):
+        # Construct upstream request
+        up_path_b = target
+        if target.startswith(b"http"):
             p = urlparse(target)
-            up_path = p.path if p.path else "/"
-            up_path += ("?" + p.query) if p.query else ""
+            up_path_b = p.path if p.path else b"/"
+            if p.query:
+                up_path_b += b"?" + p.query
 
-        u_w.write(f"{method} {up_path} {version_b.decode()}\r\n".encode())
+        # Construct request line
+        # Note: version_b is already bytes e.g. b"HTTP/1.1"
+        u_w.write(method + b' ' + up_path_b + b' ' + version_b + b'\r\n')
+
+        # [OPTIMIZATION] Avoid decoding/encoding headers if possible.
+        # We need HOP_BY_HOP_HEADERS_BYTES from structures.py (it's not imported there yet, let's assume I fix imports or use local set)
+        # For now I will check against local set or strings.
+        # Ideally structures.py has HOP_BY_HOP_HEADERS_BYTES.
+
+        # Checking proxy_core imports:
+        # from structures import CapturedRequest, HOP_BY_HOP_HEADERS, MAX_CAPTURE_BODY_SIZE
+        # I need to ensure HOP_BY_HOP_HEADERS_BYTES is imported or generated.
+
+        # Let's generate it locally for speed if not available, but I see it in structures.py!
+        # I need to import it. I will add it to the imports in next step or use lazy conversion.
+        # Let's assume standard set for now.
+
         for k, v in headers:
-            if k.lower() not in HOP_BY_HOP_HEADERS:
-                u_w.write(f"{k}: {v}\r\n".encode())
-        u_w.write(f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode())
+            # [OPTIMIZATION] Direct byte check against HOP_BY_HOP_HEADERS_BYTES
+            if k.lower() not in HOP_BY_HOP_HEADERS_BYTES:
+                 u_w.write(k + b': ' + v + b'\r\n')
+
+        u_w.write(b"Content-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n")
 
         if body:
             u_w.write(body)
