@@ -16,7 +16,8 @@ from scalpel_racer import (
     last_byte_stream_body, staged_stream_body,
     analyze_results, ScalpelApp,
     safe_spawn,
-    send_probe_advanced
+    send_probe_advanced,
+    format_request_display
 )
 import permissions
 from structures import ScanResult, CapturedRequest, SYNC_MARKER
@@ -320,6 +321,30 @@ class TestScalpelIntegration:
         await wrapper_coro_fail
         assert isinstance(results[0], ScanResult)
         assert results[0].error == "Crash"
+
+    def test_format_request_display_content_type(self):
+        """Test Content-Type tagging in display string (UX)."""
+        # Case 1: JSON
+        req = CapturedRequest(0, "POST", "/api/v1/data", [
+            ('Content-Type', 'application/json; charset=utf-8')
+        ], b'{"a":1}')
+
+        display = format_request_display(req)
+        assert "[JSON]" in display
+
+        # Case 2: Form
+        req_form = CapturedRequest(0, "POST", "/login", [
+            ('content-type', 'application/x-www-form-urlencoded')
+        ], b'user=admin')
+
+        display_form = format_request_display(req_form)
+        assert "[FORM]" in display_form
+
+        # Case 3: No Header
+        req_none = CapturedRequest(0, "GET", "/img.png", [], b'')
+        display_none = format_request_display(req_none)
+        assert "[JSON]" not in display_none
+        assert "[FORM]" not in display_none
 
 class TestAppIntegration:
     """Integration tests for App wiring."""

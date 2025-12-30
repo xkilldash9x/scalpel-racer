@@ -128,7 +128,40 @@ def format_request_display(req) -> str:
     method_str = f"{method_color}{req.method:<6}{Style.RESET_ALL}"
     proto_str = f"{Style.DIM}[{protocol}]{Style.RESET_ALL}"
 
-    return f"{proto_str} {method_str} {clean_url} ({body_len}b){edit_flag}{trunc_flag}"
+    # [PALETTE] UX Improvement: Content-Type Indicator
+    ctype_tag = ""
+    if hasattr(req, 'headers'):
+        headers = req.headers
+        c_val = None
+        if isinstance(headers, list):
+            for k, v in headers:
+                if k.lower() == 'content-type':
+                    c_val = v
+                    break
+        elif isinstance(headers, dict):
+            c_val = headers.get('content-type') or headers.get('Content-Type')
+
+        if c_val:
+            c_val = c_val.lower()
+            if 'json' in c_val:
+                ctype_tag = " [JSON]"
+            elif 'xml' in c_val:
+                ctype_tag = " [XML]"
+            elif 'form-urlencoded' in c_val:
+                ctype_tag = " [FORM]"
+            elif 'multipart' in c_val:
+                ctype_tag = " [MULTI]"
+            elif 'image' in c_val:
+                ctype_tag = " [IMG]"
+            elif 'javascript' in c_val:
+                ctype_tag = " [JS]"
+            elif 'css' in c_val:
+                ctype_tag = " [CSS]"
+
+            if ctype_tag and UI_AVAILABLE:
+                ctype_tag = f"{Fore.YELLOW}{ctype_tag}{Style.RESET_ALL}"
+
+    return f"{proto_str} {method_str} {clean_url}{ctype_tag} ({body_len}b){edit_flag}{trunc_flag}"
 
 def safe_spawn(tg: asyncio.TaskGroup, coro, result_list, index):
     """
