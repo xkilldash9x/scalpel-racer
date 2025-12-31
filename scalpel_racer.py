@@ -128,7 +128,31 @@ def format_request_display(req) -> str:
     method_str = f"{method_color}{req.method:<6}{Style.RESET_ALL}"
     proto_str = f"{Style.DIM}[{protocol}]{Style.RESET_ALL}"
 
-    return f"{proto_str} {method_str} {clean_url} ({body_len}b){edit_flag}{trunc_flag}"
+    # UX Improvement: Content-Type Badges
+    headers = req.headers_dict() if hasattr(req, 'headers_dict') else {}
+    ctype = ""
+    for k, v in headers.items():
+        if k.lower() == 'content-type':
+            ctype = v.lower()
+            break
+
+    badge = ""
+    if 'json' in ctype:
+        badge = f"{Fore.YELLOW}[JSON]{Style.RESET_ALL} "
+    elif 'xml' in ctype:
+        badge = f"{Fore.YELLOW}[XML]{Style.RESET_ALL} "
+    elif 'form' in ctype:
+        badge = f"{Fore.MAGENTA}[FORM]{Style.RESET_ALL} "
+    elif 'image' in ctype:
+        badge = f"{Fore.BLUE}[IMG]{Style.RESET_ALL} "
+    elif 'html' in ctype:
+        badge = f"{Fore.GREEN}[HTML]{Style.RESET_ALL} "
+    elif 'javascript' in ctype or 'css' in ctype:
+        badge = f"{Fore.CYAN}[CODE]{Style.RESET_ALL} "
+    elif 'text/plain' in ctype:
+        badge = f"{Fore.WHITE}[TXT]{Style.RESET_ALL} "
+
+    return f"{proto_str} {method_str} {badge}{clean_url} ({body_len}b){edit_flag}{trunc_flag}"
 
 def safe_spawn(tg: asyncio.TaskGroup, coro, result_list, index):
     """
