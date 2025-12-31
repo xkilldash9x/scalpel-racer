@@ -426,9 +426,10 @@ class ScalpelApp:
     Main Application Class for Scalpel Racer.
     Handles the TUI loop, command parsing, and proxy orchestration.
     """
-    def __init__(self, port, strategy):
+    def __init__(self, port, strategy, bind_address="127.0.0.1"):
         self.port = port
         self.strategy = strategy
+        self.bind_address = bind_address
         self.storage: List[CapturedRequest] = []
         self.command_completer = WordCompleter(
             ['ls', 'last', 'race', 'exit', 'quit', 'q', 'help', '?'], ignore_case=True
@@ -505,7 +506,8 @@ class ScalpelApp:
         self.mgr = ProxyManager(
             tcp_port=self.port,
             ssl_context_factory=self.cert_mgr.get_context_for_host,
-            external_callback=self._handler
+            external_callback=self._handler,
+            bind_address=self.bind_address
         )
         proxy_task = asyncio.create_task(self.mgr.run())
 
@@ -628,6 +630,9 @@ if __name__ == "__main__":
         "-p", "--port", type=int, default=8080, help="Proxy listen port (default: 8080)"
     )
     parser.add_argument(
+        "-b", "--bind", default="127.0.0.1", help="Bind address (default: 127.0.0.1)"
+    )
+    parser.add_argument(
         "-s", "--strategy", default="auto", choices=["auto", "spa", "first-seq"],
         help="Attack strategy"
     )
@@ -637,7 +642,7 @@ if __name__ == "__main__":
     try:
         if sys.platform == 'win32':
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        asyncio.run(ScalpelApp(args.port, args.strategy).run())
+        asyncio.run(ScalpelApp(args.port, args.strategy, args.bind).run())
     except KeyboardInterrupt:
         pass
     except Exception as e: # pylint: disable=broad-exception-caught
