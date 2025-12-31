@@ -344,11 +344,14 @@ class Http11ProxyHandler(BaseProxyHandler):
             up_path = p.path if p.path else "/"
             up_path += ("?" + p.query) if p.query else ""
 
-        u_w.write(f"{method} {up_path} {version_b.decode()}\r\n".encode())
+        # [VECTOR OPTIMIZATION] Batch header writes to minimize syscalls
+        req_buf = [f"{method} {up_path} {version_b.decode()}\r\n".encode()]
         for k, v in headers:
             if k.lower() not in HOP_BY_HOP_HEADERS:
-                u_w.write(f"{k}: {v}\r\n".encode())
-        u_w.write(f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode())
+                req_buf.append(f"{k}: {v}\r\n".encode())
+        req_buf.append(f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode())
+
+        u_w.write(b"".join(req_buf))
 
         if body:
             u_w.write(body)
