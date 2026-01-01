@@ -344,14 +344,26 @@ class Http11ProxyHandler(BaseProxyHandler):
             up_path = p.path if p.path else "/"
             up_path += ("?" + p.query) if p.query else ""
 
-        u_w.write(f"{method} {up_path} {version_b.decode()}\r\n".encode())
+        # [BOLT] Optimized request construction: Batch header writes into a single buffer
+        # Reduces Python loop overhead and asyncio write calls by buffering the headers.
+        req_lines: List[bytes] = [
+            f"{method} {up_path} {version_b.decode()}\r\n".encode()
+        ]
         for k, v in headers:
             if k.lower() not in HOP_BY_HOP_HEADERS:
-                u_w.write(f"{k}: {v}\r\n".encode())
-        u_w.write(f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode())
+                req_lines.append(f"{k}: {v}\r\n".encode())
 
+        req_lines.append(
+            f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+        )
+
+        # Write all headers in one go to minimize overhead
+        u_w.write(b"".join(req_lines))
+
+        # Write body separately to avoid memory duplication (List[bytes] + join creates copy)
         if body:
             u_w.write(body)
+
         await u_w.drain()
         await self._pipe(u_r, self.writer)
         u_w.close()
