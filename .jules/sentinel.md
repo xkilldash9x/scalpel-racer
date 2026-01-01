@@ -1,0 +1,4 @@
+## 2024-02-14 - [Insecure File Permissions for Private Keys]
+**Vulnerability:** Private keys (CA key, server key, and leaf keys) were generated using `open(..., 'wb')` without specifying file permissions. This resulted in keys being readable by other users (0o644 or 0o664 depending on umask), compromising the security of the CA and intercepted traffic.
+**Learning:** Even when `os.makedirs` sets directory permissions to 0o700, files created inside might still have permissive permissions. Standard file opening in Python respects `umask`, which is often 0o022.
+**Prevention:** Use a secure file writing helper (like `_secure_write`) that uses `os.open` with strict mode `0o600` (Read/Write by Owner Only) and `os.O_CREAT | os.O_TRUNC` to ensure atomicity and correct permissions from the moment of creation.

@@ -1,18 +1,14 @@
-#Filename: verify_certs.py
+# Filename: verify_certs.py
 import os
-import sys
 import platform
 import subprocess
 import shutil
-import socket
 import datetime
 import ssl
 import threading
-import atexit
 import stat
 import hashlib
 import ipaddress
-from typing import Optional, Union, List
 
 # Cryptography Imports
 from cryptography import x509
@@ -35,22 +31,24 @@ CA_KEY_PATH = "scalpel_ca.key"
 CA_CERT_PATH = "scalpel_ca.pem"
 CERTS_DIR = "certs"
 
+
 class CertManager:
     """
     Manages the internal Certificate Authority and generates/signs
     leaf certificates for intercepted traffic on the fly.
-    
+
     Includes optimization for Shared Ephemeral Keys and specific support
     for QUIC/HTTP3 listener certificates.
     """
+
     def __init__(self) -> None:
         self.ca_key: Optional[ec.EllipticCurvePrivateKey] = None
         self.ca_cert: Optional[x509.Certificate] = None
         self.lock = threading.Lock()
         self.cache: dict[str, ssl.SSLContext] = {}
-        
+
         # [VECTOR OPTIMIZATION] Shared Ephemeral Key
-        # Pre-generating one key for all leaf certs saves massive overhead 
+        # Pre-generating one key for all leaf certs saves massive overhead
         # during high-traffic interception.
         self.shared_leaf_key = ec.generate_private_key(ec.SECP256R1())
 
@@ -65,12 +63,23 @@ class CertManager:
                 if current_mode != 0o700:
                     os.chmod(CERTS_DIR, 0o700)
             except OSError:
-                pass # Best effort if not owner
-        
+                pass  # Best effort if not owner
+
         self._load_or_generate_ca()
-        
+
         # Generate the static server certs required for the QUIC listener
         self._generate_static_server_cert()
+
+    def _secure_write(self, path: str, data: bytes) -> None:
+        """
+        [SECURITY] Writes data to a file with 0o600 permissions atomically.
+        Uses os.open to avoid race conditions and enforce permissions before writing.
+        """
+        # Open with exclusive creation if possible, or truncate.
+        # Mode 0o600: Read/Write by owner only.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
 
     def _load_or_generate_ca(self) -> None:
         """
@@ -82,30 +91,33 @@ class CertManager:
             try:
                 print("[*] Loading existing Scalpel CA...")
                 with open(CA_KEY_PATH, "rb") as f:
-                    self.ca_key = serialization.load_pem_private_key(f.read(), password=None)
+                    self.ca_key = serialization.load_pem_private_key(
+                        f.read(), password=None)
                 with open(CA_CERT_PATH, "rb") as f:
                     self.ca_cert = x509.load_pem_x509_certificate(f.read())
-                
+
                 # If successful, return early
                 return
             except (ValueError, TypeError, AttributeError, OSError) as e:
-                print(f"[!] CA State Corrupted ({e}). Initiating Self-Healing...")
+                print(
+                    f"[!] CA State Corrupted ({e}). Initiating Self-Healing...")
                 # Fall through to generation logic below
-        
+
         # 2. Generation Logic (Runs if files missing OR corrupted)
         print("[*] Generating new Scalpel CA (ECC P-256)...")
-        
+
         self.ca_key = ec.generate_private_key(ec.SECP256R1())
-        
+
         name = x509.Name([
             x509.NameAttribute(NameOID.COMMON_NAME, "Scalpel Racer CA"),
             x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Red Team Ops"),
-            x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "Automated Security Testing"),
+            x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME,
+                               "Automated Security Testing"),
         ])
-        
+
         # [ROBUSTNESS] Backdate 1 hour to handle clock skew
         now = datetime.datetime.now(datetime.timezone.utc)
-        
+
         builder = x509.CertificateBuilder().subject_name(
             name
         ).issuer_name(
@@ -119,7 +131,7 @@ class CertManager:
         ).not_valid_after(
             now + datetime.timedelta(days=3650)
         )
-        
+
         # [SECURITY] Critical Constraints for CA
         builder = builder.add_extension(
             x509.BasicConstraints(ca=True, path_length=None), critical=True,
@@ -140,17 +152,16 @@ class CertManager:
         self.ca_cert = builder.sign(self.ca_key, hashes.SHA256())
 
         # Write Private Key
-        with open(CA_KEY_PATH, "wb") as f:
-            f.write(self.ca_key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.TraditionalOpenSSL,
-                encryption_algorithm=serialization.NoEncryption(),
-            ))
-            
+        self._secure_write(CA_KEY_PATH, self.ca_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        ))
+
         # Write Certificate
         with open(CA_CERT_PATH, "wb") as f:
             f.write(self.ca_cert.public_bytes(serialization.Encoding.PEM))
-            
+
         print(f"[+] CA Generated/Healed: {CA_CERT_PATH}")
 
     def _get_general_name(self, value: str) -> x509.GeneralName:
@@ -178,14 +189,14 @@ class CertManager:
             return
 
         print("[*] Generating static QUIC/HTTP3 listener certificates (server.crt)...")
-        
+
         # Use the shared leaf key for the server cert as well
         key = self.shared_leaf_key
-        
+
         # We generally use localhost or the machine hostname for the main listener
         # Clients will SNI negotiate for the actual target later
         common_name = "localhost"
-        
+
         subject = x509.Name([
             x509.NameAttribute(NameOID.COMMON_NAME, common_name),
         ])
@@ -225,13 +236,12 @@ class CertManager:
 
         cert = builder.sign(self.ca_key, hashes.SHA256())
 
-        with open(server_key_path, "wb") as f:
-            f.write(key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.TraditionalOpenSSL,
-                encryption_algorithm=serialization.NoEncryption(),
-            ))
-        
+        self._secure_write(server_key_path, key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        ))
+
         with open(server_crt_path, "wb") as f:
             f.write(cert.public_bytes(serialization.Encoding.PEM))
 
@@ -247,11 +257,12 @@ class CertManager:
 
             # [SECURITY FIX] Hash hostname to create safe, constant-length filename
             # This handles wildcards (e.g. *.com), IPs, and prevents collision/traversal
-            host_hash = hashlib.sha256(hostname.encode('utf-8', errors='ignore')).hexdigest()
-            
+            host_hash = hashlib.sha256(hostname.encode(
+                'utf-8', errors='ignore')).hexdigest()
+
             # [VECTOR OPTIMIZATION] Use shared key if available
             key = self.shared_leaf_key
-            
+
             # CommonName is limited to 64 chars. Hostnames can be longer.
             # We truncate for CN, but the full identity is preserved in SAN.
             cn_val = hostname[:64]
@@ -259,7 +270,7 @@ class CertManager:
             subject = x509.Name([
                 x509.NameAttribute(NameOID.COMMON_NAME, cn_val),
             ])
-            
+
             now = datetime.datetime.now(datetime.timezone.utc)
 
             # Build the leaf certificate
@@ -276,13 +287,14 @@ class CertManager:
             ).not_valid_after(
                 now + datetime.timedelta(days=365)
             )
-            
+
             # [FIX] Add SAN with correct Type (IP vs DNS)
             builder = builder.add_extension(
-                x509.SubjectAlternativeName([self._get_general_name(hostname)]),
+                x509.SubjectAlternativeName(
+                    [self._get_general_name(hostname)]),
                 critical=False,
             )
-            
+
             # [SECURITY] Add KeyUsage and EKU for strict client compliance
             builder = builder.add_extension(
                 x509.KeyUsage(
@@ -299,7 +311,7 @@ class CertManager:
             ).add_extension(
                 x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
             )
-            
+
             cert = builder.sign(self.ca_key, hashes.SHA256())
 
             # Serialize
@@ -313,10 +325,9 @@ class CertManager:
             # [SECURITY] Use hash for filesystem paths
             key_path = os.path.join(CERTS_DIR, f"{host_hash}.key")
             cert_path = os.path.join(CERTS_DIR, f"{host_hash}.crt")
-            
+
             try:
-                with open(key_path, "wb") as f:
-                    f.write(key_pem)
+                self._secure_write(key_path, key_pem)
                 with open(cert_path, "wb") as f:
                     f.write(cert_pem)
             except OSError as e:
@@ -330,12 +341,13 @@ class CertManager:
             # [CRITICAL UPDATE] Inject Key Logging Hook Here
             if os.environ.get("SSLKEYLOGFILE"):
                 ctx.keylog_filename = os.environ["SSLKEYLOGFILE"]
-            
+
             # Support HTTP/3 (h3), HTTP/2 (h2) and HTTP/1.1
             ctx.set_alpn_protocols(["h3", "h2", "http/1.1"])
-            
+
             self.cache[hostname] = ctx
             return ctx
+
 
 def install_to_trust_store() -> None:
     """
@@ -347,47 +359,53 @@ def install_to_trust_store() -> None:
         return
 
     system = platform.system()
-    
+
     try:
         if system == "Linux":
             # Debian/Ubuntu/Kali Standard Location
             ca_dir = "/usr/local/share/ca-certificates"
-            
+
             if os.path.exists(ca_dir):
                 # Check for Root
                 if os.geteuid() != 0:
-                    print(f"[!] Root privileges required to install certificate to {ca_dir}.")
+                    print(
+                        f"[!] Root privileges required to install certificate to {ca_dir}.")
                     print(f"    Please run: sudo python3 verify_certs.py")
                     return
-                
+
                 # Copy to system store with .crt extension (required by update-ca-certificates)
                 dest_path = os.path.join(ca_dir, "scalpel_racer_ca.crt")
                 print(f"[*] Copying {CA_CERT_PATH} to {dest_path}...")
                 shutil.copy(CA_CERT_PATH, dest_path)
-                
+
                 # Update store
                 print("[*] Updating CA certificates...")
                 subprocess.check_call(["update-ca-certificates"])
                 print("[+] CA Certificate installed successfully.")
             else:
-                print(f"[!] Directory {ca_dir} not found. Automatic installation not supported for this distro.")
-                print(f"    Please manually copy {CA_CERT_PATH} to your trusted CA store.")
+                print(
+                    f"[!] Directory {ca_dir} not found. Automatic installation not supported for this distro.")
+                print(
+                    f"    Please manually copy {CA_CERT_PATH} to your trusted CA store.")
 
-        elif system == "Darwin": # MacOS
-            print("[*] Detected macOS. Attempting to add to System Keychain (requires sudo)...")
+        elif system == "Darwin":  # MacOS
+            print(
+                "[*] Detected macOS. Attempting to add to System Keychain (requires sudo)...")
             subprocess.check_call([
-                "sudo", "security", "add-trusted-cert", "-d", 
+                "sudo", "security", "add-trusted-cert", "-d",
                 "-r", "trustRoot", "-k", "/Library/Keychains/System.keychain", CA_CERT_PATH
             ])
             print("[+] CA Certificate installed to System Keychain.")
 
         else:
-            print(f"[!] Auto-install not supported for {system}. Please install '{CA_CERT_PATH}' manually.")
+            print(
+                f"[!] Auto-install not supported for {system}. Please install '{CA_CERT_PATH}' manually.")
 
     except subprocess.CalledProcessError as e:
         print(f"[!] System command failed: {e}")
     except Exception as e:
         print(f"[!] Failed to install certificate: {e}")
+
 
 def install_to_chrome_nss(ca_cert_path: str) -> None:
     """
@@ -397,28 +415,29 @@ def install_to_chrome_nss(ca_cert_path: str) -> None:
     # This feature is only relevant on Linux
     if platform.system() != "Linux":
         return
-        
+
     nss_db_path = os.path.expanduser("~/.pki/nssdb")
-    
+
     # -- Check for certutil --
     if not shutil.which("certutil"):
         print("[!] 'certutil' command not found. Skipping NSS database installation.")
         print("    Please install the 'libnss3-tools' package (or equivalent for your distro).")
         return
-        
+
     # -- Ensure NSS Directory Exists --
     if not os.path.exists(nss_db_path):
         print(f"[*] Creating NSS database directory at {nss_db_path}")
         try:
             os.makedirs(nss_db_path, mode=0o700)
             # Initialize a new DB if it does not exist
-            subprocess.run(["certutil", "-N", "-d", f"sql:{nss_db_path}", "--empty-password"], check=True)
+            subprocess.run(
+                ["certutil", "-N", "-d", f"sql:{nss_db_path}", "--empty-password"], check=True)
         except (OSError, subprocess.CalledProcessError) as e:
-             print(f"[!] Failed to initialize NSS DB: {e}")
-             return
+            print(f"[!] Failed to initialize NSS DB: {e}")
+            return
 
     print(f"[*] Adding {ca_cert_path} to Chrome NSS database...")
-    
+
     try:
         # -- Add Certificate --
         # -A: Add certificate
@@ -431,14 +450,14 @@ def install_to_chrome_nss(ca_cert_path: str) -> None:
             "-n", "Scalpel Racer CA",
             "-i", ca_cert_path
         ], check=True, capture_output=True)
-        
+
         print("[+] Successfully added Scalpel CA to Chrome NSS database.")
-        
+
     except subprocess.CalledProcessError as e:
         # Ignore error if cert is already in DB, otherwise print error
         err_msg = e.stderr.decode() if e.stderr else str(e)
         if "is already installed" not in err_msg:
-             print(f"[!] Failed to update NSS database: {err_msg}")
+            print(f"[!] Failed to update NSS database: {err_msg}")
 
 
 if __name__ == "__main__":
