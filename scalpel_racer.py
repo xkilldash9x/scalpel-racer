@@ -426,9 +426,10 @@ class ScalpelApp:
     Main Application Class for Scalpel Racer.
     Handles the TUI loop, command parsing, and proxy orchestration.
     """
-    def __init__(self, port, strategy):
+    def __init__(self, port, strategy, bind_address="127.0.0.1"):
         self.port = port
         self.strategy = strategy
+        self.bind_address = bind_address
         self.storage: List[CapturedRequest] = []
         self.command_completer = WordCompleter(
             ['ls', 'last', 'race', 'exit', 'quit', 'q', 'help', '?'], ignore_case=True
@@ -467,7 +468,7 @@ class ScalpelApp:
         if not UI_AVAILABLE:
             return None
         return HTML(
-            f' <b><style bg="ansiblue"> Proxy: :{self.port} </style></b>  '
+            f' <b><style bg="ansiblue"> Proxy: {self.bind_address}:{self.port} </style></b>  '
             f'<b><style bg="ansimagenta"> Mode: {self.strategy} </style></b>  '
             f'<b><style bg="ansigreen"> Captures: {self.capture_count} </style></b> '
             f'<style fg="gray"> [F1] Help [F5] List [Alt-r] Race Last</style>'
@@ -499,11 +500,12 @@ class ScalpelApp:
 
         print_formatted_text(ANSI(BANNER.format(Fore=Fore, Style=Style)))
         print_formatted_text(
-            ANSI(f"{Fore.YELLOW}[*] Starting Proxy on port {self.port}...{Style.RESET_ALL}")
+            ANSI(f"{Fore.YELLOW}[*] Starting Proxy on {self.bind_address}:{self.port}...{Style.RESET_ALL}")
         )
 
         self.mgr = ProxyManager(
             tcp_port=self.port,
+            bind_host=self.bind_address,
             ssl_context_factory=self.cert_mgr.get_context_for_host,
             external_callback=self._handler
         )
@@ -533,7 +535,7 @@ class ScalpelApp:
                             )
                             print_formatted_text(
                                 ANSI(f"{Fore.CYAN}  Configure your browser/client to proxy "
-                                     f"through {Fore.WHITE}localhost:{self.port}{Style.RESET_ALL}")
+                                     f"through {Fore.WHITE}{self.bind_address}:{self.port}{Style.RESET_ALL}")
                             )
                         else:
                             start_idx = max(0, len(self.storage) - 15)
@@ -567,7 +569,7 @@ class ScalpelApp:
                         )
                         print_formatted_text(
                             ANSI(f"  • Configure your browser to proxy HTTP traffic to "
-                                 f"{Fore.WHITE}127.0.0.1:{self.port}{Style.RESET_ALL}")
+                                 f"{Fore.WHITE}{self.bind_address}:{self.port}{Style.RESET_ALL}")
                         )
                         print_formatted_text(
                             ANSI(f"  • Race commands accept optional thread count: "
@@ -628,6 +630,9 @@ if __name__ == "__main__":
         "-p", "--port", type=int, default=8080, help="Proxy listen port (default: 8080)"
     )
     parser.add_argument(
+        "-b", "--bind", type=str, default="127.0.0.1", help="Bind address (default: 127.0.0.1)"
+    )
+    parser.add_argument(
         "-s", "--strategy", default="auto", choices=["auto", "spa", "first-seq"],
         help="Attack strategy"
     )
@@ -637,7 +642,7 @@ if __name__ == "__main__":
     try:
         if sys.platform == 'win32':
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        asyncio.run(ScalpelApp(args.port, args.strategy).run())
+        asyncio.run(ScalpelApp(args.port, args.strategy, args.bind).run())
     except KeyboardInterrupt:
         pass
     except Exception as e: # pylint: disable=broad-exception-caught
