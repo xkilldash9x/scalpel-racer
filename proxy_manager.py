@@ -329,13 +329,14 @@ class QuicServer:
         )
 
 class ProxyManager:
-    def __init__(self, tcp_port=8080, quic_port=4433, ssl_context_factory=None, external_callback=None):
+    def __init__(self, tcp_port=8080, quic_port=4433, bind_host="127.0.0.1", ssl_context_factory=None, external_callback=None):
         self.tcp_port = tcp_port
         self.quic_port = quic_port
+        self.bind_host = bind_host
         self.ssl_context_factory = ssl_context_factory
         self.external_callback = external_callback
         self.count = 0
-        self.quic_server = QuicServer("0.0.0.0", self.quic_port, self.unified_capture_callback, ssl_context_factory)
+        self.quic_server = QuicServer(self.bind_host, self.quic_port, self.unified_capture_callback, ssl_context_factory)
         self.stop_event = asyncio.Event()
         self.proxy_task = None
 
@@ -362,7 +363,7 @@ class ProxyManager:
                 pass
 
     async def run(self, target_override=None, scope_regex=None, strict_mode=True):
-        log.info("=== Starting Proxy Manager ===")
+        log.info(f"=== Starting Proxy Manager (Binding to {self.bind_host}) ===")
         scope_pattern = None
         if scope_regex:
             import re
@@ -375,7 +376,7 @@ class ProxyManager:
                 self.unified_capture_callback(level, "SYSTEM", msg)
                 
         self.proxy_task = asyncio.create_task(proxy_core.start_proxy_server(
-                "0.0.0.0", self.tcp_port, core_adapter, target_override=target_override,
+                self.bind_host, self.tcp_port, core_adapter, target_override=target_override,
                 scope_pattern=scope_pattern, ssl_context_factory=self.ssl_context_factory, strict_mode=strict_mode))
         
         await self.quic_server.start()
@@ -393,7 +394,7 @@ class ProxyManager:
         self.stop_event.set()
 
 if __name__ == "__main__":
-    manager = ProxyManager(tcp_port=8080, quic_port=4433)
+    manager = ProxyManager(tcp_port=8080, quic_port=4433, bind_host="127.0.0.1")
     try:
         asyncio.run(manager.run())
     except KeyboardInterrupt:
