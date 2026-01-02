@@ -91,9 +91,8 @@ class Http11ProxyHandler(BaseProxyHandler):
                     self._buffer_offset = 0
 
                 try:
-                    data = await asyncio.wait_for(
-                        self.reader.read(READ_CHUNK_SIZE), timeout=IDLE_TIMEOUT
-                    )
+                    async with asyncio.timeout(IDLE_TIMEOUT):
+                        data = await self.reader.read(READ_CHUNK_SIZE)
                 except asyncio.TimeoutError as exc:
                     raise ProxyError("Read Timeout (Idle)") from exc
 
@@ -245,9 +244,8 @@ class Http11ProxyHandler(BaseProxyHandler):
                     self.log("ERROR", f"MITM Upgrade Failed: {e}")
                     return
         try:
-            u_r, u_w = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=UPSTREAM_CONNECT_TIMEOUT
-            )
+            async with asyncio.timeout(UPSTREAM_CONNECT_TIMEOUT):
+                u_r, u_w = await asyncio.open_connection(host, port)
             self.writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await self.writer.drain()
             if self.buffer and self._buffer_offset < len(self.buffer):
@@ -396,9 +394,8 @@ class Http11ProxyHandler(BaseProxyHandler):
             if len(self.buffer) > MAX_CAPTURE_BODY_SIZE + 4096:
                 raise PayloadTooLargeError("Buffer limit exceeded.")
             try:
-                data = await asyncio.wait_for(
-                    self.reader.read(READ_CHUNK_SIZE), timeout=IDLE_TIMEOUT
-                )
+                async with asyncio.timeout(IDLE_TIMEOUT):
+                    data = await self.reader.read(READ_CHUNK_SIZE)
             except asyncio.TimeoutError as exc:
                 raise ProxyError("Read Timeout (Idle) in Body") from exc
             if not data:
@@ -542,9 +539,8 @@ class DualProtocolHandler:
                 if len(buffer) >= required:
                     break
                 try:
-                    chunk = await asyncio.wait_for(
-                        self.reader.read(required - len(buffer)), timeout=0.5
-                    )
+                    async with asyncio.timeout(0.5):
+                        chunk = await self.reader.read(required - len(buffer))
                     if not chunk:
                         break
                     buffer.extend(chunk)
