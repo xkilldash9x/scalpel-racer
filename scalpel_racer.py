@@ -363,12 +363,15 @@ def analyze_results(results: List[ScanResult]):
             group = signatures[key]
             snippet = group[0].body_snippet if group and group[0].body_snippet else ""
             hash_short = body_hash[:16] if body_hash else "N/A"
+            # [PALETTE] Granular status code coloring for better scannability
             if 200 <= status_code < 300:
                 sc_color = Fore.GREEN
-            elif status_code >= 500:
-                sc_color = Fore.RED
-            else:
+            elif 300 <= status_code < 400:
+                sc_color = Fore.CYAN
+            elif 400 <= status_code < 500:
                 sc_color = Fore.YELLOW
+            else:
+                sc_color = Fore.RED
             print_formatted_text(
                 ANSI(f"  {len(group):<6} {sc_color}{status_code:<6}{Style.RESET_ALL} "
                      f"{hash_short:<16} {snippet}")
@@ -572,6 +575,11 @@ class ScalpelApp:
                         print_formatted_text(
                             ANSI(f"  • Race commands accept optional thread count: "
                                  f"{Fore.CYAN}race <id> 20{Style.RESET_ALL}")
+                        )
+                        print_formatted_text(
+                            ANSI(f"  • Shortcuts: {Fore.MAGENTA}[F1]{Style.RESET_ALL} Help, "
+                                 f"{Fore.MAGENTA}[F5]{Style.RESET_ALL} List, "
+                                 f"{Fore.MAGENTA}[Alt+r]{Style.RESET_ALL} Race Last")
                         )
 
                     elif cmd == 'last':
