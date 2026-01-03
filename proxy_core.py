@@ -118,7 +118,8 @@ class Http11ProxyHandler(BaseProxyHandler):
 
             line_end = lf_index - 1 if is_crlf else lf_index
             if line_end > self._buffer_offset:
-                line = bytes(self.buffer[self._buffer_offset:line_end])
+                # [OPTIMIZATION] Zero-copy slicing using memoryview
+                line = bytes(memoryview(self.buffer)[self._buffer_offset:line_end])
             else:
                 line = b""
 
@@ -412,7 +413,8 @@ class Http11ProxyHandler(BaseProxyHandler):
                 self._buffer_offset = 0
             self.buffer.extend(data)
 
-        chunk = bytes(self.buffer[self._buffer_offset : self._buffer_offset + n])
+        # [OPTIMIZATION] Zero-copy slicing using memoryview
+        chunk = bytes(memoryview(self.buffer)[self._buffer_offset : self._buffer_offset + n])
         self._buffer_offset += n
         return chunk
 
