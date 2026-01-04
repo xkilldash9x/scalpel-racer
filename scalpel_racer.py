@@ -522,7 +522,10 @@ class ScalpelApp:
                         continue
                     cmd = parts[0].lower()
 
+                    handled = False
+
                     if cmd == 'ls':
+                        handled = True
                         print_formatted_text(
                             ANSI(f"\n{Fore.YELLOW}--- History ({len(self.storage)}) "
                                  f"---{Style.RESET_ALL}")
@@ -543,6 +546,7 @@ class ScalpelApp:
                                 print_formatted_text(ANSI(f"[{i}] {txt}"))
 
                     elif cmd in ('help', '?'):
+                        handled = True
                         print_formatted_text(
                             ANSI(f"\n{Fore.YELLOW}--- Available Commands ---{Style.RESET_ALL}")
                         )
@@ -582,6 +586,7 @@ class ScalpelApp:
                         cmd = 'race'
 
                     if cmd == 'race':
+                        handled = True
                         if len(parts) < 2:
                             print_formatted_text("usage: race <id> [threads]")
                             continue
@@ -610,6 +615,11 @@ class ScalpelApp:
                     elif cmd in ('q', 'exit', 'quit'):
                         print_formatted_text("Shutting down...")
                         break
+
+                    if not handled:
+                        msg = f"{Fore.RED}Unknown command: {cmd}{Style.RESET_ALL}"
+                        print_formatted_text(ANSI(msg))
+
                 except (KeyboardInterrupt, EOFError):
                     break
 
