@@ -289,12 +289,22 @@ func TestController_ReleaseAll(t *testing.T) {
 	// FIX: Wait for async release goroutine
 	time.Sleep(50 * time.Millisecond)
 
+	// Check Controller state (requires c.mu)
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if len(c.heldIDs) != 0 {
+	heldCount := len(c.heldIDs)
+	c.mu.Unlock()
+
+	if heldCount != 0 {
 		t.Error("ReleaseAll failed to clear held IDs")
 	}
-	if mockQ.Verdicts[999] != nfqueue.NfAccept {
+
+	// Check MockQueue state (requires mockQ.mu)
+	// FIX: Must acquire lock to prevent data race with background release goroutine
+	mockQ.mu.Lock()
+	val := mockQ.Verdicts[999]
+	mockQ.mu.Unlock()
+
+	if val != nfqueue.NfAccept {
 		t.Error("ReleaseAll did not set Accept verdict")
 	}
 }
