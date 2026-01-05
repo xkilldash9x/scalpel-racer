@@ -27,7 +27,8 @@ func (m Model) View() string {
 			}
 			msg := lipgloss.JoinVertical(lipgloss.Center,
 				emptyTitleStyle.Render("Waiting for Traffic"),
-				emptySubtitleStyle.Render("Configure your client to proxy through the listener."),
+				emptySubtitleStyle.Render(fmt.Sprintf("Listening on 127.0.0.1:%d", m.ProxyPort)),
+				emptySubtitleStyle.Render("Configure your client to proxy through this listener."),
 			)
 			content = lipgloss.Place(m.Width, h, lipgloss.Center, lipgloss.Center, msg)
 		} else {

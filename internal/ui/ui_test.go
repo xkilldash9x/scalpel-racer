@@ -54,7 +54,7 @@ func update(m Model, msg tea.Msg) (Model, tea.Cmd) {
 func TestUI_Workflow(t *testing.T) {
 	logger := zap.NewNop()
 	racer := engine.NewRacer(&MockFactory{}, logger)
-	m := NewModel(logger, racer)
+	m := NewModel(logger, racer, 8080)
 
 	// 1. Initial State
 	if !strings.Contains(m.View(), "CAPTURE") {
@@ -80,7 +80,11 @@ func TestUI_Workflow(t *testing.T) {
 	if m.Strategy != "h1" {
 		t.Error("Strategy not toggled to h1")
 	}
-	m, _ = update(m, tea.KeyMsg{Type: tea.KeyTab}) // Toggle back
+	m, _ = update(m, tea.KeyMsg{Type: tea.KeyTab}) // Toggle to h3
+	if m.Strategy != "h3" {
+		t.Error("Strategy not toggled to h3")
+	}
+	m, _ = update(m, tea.KeyMsg{Type: tea.KeyTab}) // Toggle back to h2
 	if m.Strategy != "h2" {
 		t.Error("Strategy not toggled back to h2")
 	}

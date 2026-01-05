@@ -93,7 +93,7 @@ func Run(args []string, runner UIRunner) error {
 	racer := engine.NewRacer(&engine.RealClientFactory{}, logger)
 
 	// 6. Start UI
-	model := ui.NewModel(logger, racer)
+	model := ui.NewModel(logger, racer, *port)
 
 	// Redirect BubbleTea's internal logs to a file as well, just in case
 	if f, err := tea.LogToFile("debug.log", "debug"); err == nil {

@@ -19,7 +19,7 @@ func TestUI_StateTransitions(t *testing.T) {
 	racer := engine.NewRacer(&MockFactory{}, logger)
 
 	t.Run("CancelEdit", func(t *testing.T) {
-		m := NewModel(logger, racer)
+		m := NewModel(logger, racer, 8080)
 		m.State = StateEditing
 		m, _ = update(m, tea.KeyMsg{Type: tea.KeyEsc})
 		if m.State != StateIntercepting {
@@ -28,7 +28,7 @@ func TestUI_StateTransitions(t *testing.T) {
 	})
 
 	t.Run("BackFromResults", func(t *testing.T) {
-		m := NewModel(logger, racer)
+		m := NewModel(logger, racer, 8080)
 		m.State = StateResults
 		m, _ = update(m, tea.KeyMsg{Type: tea.KeyEsc})
 		if m.State != StateIntercepting {
@@ -37,7 +37,7 @@ func TestUI_StateTransitions(t *testing.T) {
 	})
 
 	t.Run("Quit", func(t *testing.T) {
-		m := NewModel(logger, racer)
+		m := NewModel(logger, racer, 8080)
 		_, cmd := update(m, tea.KeyMsg{Type: tea.KeyCtrlC})
 		if cmd == nil {
 			t.Fatal("Expected a quit command")
@@ -51,7 +51,7 @@ func TestUI_StateTransitions(t *testing.T) {
 func TestUI_ResultsView(t *testing.T) {
 	logger := zap.NewNop()
 	racer := engine.NewRacer(&MockFactory{}, logger)
-	m := NewModel(logger, racer)
+	m := NewModel(logger, racer, 8080)
 
 	results := []models.ScanResult{
 		{Index: 0, StatusCode: 200, Body: []byte("a")},
@@ -98,7 +98,7 @@ func TestUI_ErrorHandling(t *testing.T) {
 	racer := engine.NewRacer(&MockFactory{}, logger)
 
 	t.Run("BodyLoadError", func(t *testing.T) {
-		m := NewModel(logger, racer)
+		m := NewModel(logger, racer, 8080)
 		m, _ = update(m, BodyLoadedMsg{Err: errors.New("test error")})
 		if m.State != StateIntercepting {
 			t.Error("Should return to intercepting state on body load error")
@@ -109,7 +109,7 @@ func TestUI_ErrorHandling(t *testing.T) {
 	})
 
 	t.Run("RequestParseError", func(t *testing.T) {
-		m := NewModel(logger, racer)
+		m := NewModel(logger, racer, 8080)
 		m.State = StateEditing
 		m.SelectedReq = &models.CapturedRequest{}
 		m.Editor.SetValue("invalid request")
@@ -126,7 +126,7 @@ func TestUI_ErrorHandling(t *testing.T) {
 func TestUI_View(t *testing.T) {
 	logger := zap.NewNop()
 	racer := engine.NewRacer(&MockFactory{}, logger)
-	m := NewModel(logger, racer)
+	m := NewModel(logger, racer, 8080)
 
 	// To get some dimensions
 	m, _ = update(m, tea.WindowSizeMsg{Width: 80, Height: 24})

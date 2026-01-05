@@ -122,6 +122,7 @@ type Model struct {
 	Resolver Resolver
 
 	// Config
+	ProxyPort   int
 	Concurrency int
 	Strategy    string
 
@@ -147,7 +148,7 @@ type Model struct {
 	LastError     string
 }
 
-func NewModel(logger *zap.Logger, racer *engine.Racer) Model {
+func NewModel(logger *zap.Logger, racer *engine.Racer, proxyPort int) Model {
 	// Table Setup
 	t := table.New(
 		table.WithColumns([]table.Column{
@@ -204,6 +205,7 @@ func NewModel(logger *zap.Logger, racer *engine.Racer) Model {
 		Keys:        DefaultKeyMap(),
 		Logger:      logger,
 		Resolver:    DefaultResolver{},
+		ProxyPort:   proxyPort,
 		Concurrency: 20,
 		Strategy:    "h2",
 		Racer:       racer,
