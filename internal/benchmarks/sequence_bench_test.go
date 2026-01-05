@@ -1,3 +1,4 @@
+// FILENAME: internal/benchmarks/bench_test.go
 package benchmarks
 
 import (
@@ -9,8 +10,8 @@ import (
 	"go.uber.org/zap"
 )
 
-// BenchmarkPlanning measures the overhead of the split calculation logic.
-func BenchmarkPlanning(b *testing.B) {
+// BenchmarkPlanner measures the overhead of the split calculation logic.
+func BenchmarkPlanner(b *testing.B) {
 	body := []byte("Part1{{SYNC}}Part2{{SYNC}}Part3")
 	req := &models.CapturedRequest{
 		Method: "POST",
@@ -28,7 +29,7 @@ func BenchmarkPlanning(b *testing.B) {
 }
 
 // BenchmarkRaceOrchestration measures the Engine overhead using real factory instantiation.
-func BenchmarkRaceOrchestrator(b *testing.B) {
+func BenchmarkRaceOrchestration(b *testing.B) {
 	// Using RealClientFactory with invalid URL to measure init overhead
 	racer := engine.NewRacer(&engine.RealClientFactory{}, zap.NewNop())
 	req := &models.CapturedRequest{URL: "http://127.0.0.1:0", Body: []byte("A")}
@@ -36,5 +37,17 @@ func BenchmarkRaceOrchestrator(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		racer.RunH1Race(context.Background(), req, 1)
+	}
+}
+
+// BenchmarkSequenceRace measures the overhead of the two-request sequence engine.
+func BenchmarkSequenceRace(b *testing.B) {
+	racer := engine.NewRacer(&engine.RealClientFactory{}, zap.NewNop())
+	reqA := &models.CapturedRequest{URL: "http://127.0.0.1:0/a", Body: []byte("A")}
+	reqB := &models.CapturedRequest{URL: "http://127.0.0.1:0/b", Body: []byte("B")}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = racer.RunSequenceRace(context.Background(), reqA, reqB)
 	}
 }

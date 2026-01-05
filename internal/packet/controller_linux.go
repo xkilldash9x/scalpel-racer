@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"runtime"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -30,6 +31,7 @@ var (
 	}
 )
 
+// PacketQueue abstracts the NFQUEUE interaction.
 type PacketQueue interface {
 	RegisterWithErrorFunc(ctx context.Context, fn nfqueue.HookFunc, errFn nfqueue.ErrorFunc) error
 	SetVerdict(id uint32, verdict int) error
@@ -50,6 +52,7 @@ func (r *realPacketQueue) Close() {
 	r.q.Close()
 }
 
+// Controller implements "First-Sequence Sync" using Linux NFQUEUE.
 type Controller struct {
 	TargetIP    string
 	TargetPort  int
@@ -81,9 +84,8 @@ func NewController(ip string, port int, concurrency int, logger *zap.Logger) *Co
 func (c *Controller) Start(ctx context.Context) error {
 	c.cleanupRules()
 
-	// Bypass ensures traffic flows if we crash.
-	// Filter strictly for SYN,PSH,ACK packets to reduce noise if needed,
-	// but for now, we keep it broad to catch the data payload.
+	// 1. iptables Rule
+	// Queue TCP packets for the target. Fail-open (bypass) if userspace crashes.
 	ruleArgs := []string{
 		"-I", "OUTPUT", "1",
 		"-p", "tcp",
@@ -94,18 +96,19 @@ func (c *Controller) Start(ctx context.Context) error {
 		"--queue-bypass",
 	}
 
-	c.Logger.Info("Applying iptables rule", zap.Strings("args", ruleArgs))
+	c.Logger.Info("Applying First-Sequence Sync iptables rule", zap.Strings("args", ruleArgs))
 
 	if err := execCommand("iptables", ruleArgs...).Run(); err != nil {
 		return fmt.Errorf("failed to add iptables rule: %w", err)
 	}
 
+	// 2. Open NFQUEUE
 	config := nfqueue.Config{
 		NfQueue:      uint16(QueueNum),
 		MaxPacketLen: 0xFFFF,
-		MaxQueueLen:  1024,
+		MaxQueueLen:  4096,
 		Copymode:     nfqueue.NfQnlCopyPacket,
-		WriteTimeout: 15 * time.Millisecond,
+		WriteTimeout: 5 * time.Millisecond,
 	}
 
 	nf, err := nfqueueOpen(&config)
@@ -115,6 +118,7 @@ func (c *Controller) Start(ctx context.Context) error {
 	}
 	c.nfq = nf
 
+	// 3. Register Callback
 	fn := func(a nfqueue.Attribute) int {
 		defer func() {
 			if r := recover(); r != nil {
@@ -135,15 +139,21 @@ func (c *Controller) Start(ctx context.Context) error {
 		}
 
 		verdict := c.evaluatePacket(id, payload)
+
+		// If evaluate returns -1, we are holding the packet (no verdict).
 		if verdict != -1 {
 			if err := c.nfq.SetVerdict(id, verdict); err != nil {
-				c.Logger.Error("failed to set verdict", zap.Error(err))
+				c.Logger.Debug("failed to set verdict", zap.Error(err))
 			}
 		}
 		return 0
 	}
 
 	go func() {
+		// Pin to OS thread for stability
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+
 		if err := nf.RegisterWithErrorFunc(ctx, fn, func(e error) int {
 			c.Logger.Debug("nfqueue error", zap.Error(e))
 			return 0
@@ -155,75 +165,53 @@ func (c *Controller) Start(ctx context.Context) error {
 	return nil
 }
 
+// evaluatePacket determines if the packet is the start of a new flow.
 func (c *Controller) evaluatePacket(id uint32, payload []byte) int {
-	// OPTIMIZATION: Decode packet OUTSIDE the lock.
-	// Decoding is CPU intensive. Doing it inside the lock increases the critical section
-	// duration, increasing jitter for the release burst. "Attosecond" level precision
-	// requires minimal locking.
-
 	if len(payload) == 0 {
 		return nfqueue.NfAccept
 	}
 
-	// FIX: Use a loose parser that ignores unsupported trailing data.
-	// We decode IPv4 first, but check for IPv6 if v4 fails.
-	decoder := gopacket.NewDecodingLayerParser(layers.LayerTypeIPv4)
-	decoder.IgnoreUnsupported = true
+	// OPTIMIZATION: Decode logic
 	var ip4 layers.IPv4
 	var ip6 layers.IPv6
 	var tcp layers.TCP
+
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeIPv4, &ip4, &tcp)
+	parser.IgnoreUnsupported = true
 	decoded := []gopacket.LayerType{}
 
-	// Attempt IPv4 first
-	decoder.SetDecodingLayerContainer(gopacket.DecodingLayerArray(nil))
-	decoder.AddDecodingLayer(&ip4)
-	decoder.AddDecodingLayer(&tcp)
-
-	err := decoder.DecodeLayers(payload, &decoded)
-	if err != nil {
-		// Fallback: Try IPv6
-		decoder = gopacket.NewDecodingLayerParser(layers.LayerTypeIPv6)
-		decoder.IgnoreUnsupported = true
-		decoder.AddDecodingLayer(&ip6)
-		decoder.AddDecodingLayer(&tcp)
-		decoded = []gopacket.LayerType{}
-		_ = decoder.DecodeLayers(payload, &decoded)
+	if err := parser.DecodeLayers(payload, &decoded); err != nil {
+		// Fallback IPv6
+		parser = gopacket.NewDecodingLayerParser(layers.LayerTypeIPv6, &ip6, &tcp)
+		parser.IgnoreUnsupported = true
+		_ = parser.DecodeLayers(payload, &decoded)
 	}
 
 	hasTCP := false
-	var srcIP string
-	var srcPort layers.TCPPort
+	var srcKey string
 
 	for _, layerType := range decoded {
 		if layerType == layers.LayerTypeTCP {
 			hasTCP = true
-			srcPort = tcp.SrcPort
 		}
 		if layerType == layers.LayerTypeIPv4 {
-			srcIP = ip4.SrcIP.String()
+			srcKey = fmt.Sprintf("%s:%d", ip4.SrcIP, tcp.SrcPort)
 		}
 		if layerType == layers.LayerTypeIPv6 {
-			srcIP = ip6.SrcIP.String()
+			srcKey = fmt.Sprintf("%s:%d", ip6.SrcIP, tcp.SrcPort)
 		}
 	}
 
 	if !hasTCP {
-		// Just accept non-TCP traffic for this target without logging to avoid noise
 		return nfqueue.NfAccept
 	}
 
-	// Pre-calculate flow ID to avoid allocating inside the lock if possible,
-	// though string creation is still overhead.
-	// Note: We only care about holding DATA packets.
-	isDataPacket := len(tcp.Payload) > 0
-
-	if !isDataPacket {
+	// First-Sequence Logic: strictly hold packets that contain payload.
+	// Allow handshakes (SYN) and empty ACKs to pass.
+	if len(tcp.Payload) == 0 {
 		return nfqueue.NfAccept
 	}
 
-	flowID := fmt.Sprintf("%s:%d", srcIP, srcPort)
-
-	// --- CRITICAL SECTION START ---
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -231,32 +219,35 @@ func (c *Controller) evaluatePacket(id uint32, payload []byte) int {
 		return nfqueue.NfAccept
 	}
 
+	// If barrier broken, pass everything
 	select {
 	case <-c.releaseChan:
 		return nfqueue.NfAccept
 	default:
 	}
 
-	if len(c.heldIDs) == 0 {
-		// Safety Valve: 100ms max hold time.
-		// If fewer than Concurrency flows arrive (e.g., failed connects),
-		// this ensures we don't hold the healthy ones forever.
-		c.flushTimer = time.AfterFunc(100*time.Millisecond, c.ReleaseAll)
-	}
+	// FIX: We intentionally removed the "allow if seen" check here.
+	// If the barrier is up, we MUST hold all packets, including retransmissions.
+	// If we let a retransmission through, the server processes it and the race fails.
 
+	// New Flow or Retransmission: Hold it.
 	c.heldIDs = append(c.heldIDs, id)
+	c.seenFlows[srcKey] = struct{}{}
 
-	if _, seen := c.seenFlows[flowID]; !seen {
-		c.seenFlows[flowID] = struct{}{}
+	// Safety Timer: If we don't reach full concurrency quickly, release to avoid deadlock.
+	if len(c.heldIDs) == 1 {
+		c.flushTimer = time.AfterFunc(200*time.Millisecond, c.ReleaseAll)
 	}
 
+	// Trigger Check
 	if len(c.seenFlows) >= c.Concurrency {
 		if c.flushTimer != nil {
 			c.flushTimer.Stop()
 		}
 		c.triggerReleaseLocked()
 	}
-	return -1 // NF_DROP/NF_QUEUE (Wait)
+
+	return -1 // NF_QUEUE/Hold
 }
 
 func (c *Controller) triggerReleaseLocked() {
@@ -267,37 +258,38 @@ func (c *Controller) triggerReleaseLocked() {
 		close(c.releaseChan)
 	}
 
-	c.Logger.Info("Barrier reached!", zap.Int("held_packets", len(c.heldIDs)), zap.Int("flows", len(c.seenFlows)))
+	c.Logger.Info("NFQUEUE Barrier Reached - Releasing",
+		zap.Int("packets", len(c.heldIDs)),
+		zap.Int("flows", len(c.seenFlows)))
 
-	// OPTIMIZATION: Parallel Verdict Release
-	// We spawn a goroutine per packet to flood the kernel with verdicts simultaneously,
-	// achieving tighter "on-wire" synchronization than sequential syscalls.
-	var wg sync.WaitGroup
-	for _, id := range c.heldIDs {
-		wg.Add(1)
-		go func(packetID uint32) {
-			defer wg.Done()
-			if err := c.nfq.SetVerdict(packetID, nfqueue.NfAccept); err != nil {
-				// Log debug only to avoid spamming if socket closes during release
-				c.Logger.Debug("failed to release packet", zap.Uint32("id", packetID), zap.Error(err))
+	// OPTIMIZATION: Burst Release
+	// Spawn a single goroutine locked to an OS thread to flood the verdicts.
+	// This avoids scheduler overhead associated with spawning N goroutines.
+	idsToRelease := make([]uint32, len(c.heldIDs))
+	copy(idsToRelease, c.heldIDs)
+
+	go func(ids []uint32) {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+
+		for _, id := range ids {
+			// NF_ACCEPT = 1
+			if err := c.nfq.SetVerdict(id, nfqueue.NfAccept); err != nil {
+				// Suppress errors during burst to avoid I/O blocking logic
 			}
-		}(id)
-	}
-
-	// Wait for syscalls to initiate to ensure state consistency
-	wg.Wait()
+		}
+	}(idsToRelease)
 
 	c.heldIDs = nil
-	c.seenFlows = make(map[string]struct{})
+	// Keep seenFlows populated so retransmissions/tail packets aren't re-queued (logic handled by releaseChan check)
 }
 
 func (c *Controller) ReleaseAll() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
-		return
+	if !c.closed {
+		c.triggerReleaseLocked()
 	}
-	c.triggerReleaseLocked()
 }
 
 func (c *Controller) Close() {
@@ -307,7 +299,6 @@ func (c *Controller) Close() {
 		return
 	}
 	c.closed = true
-	// Ensure timer is stopped
 	if c.flushTimer != nil {
 		c.flushTimer.Stop()
 	}
@@ -330,6 +321,5 @@ func (c *Controller) cleanupRules() {
 		"--queue-num", fmt.Sprintf("%d", QueueNum),
 		"--queue-bypass",
 	}
-	// Ignore errors during cleanup
 	_ = execCommand("iptables", ruleArgs...).Run()
 }

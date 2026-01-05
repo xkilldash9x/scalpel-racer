@@ -27,7 +27,7 @@ func (r *Racer) RunH1Race(ctx context.Context, reqSpec *models.CapturedRequest, 
 		return nil, fmt.Errorf("invalid URL: %w", err)
 	}
 
-	// 1. Plan Attack (Pure Logic)
+	// 1. Plan Attack
 	plan, err := PlanH1Attack(reqSpec)
 	if err != nil {
 		return nil, fmt.Errorf("attack planning failed: %w", err)
@@ -42,7 +42,6 @@ func (r *Racer) RunH1Race(ctx context.Context, reqSpec *models.CapturedRequest, 
 
 	// 2. Setup Barriers
 	numStages := len(wireStages)
-	// ContextBarrier allows breaking the wait if context cancels
 	intermediateBarriers := make([]*ContextBarrier, 0)
 	if numStages > 1 {
 		for i := 0; i < numStages-1; i++ {
@@ -55,58 +54,59 @@ func (r *Racer) RunH1Race(ctx context.Context, reqSpec *models.CapturedRequest, 
 	conf.RequestTimeout = 20 * time.Second
 	conf.InsecureSkipVerify = true
 
-	// CRITICAL FIX: Enforce a hard timeout on the context.
-	// The parent ctx (m.Ctx) might be background/infinite. We must ensure
-	// that if the network or PacketController hangs, we abort eventually.
-	// We add a buffer to the config timeout to allow for setup overhead.
+	// Create strict context to prevent hangs
 	raceCtx, cancel := context.WithTimeout(ctx, conf.RequestTimeout+2*time.Second)
 	defer cancel()
 
-	// OPTIMIZATION: Disable GC for H1 pipeline synchronization
+	//  Disable GC safely.
+	// capture the old value to restore it later.  Don't call runtime.GC().
 	oldGC := debug.SetGCPercent(-1)
 	defer debug.SetGCPercent(oldGC)
 
 	results := make([]models.ScanResult, concurrency)
 	var activeWg sync.WaitGroup
-	var readyWg sync.WaitGroup // For synchronizing the Spinlock Entry
-
-	// Optimized Spinlock Barrier for attosecond-precision release
+	var readyWg sync.WaitGroup
 	var startFlag int32
 
-	// drainBarriers ensures no worker is left stuck at a barrier if others fail/die
+	// Helper to unblock waiting routines if something fails
 	drainBarriers := func(fromStage int) {
 		for i := fromStage; i < len(intermediateBarriers); i++ {
 			intermediateBarriers[i].ForceRelease()
 		}
 	}
 
-	for i := 0; i < concurrency; i++ {
-		client, err := r.Factory.NewH1Client(u, conf, r.Logger)
-		if err != nil {
-			results[i] = models.NewScanResult(i, 0, 0, nil, err)
-			// Failed to start: drain all barriers for this missing worker
-			drainBarriers(0)
-			continue
-		}
+	var successfulWorkers int32
 
+	for i := 0; i < concurrency; i++ {
 		activeWg.Add(1)
 		readyWg.Add(1)
-		go func(idx int, c H1Client) {
-			defer activeWg.Done()
-			defer c.Close()
 
-			if err := c.Connect(raceCtx); err != nil {
+		// OPTIMIZATION: Initialize clients in parallel inside the goroutine
+		go func(idx int) {
+			defer activeWg.Done()
+
+			client, err := r.Factory.NewH1Client(u, conf, r.Logger)
+			if err != nil {
 				results[idx] = models.NewScanResult(idx, 0, 0, nil, err)
-				readyWg.Done() // Failed
+				readyWg.Done()
 				drainBarriers(0)
 				return
 			}
+			defer client.Close()
+
+			if err := client.Connect(raceCtx); err != nil {
+				results[idx] = models.NewScanResult(idx, 0, 0, nil, err)
+				readyWg.Done()
+				drainBarriers(0)
+				return
+			}
+
+			atomic.AddInt32(&successfulWorkers, 1)
 
 			// EXECUTE STAGES
 			for step, stagePayload := range wireStages {
 				isFinalStage := step == numStages-1
 
-				// Check context before potential blocking operations
 				if raceCtx.Err() != nil {
 					results[idx] = models.NewScanResult(idx, 0, 0, nil, raceCtx.Err())
 					if !isFinalStage {
@@ -119,11 +119,9 @@ func (r *Racer) RunH1Race(ctx context.Context, reqSpec *models.CapturedRequest, 
 				}
 
 				if len(stagePayload) > 0 {
-					// Use SendRaw to bypass standard serialization
-					if err := c.SendRaw(raceCtx, stagePayload); err != nil {
+					if err := client.SendRaw(raceCtx, stagePayload); err != nil {
 						results[idx] = models.NewScanResult(idx, 0, 0, nil, err)
 						if !isFinalStage {
-							// Failed during stage sending: drain remaining barriers
 							drainBarriers(step)
 						}
 						if step == numStages-2 {
@@ -137,27 +135,19 @@ func (r *Racer) RunH1Race(ctx context.Context, reqSpec *models.CapturedRequest, 
 					barrier := intermediateBarriers[step]
 					barrier.Vote()
 
-					// Barrier Synchronization
 					if step == numStages-2 {
-						// Final Pre-Flight Alignment
-						readyWg.Done() // Signal that we are at the gate
-
-						// OPTIMIZATION: Lock OS Thread.
-						// Ensures the spinlock isn't preempted by the scheduler.
+						// Final Pre-Flight
+						readyWg.Done()
 						runtime.LockOSThread()
 						defer runtime.UnlockOSThread()
-
-						// SPIN BARRIER: High-Precision Busy Wait (Spinlock)
-						// This avoids the scheduler overhead of 'select'
 						for atomic.LoadInt32(&startFlag) == 0 {
-							// Check context cheaply to allow aborts without locking up
 							if raceCtx.Err() != nil {
 								results[idx] = models.NewScanResult(idx, 0, 0, nil, raceCtx.Err())
 								return
 							}
 						}
 					} else {
-						// Standard Barrier Wait
+						// Standard Wait
 						if err := barrier.Wait(raceCtx); err != nil {
 							results[idx] = models.NewScanResult(idx, 0, 0, nil, err)
 							return
@@ -167,8 +157,7 @@ func (r *Racer) RunH1Race(ctx context.Context, reqSpec *models.CapturedRequest, 
 			}
 
 			reqStart := time.Now()
-			// This blocking call is now protected by raceCtx timeout
-			responses, err := c.ReadPipelinedResponses(raceCtx, 1)
+			responses, err := client.ReadPipelinedResponses(raceCtx, 1)
 			duration := time.Since(reqStart)
 
 			if err != nil {
@@ -181,39 +170,36 @@ func (r *Racer) RunH1Race(ctx context.Context, reqSpec *models.CapturedRequest, 
 			}
 
 			resp := responses[0]
-			// Limit capture to prevent OOM on large responses
 			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 			resp.Body.Close()
-
 			results[idx] = models.NewScanResult(idx, resp.StatusCode, duration, bodyBytes, nil)
-		}(i, client)
+		}(i)
 	}
 
 	// 4. Orchestrate
 	if len(intermediateBarriers) > 0 {
 		finalBarrier := intermediateBarriers[len(intermediateBarriers)-1]
-		// Wait for all healthy clients to align at the final barrier
 		if err := finalBarrier.Wait(raceCtx); err != nil {
 			r.Logger.Warn("Context cancelled during alignment")
-			atomic.StoreInt32(&startFlag, 1) // Release spinners
+			atomic.StoreInt32(&startFlag, 1)
 			activeWg.Wait()
 			return nil, err
 		}
 	} else {
-		// Safety sleep for Last-Byte sync fallback
-		time.Sleep(100 * time.Millisecond)
+		// Reduced safe-guard sleep from 50ms to 1ms
+		time.Sleep(1 * time.Millisecond)
 	}
 
-	// If we have stages, we wait for the final synchronization group
 	if len(intermediateBarriers) > 0 {
-		// Wait for all active routines to be spinning on the atomic flag
 		readyWg.Wait()
 	}
 
-	time.Sleep(50 * time.Millisecond)
+	// Optimization: Only sleep if actual workers are waiting
+	if atomic.LoadInt32(&successfulWorkers) > 0 {
+		time.Sleep(1 * time.Millisecond)
+	}
 
 	r.Logger.Info("Releasing final stage...")
-	// ATOMIC RELEASE: The fastest possible broadcast in userspace
 	atomic.StoreInt32(&startFlag, 1)
 	activeWg.Wait()
 

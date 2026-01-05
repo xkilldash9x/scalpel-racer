@@ -127,8 +127,8 @@ func TestFlowLogic(t *testing.T) {
 		t.Errorf("Expected hold for flow 1, got %d", verdict)
 	}
 
-	// Flow 1 Retransmission. Should Hold (Wait) and NOT increment flow count.
-	// This verifies we are tracking unique flows, not just raw packet counts.
+	// Flow 1 Retransmission. Should Hold (Wait).
+	// FIX: Previous logic accepted retransmissions, which is unsafe for sync.
 	if verdict := c.evaluatePacket(2, pkt1); verdict != -1 {
 		t.Errorf("Expected hold for flow 1 retransmission, got %d", verdict)
 	}
@@ -148,7 +148,7 @@ func TestFlowLogic(t *testing.T) {
 
 	// Verify Barrier Release
 	// We wait briefly to ensure the goroutine fired by evaluatePacket has closed the channel
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -262,6 +262,9 @@ func TestController_Callback_Integration(t *testing.T) {
 	// Invoke the callback directly
 	hook(attr)
 
+	// FIX: Wait for the async release goroutine to process and set verdicts
+	time.Sleep(50 * time.Millisecond)
+
 	// Check if verdict was set (Accept because Concurrency=1 triggers release immediately)
 	mockQ.mu.Lock()
 	verdict, exists := mockQ.Verdicts[9999]
@@ -282,6 +285,9 @@ func TestController_ReleaseAll(t *testing.T) {
 
 	c.heldIDs = append(c.heldIDs, 999)
 	c.ReleaseAll()
+
+	// FIX: Wait for async release goroutine
+	time.Sleep(50 * time.Millisecond)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()

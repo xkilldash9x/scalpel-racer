@@ -26,6 +26,9 @@ func (f *MockFactory) NewH1Client(u *url.URL, c *customhttp.ClientConfig, l *zap
 func (f *MockFactory) NewH2Client(u *url.URL, c *customhttp.ClientConfig, l *zap.Logger) (engine.H2Client, error) {
 	return &MockH2{}, nil
 }
+func (f *MockFactory) NewH3Client(u *url.URL, c *customhttp.ClientConfig, l *zap.Logger) (engine.H3Client, error) {
+	return nil, nil
+}
 
 type MockH2 struct{}
 

@@ -21,6 +21,7 @@ import (
 type MockClientFactory struct {
 	H1 *MockH1Client
 	H2 *MockH2Client
+	H3 *MockH3Client
 }
 
 func (f *MockClientFactory) NewH1Client(u *url.URL, conf *customhttp.ClientConfig, l *zap.Logger) (engine.H1Client, error) {
@@ -37,6 +38,13 @@ func (f *MockClientFactory) NewH2Client(u *url.URL, conf *customhttp.ClientConfi
 		return f.H2, nil
 	}
 	return nil, errors.New("mock h2 factory fail")
+}
+
+func (f *MockClientFactory) NewH3Client(u *url.URL, conf *customhttp.ClientConfig, l *zap.Logger) (engine.H3Client, error) {
+	if f.H3 != nil {
+		return f.H3, nil
+	}
+	return nil, errors.New("mock h3 factory fail")
 }
 
 type MockH1Client struct {
@@ -99,6 +107,24 @@ func (m *MockH2Client) WaitResponse(ctx context.Context, h *customhttp.H2StreamH
 		Body:       io.NopCloser(bytes.NewReader(m.ResponseBody)),
 	}, nil
 }
+
+type MockH3Client struct {
+	DoError            error
+	ResponseStatusCode int
+	ResponseBody       []byte
+}
+
+func (m *MockH3Client) Do(ctx context.Context, req *http.Request) (*http.Response, error) {
+	if m.DoError != nil {
+		return nil, m.DoError
+	}
+	return &http.Response{
+		StatusCode: m.ResponseStatusCode,
+		Body:       io.NopCloser(bytes.NewReader(m.ResponseBody)),
+	}, nil
+}
+
+func (m *MockH3Client) Close() error { return nil }
 
 // -- Tests --
 
