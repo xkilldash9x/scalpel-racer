@@ -137,4 +137,12 @@ The TUI disables standard output logging to prevent display corruption.
     *   **Fix**: Ensure your browser proxy is set to `127.0.0.1:8080` (or your custom port) for both HTTP and HTTPS.
 
 ---
+
+## Legal Disclaimer
+
+**Scalpel Racer is intended for authorized testing and educational purposes only.**
+
+The creators and contributors of this project are not liable for any misuse of this tool or for any damage caused by it. You are responsible for ensuring that you have the necessary permissions to test the targets you are scanning. Use at your own risk.
+
+---
 _Crafted with precision by Project Scalpel Team._
