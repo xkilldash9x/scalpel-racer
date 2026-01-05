@@ -84,7 +84,7 @@ func TestInterceptor_Integration(t *testing.T) {
 	defer target.Close()
 
 	logger := zap.NewNop()
-	p, err := proxy.NewInterceptor(0, logger)
+	p, err := proxy.NewInterceptor(proxy.InterceptorConfig{Port: 0, InsecureSkipVerify: true}, logger)
 	if err != nil {
 		t.Fatalf("Failed to create interceptor: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestInterceptor_Integration(t *testing.T) {
 // TestInterceptor_Stability verifies the proxy handles "chaos" without crashing.
 func TestInterceptor_Stability(t *testing.T) {
 	logger := zap.NewNop()
-	p, _ := proxy.NewInterceptor(0, logger)
+	p, _ := proxy.NewInterceptor(proxy.InterceptorConfig{Port: 0, InsecureSkipVerify: true}, logger)
 	p.Start()
 	defer p.Close()
 
@@ -204,7 +204,7 @@ func TestInterceptor_Stability(t *testing.T) {
 // FIX: Moved to standalone test to avoid race condition on p.Transport
 func TestInterceptor_UpstreamFailure(t *testing.T) {
 	logger := zap.NewNop()
-	p, _ := proxy.NewInterceptor(0, logger)
+	p, _ := proxy.NewInterceptor(proxy.InterceptorConfig{Port: 0}, logger)
 
 	// Inject Transport BEFORE starting the proxy
 	p.UpstreamClient.Transport = &http.Transport{
@@ -306,7 +306,7 @@ func (w *errorWriter) Write(p []byte) (n int, err error) {
 // Test coverage for captureAndForwardStandard
 func TestInterceptor_captureAndForwardStandard(t *testing.T) {
 	logger := zap.NewNop()
-	p, _ := proxy.NewInterceptor(0, logger)
+	p, _ := proxy.NewInterceptor(proxy.InterceptorConfig{Port: 0}, logger)
 
 	t.Run("Successful forward", func(t *testing.T) {
 		target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

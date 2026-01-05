@@ -77,7 +77,10 @@ func Run(args []string, runner UIRunner) error {
 	defer cancel()
 
 	// 4. Start Proxy
-	interceptor, err := proxy.NewInterceptor(*port, logger)
+	proxyCfg := proxy.InterceptorConfig{
+		Port: *port,
+	}
+	interceptor, err := proxy.NewInterceptor(proxyCfg, logger)
 	if err != nil {
 		return fmt.Errorf("proxy init error: %w", err)
 	}
