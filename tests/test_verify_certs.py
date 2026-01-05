@@ -41,9 +41,11 @@ class TestCertManager:
             getattr(mock_builder_inst, method).return_value = mock_builder_inst
 
         # Mock filesystem to say files do NOT exist
-        # We patch os.open but do not assert on it, as python's open() is used
+        # We patch os.open for secure writes
         with patch("os.path.exists", return_value=False), \
              patch("builtins.open", MagicMock()) as mock_file, \
+             patch("os.open", return_value=123) as mock_os_open, \
+             patch("os.fdopen", MagicMock()), \
              patch("os.makedirs"):
             
             # Use real class to test the _load_or_generate_ca logic
@@ -55,10 +57,19 @@ class TestCertManager:
             # Once for shared leaf key, Once for CA key
             assert mock_ec.call_count >= 2
             
-            # [FIXED ASSERTION] Verify we opened the files using standard open()
-            mock_file.assert_any_call(CA_KEY_PATH, "wb")
+            # [FIXED ASSERTION] Verify we opened the CA CERT file using standard open()
             mock_file.assert_any_call(CA_CERT_PATH, "wb")
             
+            # Verify CA KEY was opened securely via os.open
+            # os.open is called for CA key and potentially shared key/server key if _generate_static_server_cert wasn't mocked.
+            # But we mocked _generate_static_server_cert, so it should be called for CA_KEY_PATH.
+            found_secure_ca_key = False
+            for call in mock_os_open.call_args_list:
+                if call[0][0] == CA_KEY_PATH:
+                    found_secure_ca_key = True
+                    break
+            assert found_secure_ca_key, "CA Key should be written using os.open (via _secure_write)"
+
             # Verify CA cert builder was invoked
             mock_builder_inst.sign.assert_called()
 
@@ -161,7 +172,9 @@ class TestCertManager:
 
         host = "secure-test.com"
 
-        with patch("builtins.open", MagicMock()):
+        with patch("builtins.open", MagicMock()), \
+             patch("os.open", MagicMock()), \
+             patch("os.fdopen", MagicMock()):
             manager.get_context_for_host(host)
 
         # 1. Verify Public Key setting
