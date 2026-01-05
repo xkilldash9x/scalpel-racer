@@ -81,6 +81,20 @@ func DefaultKeyMap() KeyMap {
 	}
 }
 
+// dynamicKeyMap adapts a slice of bindings to the help.KeyMap interface
+type dynamicKeyMap struct {
+	short []key.Binding
+	full  [][]key.Binding
+}
+
+func (k dynamicKeyMap) ShortHelp() []key.Binding {
+	return k.short
+}
+
+func (k dynamicKeyMap) FullHelp() [][]key.Binding {
+	return k.full
+}
+
 type Model struct {
 	State   State
 	History *RequestHistory
@@ -182,6 +196,37 @@ func NewModel(logger *zap.Logger, racer *engine.Racer) Model {
 
 func (m Model) Init() tea.Cmd {
 	return m.Spinner.Tick
+}
+
+func (m Model) HelpKeyMap() help.KeyMap {
+	var short []key.Binding
+	var full [][]key.Binding
+
+	switch m.State {
+	case StateIntercepting:
+		short = []key.Binding{m.Keys.Up, m.Keys.Down, m.Keys.Enter, m.Keys.Tab, m.Keys.Quit}
+		full = [][]key.Binding{
+			{m.Keys.Up, m.Keys.Down, m.Keys.Enter},
+			{m.Keys.Tab, m.Keys.Quit},
+		}
+	case StateEditing:
+		short = []key.Binding{m.Keys.Save, m.Keys.Esc}
+		full = [][]key.Binding{{m.Keys.Save, m.Keys.Esc}}
+	case StateResults:
+		short = []key.Binding{m.Keys.Suspect, m.Keys.Base, m.Keys.Filter, m.Keys.Esc}
+		full = [][]key.Binding{
+			{m.Keys.Suspect, m.Keys.Base},
+			{m.Keys.Filter, m.Keys.Esc},
+		}
+	case StateRunning:
+		short = []key.Binding{m.Keys.Quit}
+		full = [][]key.Binding{{m.Keys.Quit}}
+	default:
+		short = []key.Binding{m.Keys.Quit}
+		full = [][]key.Binding{{m.Keys.Quit}}
+	}
+
+	return dynamicKeyMap{short: short, full: full}
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {

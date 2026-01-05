@@ -64,23 +64,13 @@ func (m Model) renderStatusBar() string {
 		mode, info = "ANALYSIS", fmt.Sprintf("Samples: %d | Outliers: %v", len(m.Results), m.Filter == FilterOutliers)
 	}
 
-	keys := []string{}
-	switch m.State {
-	case StateIntercepting:
-		keys = []string{"↑/↓ select", "enter edit", "tab strategy", "q quit"}
-	case StateEditing:
-		keys = []string{"ctrl+s fire", "esc cancel"}
-	case StateResults:
-		keys = []string{"enter suspect", "b baseline", "f filter", "esc back"}
-	}
-
 	return lipgloss.JoinVertical(lipgloss.Top,
 		lipgloss.NewStyle().BorderTop(true).BorderForeground(cSub).Width(m.Width).Render(""),
 		lipgloss.JoinHorizontal(lipgloss.Center,
 			lipgloss.NewStyle().Background(cAccent).Foreground(lipgloss.Color("0")).Bold(true).Padding(0, 1).Render(mode),
 			statusText.Render(info),
 			lipgloss.NewStyle().Width(5).Render(""),
-			statusText.Render(strings.Join(keys, " • ")),
+			m.Help.View(m.HelpKeyMap()),
 		),
 	)
 }
