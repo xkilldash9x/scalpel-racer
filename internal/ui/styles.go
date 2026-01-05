@@ -37,6 +37,10 @@ var (
 	// Flags
 	outlierFlag = lipgloss.NewStyle().Foreground(cErr).Bold(true).SetString("!")
 	normalFlag  = lipgloss.NewStyle().SetString(" ")
+
+	// Empty State
+	emptyTitleStyle    = lipgloss.NewStyle().Foreground(cFocus).Bold(true)
+	emptySubtitleStyle = lipgloss.NewStyle().Foreground(cSub)
 )
 
 // statusColor returns a style based on standard HTTP status code semantics.

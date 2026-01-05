@@ -19,7 +19,19 @@ func (m Model) View() string {
 
 	switch m.State {
 	case StateIntercepting:
-		content = lipgloss.JoinVertical(lipgloss.Left, m.ReqTable.View())
+		if m.History.size == 0 {
+			h := m.Height - 5
+			if h < 0 {
+				h = 0
+			}
+			msg := lipgloss.JoinVertical(lipgloss.Center,
+				emptyTitleStyle.Render("Waiting for Traffic"),
+				emptySubtitleStyle.Render("Configure your client to proxy through the listener."),
+			)
+			content = lipgloss.Place(m.Width, h, lipgloss.Center, lipgloss.Center, msg)
+		} else {
+			content = lipgloss.JoinVertical(lipgloss.Left, m.ReqTable.View())
+		}
 	case StateLoading:
 		content = lipgloss.Place(m.Width, m.Height, lipgloss.Center, lipgloss.Center,
 			lipgloss.JoinVertical(lipgloss.Center, m.Spinner.View(), lipgloss.NewStyle().Foreground(cSub).Render("Hydrating payload from disk...")))
