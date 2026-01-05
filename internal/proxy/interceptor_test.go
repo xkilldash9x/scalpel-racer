@@ -1,3 +1,4 @@
+// FILENAME: internal/proxy/interceptor_test.go
 package proxy
 
 import (
@@ -28,7 +29,11 @@ func TestInterceptor_GoroutineLeak(t *testing.T) {
 	// 3. Proxy Lifecycle
 	logger := zap.NewNop()
 	// Use port 0 for random available port
-	p, err := NewInterceptor(0, logger)
+	cfg := InterceptorConfig{
+		Port:               0,
+		InsecureSkipVerify: true,
+	}
+	p, err := NewInterceptor(cfg, logger)
 	if err != nil {
 		t.Fatalf("setup failed: %v", err)
 	}
@@ -117,7 +122,8 @@ func TestSanitization_StrictRFC9113(t *testing.T) {
 // capture channel does not deadlock the proxy core.
 func TestInterceptor_CaptureChannelBlocking(t *testing.T) {
 	logger := zap.NewNop()
-	p, _ := NewInterceptor(0, logger)
+	cfg := InterceptorConfig{Port: 0}
+	p, _ := NewInterceptor(cfg, logger)
 
 	// Fill the capture channel to capacity
 	capSize := cap(p.CaptureChan)
