@@ -73,6 +73,15 @@ func LoadOrCreateCA(certFile, keyFile string) (tls.Certificate, error) {
 	}
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
 
+	// SECURITY: Ensure we don't follow symlinks if they exist.
+	// This prevents local privilege escalation/overwrite attacks (CWE-59).
+	if err := os.Remove(certFile); err != nil && !os.IsNotExist(err) {
+		return tls.Certificate{}, fmt.Errorf("failed to remove existing cert file (security check): %w", err)
+	}
+	if err := os.Remove(keyFile); err != nil && !os.IsNotExist(err) {
+		return tls.Certificate{}, fmt.Errorf("failed to remove existing key file (security check): %w", err)
+	}
+
 	if err := os.WriteFile(certFile, certPEM, 0644); err != nil {
 		return tls.Certificate{}, err
 	}
