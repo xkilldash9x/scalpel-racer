@@ -142,7 +142,7 @@ The TUI disables standard output logging to prevent display corruption.
 
 **Scalpel Racer is intended for authorized testing and educational purposes only.**
 
-The creators and contributors of this project are not liable for any misuse of this tool or for any damage caused by it. You are responsible for ensuring that you have the necessary permissions to test the targets you are scanning. Use at your own risk.
+The creator of this project is not liable for any misuse of this tool or for any damage caused by it. You are responsible for ensuring that you have the necessary permissions to test the targets you are scanning. Use at your own risk.
 
 ---
 _Crafted with precision by Project Scalpel Team._

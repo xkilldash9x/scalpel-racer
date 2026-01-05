@@ -6,13 +6,13 @@ The following is a set of guidelines for contributing to Scalpel Racer. These ar
 
 ## Code of Conduct
 
-This project and everyone participating in it is governed by the Scalpel Racer Code of Conduct. By participating, you are expected to uphold this code. Please report unacceptable behavior to the project maintainers.
+This project and everyone participating in it is governed by the Scalpel Racer Code of Conduct. By participating, you are expected to uphold this code. Please report unacceptable behavior to the project maintainer.
 
 ## How Can I Contribute?
 
 ### Reporting Bugs
 
-This section guides you through submitting a bug report for Scalpel Racer. Following these guidelines helps maintainers and the community understand your report, reproduce the behavior, and find related reports.
+This section guides you through submitting a bug report for Scalpel Racer. Following these guidelines helps the maintainer and the community understand your report, reproduce the behavior, and find related reports.
 
 *   **Use a clear and descriptive title** for the issue to identify the problem.
 *   **Describe the exact steps which reproduce the problem** in as much detail as possible.
