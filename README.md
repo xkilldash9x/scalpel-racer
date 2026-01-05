@@ -11,7 +11,7 @@
 
 > **A high-precision race condition exploitation framework.**
 
-![Python Version](https://img.shields.io/badge/python-3.11%2B-blue)
+![Go Version](https://img.shields.io/badge/go-1.18%2B-blue)
 ![Strategies](https://img.shields.io/badge/strategies-SPA%20%7C%20First--Seq%20%7C%20Sync-orange)
 ![Status](https://img.shields.io/badge/status-active-green)
 
@@ -39,33 +39,13 @@ Scalpel Racer is an advanced testing tool designed to identify and exploit race 
 
 ## Installation
 
-### 1. Clone & Environment
-Scalpel Racer requires **Python 3.11+**.
+### 1. Clone & Build
+Scalpel Racer requires **Go 1.18+**.
 
 ```bash
 git clone https://github.com/xkilldash9x/scalpel-racer.git
 cd scalpel-racer
-
-# Linux / MacOS
-python3 -m venv venv
-source venv/bin/activate
-
-# Windows
-python -m venv venv
-venv\Scripts\activate
-```
-
-### 2. Install Dependencies
-**Linux Users (Prerequisite):** You must install system headers *before* installing Python packages to support the First-Seq strategy.
-
-```bash
-sudo apt-get install libnetfilter-queue-dev
-```
-
-**All Platforms:** Install the Python dependencies:
-
-```bash
-pip install -r requirements.txt
+go build -o scalpel-racer ./cmd/scalpel-racer
 ```
 
 ## Usage Guide
@@ -75,7 +55,7 @@ Launch the tool. It acts as an interactive CLI and Proxy.
 
 ```bash
 # Listen on port 8080 (default)
-python3 scalpel_racer.py
+./scalpel-racer
 ```
 
 ### 2. Capture Traffic
@@ -101,56 +81,34 @@ vector > race 0 20
 ## Attack Strategies
 
 ### Auto (Default)
-Uses `httpx` with synchronization barriers. Good for general testing.
+Uses `net/http` with synchronization barriers. Good for general testing.
 *   Supports **Staged Attacks**: Insert `{{SYNC}}` in the body (e.g., `param=val&{{SYNC}}final=true`) to pause requests before the final byte.
 
 ### SPA (Single Packet Attack)
-```bash
-python3 scalpel_racer.py --strategy spa
-```
 Uses **HTTP/2** features to pre-send headers and hold the final DATA frame. All requests complete when the final packet arrives, eliminating most network jitter.
-
-### First-Seq (Kernel Sync)
-```bash
-sudo python3 scalpel_racer.py --strategy first-seq
-```
-**The Nuclear Option.** Uses `iptables` to hold packets at the network interface level until the entire batch is ready. Requires `sudo`.
 
 ## Architecture
 
-*   **`scalpel_racer.py`**: Command Center & UI.
-*   **`proxy_manager.py`**: Unified Proxy (TCP/QUIC) Orchestrator.
-*   **`proxy_core.py`**: Native H1/H2 Proxy Engine.
-*   **`low_level.py`**: Raw Socket Engine for SPA/First-Seq.
-*   **`packet_controller.py`**: Linux Netfilter Controller.
+*   **`cmd/scalpel-racer`**: Command Center & UI.
+*   **`internal/proxy`**: Unified Proxy (TCP/QUIC) Orchestrator.
+*   **`internal/engine`**: Native H1/H2 Proxy Engine.
+*   **`internal/packet`**: Low-level packet manipulation.
 
 ## Troubleshooting
 
 ### Common Issues
 
-*   **`AttributeError: module 'asyncio' has no attribute 'TaskGroup'`**:
-    *   **Cause**: You are running Python older than 3.11.
-    *   **Fix**: Upgrade to Python 3.11 or higher.
+*   **`permission denied` (when running `./scalpel-racer`)**:
+    *   **Cause**: The binary does not have execute permissions.
+    *   **Fix**: Run `chmod +x ./scalpel-racer`.
 
-*   **`ImportError: No module named 'aioquic'`**:
-    *   **Cause**: The optional HTTP/3 dependency is missing.
-    *   **Fix**: Install it via `pip install aioquic` or ignore the warning if you don't need HTTP/3 support.
-
-*   **`NetfilterQueue` not found / `fatal error: libnetfilter_queue/libnetfilter_queue.h: No such file`**:
-    *   **Cause**: Missing system headers for compiling the Python package.
-    *   **Fix**: Run `sudo apt-get install libnetfilter-queue-dev` (Ubuntu/Debian) before pip installing.
-
-*   **`Permission Denied` (when using `first-seq`)**:
-    *   **Cause**: Modifying firewall rules requires root privileges.
-    *   **Fix**: Run the script with `sudo`.
-
-*   **`Address already in use`**:
-    *   **Cause**: Another process (or a previous instance of Scalpel Racer) is using port 8080 or 4433.
-    *   **Fix**: Kill the process using `lsof -i :8080` / `kill <PID>` or use the `-l <port>` argument to listen on a different port.
+*   **`address already in use`**:
+    *   **Cause**: Another process (or a previous instance of Scalpel Racer) is using the specified port.
+    *   **Fix**: Kill the process using `lsof -i :<port>` / `kill <PID>` or use the `-l <port>` argument to listen on a different port.
 
 *   **Browser Warnings / SSL Errors**:
     *   **Cause**: The browser does not trust the generated CA.
-    *   **Fix**: Import `scalpel_ca.pem` into your browser's Trusted Root Certification Authorities store. Firefox has its own store separate from the OS.
+    *   **Fix**: Import `~/.scalpel-racer/certs/ca.pem` into your browser's Trusted Root Certification Authorities store. Firefox has its own store separate from the OS.
 
 *   **No Requests Captured**:
     *   **Cause**: The proxy is not configured correctly in your browser/tool, or the `scope` regex is too restrictive.
