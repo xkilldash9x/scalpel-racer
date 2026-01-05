@@ -40,6 +40,8 @@ type Interceptor struct {
 	quicServer     *http3.Server
 	UpstreamClient *http.Client
 
+	certCache    map[string]*tls.Certificate
+	certCacheMu  sync.RWMutex
 	mu           sync.RWMutex
 	closed       bool
 	shutdownOnce sync.Once
@@ -95,6 +97,7 @@ func NewInterceptor(port int, logger *zap.Logger) (*Interceptor, error) {
 		ca:          ca,
 		caParsed:    caParsed,
 		serverKey:   serverKey,
+		certCache:   make(map[string]*tls.Certificate),
 		UpstreamClient: &http.Client{
 			Transport:     transport,
 			Timeout:       10 * time.Second,
@@ -214,11 +217,27 @@ func (i *Interceptor) handleHTTPS(clientConn net.Conn, req *http.Request) {
 
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
-	// Optimized cert generation
-	leaf, err := GenerateLeafCert(i.ca, i.caParsed, i.serverKey, host)
-	if err != nil {
-		i.Logger.Error("cert gen fail", zap.Error(err))
-		return
+	// Check cache first
+	i.certCacheMu.RLock()
+	leaf, hit := i.certCache[host]
+	i.certCacheMu.RUnlock()
+
+	if !hit {
+		var err error
+		// Optimized cert generation
+		leaf, err = GenerateLeafCert(i.ca, i.caParsed, i.serverKey, host)
+		if err != nil {
+			i.Logger.Error("cert gen fail", zap.Error(err))
+			return
+		}
+		// Cache the generated certificate
+		i.certCacheMu.Lock()
+		// Simple eviction to prevent memory leaks
+		if len(i.certCache) > 1000 {
+			i.certCache = make(map[string]*tls.Certificate)
+		}
+		i.certCache[host] = leaf
+		i.certCacheMu.Unlock()
 	}
 
 	tlsConfig := &tls.Config{Certificates: []tls.Certificate{*leaf}}
