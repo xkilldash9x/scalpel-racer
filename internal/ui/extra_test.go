@@ -4,6 +4,7 @@ package ui
 import (
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"testing"
 
@@ -175,6 +176,14 @@ func TestHelpers(t *testing.T) {
 		if clean("1234567890", 5) != "12..." {
 			t.Error("Truncation failed")
 		}
+		// FIX: Verify fix for panic on small width
+		if clean("abc", 2) != "ab" {
+			t.Error("Small width truncation failed")
+		}
+		// FIX: Verify fix for negative width (bug fix verification)
+		if clean("abc", -1) != "" {
+			t.Error("Negative width should return empty string, not panic")
+		}
 	})
 
 	t.Run("getMaxKey", func(t *testing.T) {
@@ -182,14 +191,26 @@ func TestHelpers(t *testing.T) {
 		if getMaxKey(m) != 2 {
 			t.Error("getMaxKey failed")
 		}
+		// FIX: Deterministic tie-breaking check
+		mTie := map[int]int{1: 10, 2: 10}
+		if getMaxKey(mTie) != 1 {
+			t.Error("getMaxKey nondeterministic on tie")
+		}
 	})
 }
 
-func Test_resolveTargetIPAndPort(t *testing.T) {
-	logger := zap.NewNop()
-	racer := engine.NewRacer(&MockFactory{}, logger)
-	m := NewModel(logger, racer)
+// MockResolver implements the Resolver interface for testing.
+type MockResolver struct{}
 
+func (mr *MockResolver) LookupIP(host string) ([]net.IP, error) {
+	// Deterministic Mock
+	if host == "example.com" {
+		return []net.IP{net.ParseIP("93.184.216.34")}, nil
+	}
+	return nil, fmt.Errorf("not found")
+}
+
+func Test_resolveTargetIPAndPort(t *testing.T) {
 	testCases := []struct {
 		name       string
 		req        *models.CapturedRequest
@@ -228,19 +249,68 @@ func Test_resolveTargetIPAndPort(t *testing.T) {
 			},
 			"93.184.216.34", 80,
 		},
+		{
+			"HostWithoutPort",
+			&models.CapturedRequest{
+				URL:     "http://example.com",
+				Headers: map[string]string{"Host": "example.com"},
+			},
+			"93.184.216.34", 80, // Should resolve despite no port in Host header
+		},
+		{
+			"HostOverridesDefault",
+			&models.CapturedRequest{
+				URL:     "/", // Relative URL
+				Headers: map[string]string{"Host": "example.com:8080"},
+			},
+			"93.184.216.34", 8080, // New logic should return 8080, not 80
+		},
+		{
+			"HostOverridesDefaultHTTPS",
+			&models.CapturedRequest{
+				URL:     "https://example.com", // Implies 443
+				Headers: map[string]string{"Host": "example.com:8443"},
+			},
+			"93.184.216.34", 8443, // Host header is more specific than default scheme
+		},
+		{
+			"URLOverridesHost",
+			&models.CapturedRequest{
+				URL:     "http://example.com:9000",
+				Headers: map[string]string{"Host": "example.com:8000"},
+			},
+			"93.184.216.34", 9000, // Explicit URL port wins
+		},
 	}
+
+	resolver := &MockResolver{}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			m.SelectedReq = tc.req
-			ip, port := m.resolveTargetIPAndPort()
-			// IP can be flaky, so we just check for non-empty
-			if ip == "" {
-				t.Error("Expected IP, got empty string")
+			ip, port := resolveTargetIPAndPort(tc.req, resolver)
+			if ip != tc.expectedIP {
+				t.Errorf("Expected IP %s, got %s", tc.expectedIP, ip)
 			}
 			if port != tc.expectedPo {
 				t.Errorf("Expected port %d, got %d", tc.expectedPo, port)
 			}
 		})
+	}
+}
+
+func TestTextToRequest_ContentLength(t *testing.T) {
+	// Verify that Content-Length is updated
+	req := &models.CapturedRequest{
+		Headers: map[string]string{"Host": "example.com", "Content-Length": "5"},
+	}
+	text := "POST http://example.com HTTP/1.1\nHost: example.com\nContent-Length: 5\n\n1234567890" // 10 bytes
+
+	newReq, err := textToRequest(text, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if newReq.Headers["Content-Length"] != "10" {
+		t.Errorf("Content-Length not updated. Got %s, want 10", newReq.Headers["Content-Length"])
 	}
 }

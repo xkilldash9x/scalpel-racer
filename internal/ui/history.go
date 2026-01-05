@@ -2,7 +2,6 @@
 package ui
 
 import (
-	"io/ioutil"
 	"os"
 	"runtime"
 
@@ -41,29 +40,35 @@ func (h *RequestHistory) Add(req *models.CapturedRequest) {
 
 	// Offload to disk if body is large
 	if len(req.Body) > BodyOffloadThreshold {
-		tmpfile, err := ioutil.TempFile("", "scalpel-body-*.bin")
+		// -- Usage of os.CreateTemp replaces deprecated ioutil.TempFile --
+		tmpfile, err := os.CreateTemp("", "scalpel-body-*.bin")
 		if err != nil {
 			h.logger.Error("Failed to create temp file for body offload", zap.Error(err))
-			// Still add to history, but without offloading
+			// Fallback: Keep in RAM if disk offload fails
 		} else {
-			if _, err := tmpfile.Write(req.Body); err != nil {
-				h.logger.Error("Failed to write to temp file for body offload", zap.Error(err))
-				tmpfile.Close() // Best effort cleanup
+			// Write and Close immediately to flush buffers and release handle.
+			_, writeErr := tmpfile.Write(req.Body)
+			closeErr := tmpfile.Close()
+
+			if writeErr != nil {
+				h.logger.Error("Failed to write to temp file for body offload", zap.Error(writeErr))
+				os.Remove(tmpfile.Name())
+			} else if closeErr != nil {
+				h.logger.Error("Failed to close temp file", zap.Error(closeErr))
 				os.Remove(tmpfile.Name())
 			} else {
 				h.logger.Info("Offloaded large request body to disk", zap.String("path", tmpfile.Name()))
 				req.OffloadPath = tmpfile.Name()
-				req.Body = nil // Clear from memory
+				req.Body = nil // Clear from memory to free RAM
 				stored.OnDisk = true
 			}
-			tmpfile.Close()
 		}
 	}
 
 	// Ring Buffer Overwrite Logic
 	existing := h.buffer[h.head]
 	if existing != nil && existing.OnDisk {
-		// Clean up the old file if we are evicting it
+		// Clean up the old file if we are evicting it from history
 		if existing.Req.OffloadPath != "" {
 			os.Remove(existing.Req.OffloadPath)
 		}
@@ -80,6 +85,11 @@ func (h *RequestHistory) Add(req *models.CapturedRequest) {
 // We use this to check if we need to perform an async load.
 func (h *RequestHistory) GetMeta(index int) *StoredRequest {
 	if h.size == 0 {
+		return nil
+	}
+
+	// Safety: Ensure index is within the logical size of the history
+	if index < 0 || index >= h.size {
 		return nil
 	}
 

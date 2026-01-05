@@ -31,6 +31,20 @@ import (
 
 const MaxHistory = 1000
 
+// -- Interfaces --
+
+// Resolver abstracts network lookups to allow dependency injection and testing.
+type Resolver interface {
+	LookupIP(host string) ([]net.IP, error)
+}
+
+// DefaultResolver uses the standard net package.
+type DefaultResolver struct{}
+
+func (d DefaultResolver) LookupIP(host string) ([]net.IP, error) {
+	return net.LookupIP(host)
+}
+
 // -- Messages --
 type CaptureMsg *models.CapturedRequest
 type RaceResultMsg []models.ScanResult
@@ -103,6 +117,9 @@ type Model struct {
 	Ctx     context.Context
 	Cancel  context.CancelFunc
 	Keys    KeyMap
+
+	// Dependencies
+	Resolver Resolver
 
 	// Config
 	Concurrency int
@@ -186,6 +203,7 @@ func NewModel(logger *zap.Logger, racer *engine.Racer) Model {
 		Help:        help.New(),
 		Keys:        DefaultKeyMap(),
 		Logger:      logger,
+		Resolver:    DefaultResolver{},
 		Concurrency: 20,
 		Strategy:    "h2",
 		Racer:       racer,
@@ -241,8 +259,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case CaptureMsg:
 		m.History.Add(msg)
+		// UI Refinement: Only auto-scroll if user is already at the bottom
+		shouldScroll := m.ReqTable.Cursor() == len(m.History.List())-1
 		m.updateReqTable()
-		if m.State == StateIntercepting {
+		if m.State == StateIntercepting && shouldScroll {
 			m.ReqTable.GotoBottom()
 		}
 		return m, nil
@@ -363,8 +383,11 @@ func (m Model) updateEditing(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.SelectedReq = updatedReq
 			m.State = StateRunning
 			m.ProgressBar.SetPercent(0)
+
+			// -- Concurrency Fix: Pass explicit arguments to command generator --
+			// Avoids passing pointer to transient model or racing on m.SelectedReq
 			return m, tea.Batch(
-				m.runRaceCmd(),
+				m.runRaceCmd(m.SelectedReq, m.Strategy, m.Concurrency),
 				tea.Tick(50*time.Millisecond, func(t time.Time) tea.Msg { return TickMsg(t) }),
 			)
 		}
@@ -408,8 +431,19 @@ func (m Model) updateResults(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.SuspectRes = s
 				m.updateDiffView()
 			}
-			m.DiffView, cmd = m.DiffView.Update(msg)
-			cmds = append(cmds, cmd)
+
+			// UX Fix: Prevent double scrolling. Only pass event to DiffView if it's NOT a navigation key.
+			// This prevents the viewport from scrolling when the user is just moving the selection cursor.
+			shouldUpdateDiff := true
+			switch msg.String() {
+			case "up", "down", "k", "j":
+				shouldUpdateDiff = false
+			}
+
+			if shouldUpdateDiff {
+				m.DiffView, cmd = m.DiffView.Update(msg)
+				cmds = append(cmds, cmd)
+			}
 		}
 	}
 	return m, tea.Batch(cmds...)
@@ -427,21 +461,33 @@ func (m *Model) loadBodyCmd(path string) tea.Cmd {
 }
 
 // resolveTargetIPAndPort extracts the destination IP and port from the captured request.
-// This is critical for configuring the NFQUEUE iptables rule.
-func (m *Model) resolveTargetIPAndPort() (string, int) {
-	host := m.SelectedReq.Headers["Host"]
-	// Fallback to URL host if header is missing
+// It prioritizes the Host header for port resolution, falling back to URL defaults.
+// It uses an injected Resolver to facilitate testing.
+func resolveTargetIPAndPort(req *models.CapturedRequest, r Resolver) (string, int) {
+	host := req.Headers["Host"]
 	if host == "" {
-		if u, err := url.Parse(m.SelectedReq.URL); err == nil {
+		if u, err := url.Parse(req.URL); err == nil {
 			host = u.Host
 		}
 	}
 
-	if strings.Contains(host, ":") {
-		host, _, _ = net.SplitHostPort(host)
+	// 1. Attempt to extract port from Host header first (Authoritative)
+	var hostPort int
+	if _, portStr, err := net.SplitHostPort(host); err == nil {
+		if p, err := strconv.Atoi(portStr); err == nil {
+			hostPort = p
+		}
 	}
 
-	ips, _ := net.LookupIP(host)
+	// 2. Resolve IP
+	// Strip port for lookup
+	hostname := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		hostname = h
+	}
+
+	// Use injected resolver
+	ips, _ := r.LookupIP(hostname)
 	var targetIP string
 	for _, ip := range ips {
 		if ip.To4() != nil {
@@ -449,16 +495,30 @@ func (m *Model) resolveTargetIPAndPort() (string, int) {
 			break
 		}
 	}
+	// Fallback to IPv6 if no IPv4
+	if targetIP == "" && len(ips) > 0 {
+		targetIP = ips[0].String()
+	}
 
 	if targetIP == "" {
 		return "", 0
 	}
 
+	// 3. Determine Port
 	port := 80
-	if u, err := url.Parse(m.SelectedReq.URL); err == nil {
+	if u, err := url.Parse(req.URL); err == nil {
 		if u.Scheme == "https" {
 			port = 443
 		}
+	}
+
+	// If Host header had a port, it takes precedence over the default scheme
+	if hostPort != 0 {
+		port = hostPort
+	}
+
+	// Explicit URL port overrides everything (e.g., http://host:9000)
+	if u, err := url.Parse(req.URL); err == nil {
 		if u.Port() != "" {
 			if p, err := strconv.Atoi(u.Port()); err == nil {
 				port = p
@@ -469,43 +529,46 @@ func (m *Model) resolveTargetIPAndPort() (string, int) {
 	return targetIP, port
 }
 
-func (m *Model) runRaceCmd() tea.Cmd {
+// runRaceCmd generates the command to run the attack.
+// It accepts all necessary data as arguments to avoid closure race conditions on the Model.
+func (m *Model) runRaceCmd(req *models.CapturedRequest, strategy string, concurrency int) tea.Cmd {
+	// Capture dependencies to safe local variables
+	// This prevents the goroutine from racing on the 'm' pointer if the model updates
+	ctxCopy := m.Ctx
+	logger := m.Logger
+	racer := m.Racer
+	resolver := m.Resolver
+
 	return func() tea.Msg {
 		var res []models.ScanResult
 		var err error
 
-		// FIX: Create a derived context with a strict timeout to prevent UI hangs.
-		// Even if the engine logic fails to timeout (unlikely with other fixes), this
-		// ensures the UI state machine eventually recovers.
-		// 45 seconds gives ample buffer for the 30s race timeout.
-		ctx, cancel := context.WithTimeout(m.Ctx, 45*time.Second)
+		// Fix: Create a derived context with a strict timeout to prevent UI hangs.
+		ctx, cancel := context.WithTimeout(ctxCopy, 45*time.Second)
 		defer cancel()
 
-		switch m.Strategy {
+		switch strategy {
 		case "h1", "first-seq":
 			// STRATEGY: H1 + Packet Synchronization (Hybrid)
-			// We attempt to start the Packet Controller to synchronize packets at the kernel level.
-			// If it fails (e.g., lack of root), we degrade gracefully to standard Pipelining.
-
-			targetIP, port := m.resolveTargetIPAndPort()
+			targetIP, port := resolveTargetIPAndPort(req, resolver)
 			if targetIP != "" {
-				pc := packet.NewController(targetIP, port, m.Concurrency, m.Logger)
+				pc := packet.NewController(targetIP, port, concurrency, logger)
 				if startErr := pc.Start(ctx); startErr == nil {
 					// Success: Controller is active.
 					defer pc.Close()
-					m.Logger.Info("Packet Controller active", zap.String("ip", targetIP))
+					logger.Info("Packet Controller active", zap.String("ip", targetIP))
 				} else {
 					// Fallback: Log warning but proceed with application-layer sync
-					m.Logger.Warn("Packet Controller failed to start (Root required?). Degrading to standard pipelining.", zap.Error(startErr))
+					logger.Warn("Packet Controller failed to start (Root required?). Degrading to standard pipelining.", zap.Error(startErr))
 				}
 			}
 
 			// Pass the timed context to the engine
-			res, err = m.Racer.RunH1Race(ctx, m.SelectedReq, m.Concurrency)
+			res, err = racer.RunH1Race(ctx, req, concurrency)
 
 		default:
 			// STRATEGY: H2 (Single Packet Attack)
-			res, err = m.Racer.RunH2Race(ctx, m.SelectedReq, m.Concurrency)
+			res, err = racer.RunH2Race(ctx, req, concurrency)
 		}
 
 		if err != nil {
@@ -521,8 +584,16 @@ func (m *Model) runRaceCmd() tea.Cmd {
 func requestToText(r *models.CapturedRequest) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("%s %s %s\n", r.Method, r.URL, r.Protocol))
-	for k, v := range r.Headers {
-		b.WriteString(fmt.Sprintf("%s: %s\n", k, v))
+
+	// Deterministic Header Order
+	keys := make([]string, 0, len(r.Headers))
+	for k := range r.Headers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		b.WriteString(fmt.Sprintf("%s: %s\n", k, r.Headers[k]))
 	}
 	b.WriteString("\n")
 	b.Write(r.Body)
@@ -557,5 +628,12 @@ func textToRequest(text string, original *models.CapturedRequest) (*models.Captu
 			req.Headers["Host"] = h
 		}
 	}
+
+	// Fix: Update Content-Length if it exists in the headers to match the new body.
+	// This prevents sending invalid HTTP requests where CL != Body Size.
+	if _, ok := req.Headers["Content-Length"]; ok {
+		req.Headers["Content-Length"] = strconv.Itoa(len(req.Body))
+	}
+
 	return req, nil
 }

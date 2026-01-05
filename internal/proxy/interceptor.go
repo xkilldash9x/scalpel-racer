@@ -12,7 +12,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,16 +50,20 @@ type Interceptor struct {
 }
 
 func NewInterceptor(port int, logger *zap.Logger) (*Interceptor, error) {
-	// FIX: Establish a stable, absolute path for identity files.
-	// This prevents "directory drift" where certs are scattered across the repo.
-	home, err := os.UserHomeDir()
+	// FIX: Resolve the "Real" home directory to prevent drift when running with sudo.
+	// If we don't do this, sudo runs generate certs in /root/ that the browser doesn't trust.
+	certDir, uid, gid, err := resolveRealCertDir()
 	if err != nil {
-		return nil, fmt.Errorf("failed to determine user home: %w", err)
+		return nil, fmt.Errorf("failed to resolve cert directory: %w", err)
 	}
 
-	certDir := filepath.Join(home, ".scalpel-racer", "certs")
+	// Ensure the directory exists with correct permissions
 	if err := os.MkdirAll(certDir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create cert dir: %w", err)
+	}
+	// If we created it as root on behalf of a user, fix ownership immediately
+	if uid != -1 && gid != -1 {
+		_ = os.Chown(certDir, uid, gid)
 	}
 
 	certPath := filepath.Join(certDir, "ca.pem")
@@ -68,6 +74,13 @@ func NewInterceptor(port int, logger *zap.Logger) (*Interceptor, error) {
 	ca, err := LoadOrCreateCA(certPath, keyPath)
 	if err != nil {
 		return nil, err
+	}
+
+	// FIX: If we just generated these as root, we must give them back to the user.
+	// Otherwise, subsequent non-sudo runs will crash with permission denied.
+	if uid != -1 && gid != -1 {
+		_ = os.Chown(certPath, uid, gid)
+		_ = os.Chown(keyPath, uid, gid)
 	}
 
 	// Performance optimization: Parse CA once
@@ -104,6 +117,41 @@ func NewInterceptor(port int, logger *zap.Logger) (*Interceptor, error) {
 			CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}, nil
+}
+
+// resolveRealCertDir attempts to find the actual user's home directory even if running as sudo.
+// Returns the absolute path to .scalpel-racer/certs, and the original UID/GID (or -1 if not sudo).
+func resolveRealCertDir() (string, int, int, error) {
+	var homeDir string
+	uid := -1
+	gid := -1
+
+	sudoUser := os.Getenv("SUDO_USER")
+	if sudoUser != "" {
+		// We are likely running with sudo. Lookup the original user.
+		u, err := user.Lookup(sudoUser)
+		if err == nil {
+			homeDir = u.HomeDir
+			// Parse ID strings to ints for Chown
+			if id, err := strconv.Atoi(u.Uid); err == nil {
+				uid = id
+			}
+			if id, err := strconv.Atoi(u.Gid); err == nil {
+				gid = id
+			}
+		}
+	}
+
+	// Fallback to standard environment if not sudo or lookup failed
+	if homeDir == "" {
+		h, err := os.UserHomeDir()
+		if err != nil {
+			return "", -1, -1, err
+		}
+		homeDir = h
+	}
+
+	return filepath.Join(homeDir, ".scalpel-racer", "certs"), uid, gid, nil
 }
 
 func (i *Interceptor) Start() error {
