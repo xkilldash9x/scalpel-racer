@@ -11,7 +11,7 @@
 
 > **A high-precision race condition exploitation framework.**
 
-![Python Version](https://img.shields.io/badge/python-3.11%2B-blue)
+![Go Version](https://img.shields.io/badge/go-1.18%2B-blue)
 ![Strategies](https://img.shields.io/badge/strategies-SPA%20%7C%20First--Seq%20%7C%20Sync-orange)
 ![Status](https://img.shields.io/badge/status-active-green)
 
