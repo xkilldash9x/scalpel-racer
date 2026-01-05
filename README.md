@@ -51,50 +51,72 @@ go build -o scalpel-racer ./cmd/scalpel-racer
 ## Usage Guide
 
 ### 1. Start the Engine
-Launch the tool. It acts as an interactive CLI and Proxy.
+Launch the tool. It acts as an interactive TUI (Terminal User Interface) and Proxy.
 
 ```bash
 # Listen on port 8080 (default)
 ./scalpel-racer
+
+# Or specify a custom port
+./scalpel-racer -p 9090
 ```
 
 ### 2. Capture Traffic
 Configure your browser (or Burp Suite) to proxy through `127.0.0.1:8080`.
 *   Trigger the request you want to test in your browser.
-*   It will appear in the Scalpel CLI.
+*   It will appear in the Scalpel TUI list.
 
-### 3. Race!
-Inside the CLI:
+### 3. TUI Workflow
+The tool uses a keyboard-driven interface.
 
-*   **`ls`**: List captured requests.
-*   **`race <ID>`**: Launch an attack on request #ID.
-*   **`race <ID> 20`**: Launch with 20 concurrent threads.
+1.  **Select**: Use `Up`/`Down` arrows (or `j`/`k`) to navigate captured requests.
+2.  **Edit**: Press `Enter` on a request to open the Payload Editor. You can modify headers and body here.
+3.  **Strategy**: Press `Tab` in the main list to toggle between strategies (e.g., H2 vs H1).
+4.  **Race**: Inside the editor, press `Ctrl+S` to launch the attack.
+5.  **Analyze**:
+    *   Results are displayed in a table.
+    *   Press `f` to toggle "Filter Outliers" (hide common responses).
+    *   Select a result to view its content.
+    *   **Diffing**: Press `b` on a result to set it as "Baseline", then select another result to see a diff.
 
-```text
-vector > ls
-[0] POST https://api.example.com/transfer
+### Key Bindings
 
-vector > race 0 20
-[*] Racing https://api.example.com/transfer (20 threads)...
-```
+| Context | Key | Action |
+| :--- | :--- | :--- |
+| **Global** | `q` / `Ctrl+C` | Quit |
+| **Capture List** | `↑` / `↓` / `k` / `j` | Navigate requests |
+| | `Enter` | Edit selected request |
+| | `Tab` | Toggle Attack Strategy |
+| **Editor** | `Ctrl+S` | Start Race (Attack) |
+| | `Esc` | Cancel / Back to List |
+| **Results** | `f` | Filter Outliers |
+| | `b` | Set Baseline for Diff |
+| | `Enter` | Set Suspect for Diff |
+| | `Esc` | Back to Capture List |
 
 ## Attack Strategies
 
-### Auto (Default)
+### Auto / H1 (Default)
 Uses `net/http` with synchronization barriers. Good for general testing.
 *   Supports **Staged Attacks**: Insert `{{SYNC}}` in the body (e.g., `param=val&{{SYNC}}final=true`) to pause requests before the final byte.
 
-### SPA (Single Packet Attack)
+### SPA (Single Packet Attack / H2)
 Uses **HTTP/2** features to pre-send headers and hold the final DATA frame. All requests complete when the final packet arrives, eliminating most network jitter.
 
 ## Architecture
 
-*   **`cmd/scalpel-racer`**: Command Center & UI.
+*   **`cmd/scalpel-racer`**: Application Entry Point.
+*   **`internal/ui`**: Bubble Tea TUI implementation.
 *   **`internal/proxy`**: Unified Proxy (TCP/QUIC) Orchestrator.
 *   **`internal/engine`**: Native H1/H2 Proxy Engine.
 *   **`internal/packet`**: Low-level packet manipulation.
 
 ## Troubleshooting
+
+### Logs
+The TUI disables standard output logging to prevent display corruption.
+*   **`racer.log`**: Contains application telemetry and errors.
+*   **`debug.log`**: Contains UI-specific debug information.
 
 ### Common Issues
 
@@ -104,15 +126,15 @@ Uses **HTTP/2** features to pre-send headers and hold the final DATA frame. All 
 
 *   **`address already in use`**:
     *   **Cause**: Another process (or a previous instance of Scalpel Racer) is using the specified port.
-    *   **Fix**: Kill the process using `lsof -i :<port>` / `kill <PID>` or use the `-l <port>` argument to listen on a different port.
+    *   **Fix**: Kill the process using `lsof -i :<port>` / `kill <PID>` or use the `-p <port>` argument to listen on a different port.
 
 *   **Browser Warnings / SSL Errors**:
     *   **Cause**: The browser does not trust the generated CA.
     *   **Fix**: Import `~/.scalpel-racer/certs/ca.pem` into your browser's Trusted Root Certification Authorities store. Firefox has its own store separate from the OS.
 
 *   **No Requests Captured**:
-    *   **Cause**: The proxy is not configured correctly in your browser/tool, or the `scope` regex is too restrictive.
-    *   **Fix**: Ensure your browser proxy is set to `127.0.0.1:8080` (or your custom port) for both HTTP and HTTPS. Check your `--scope` argument.
+    *   **Cause**: The proxy is not configured correctly in your browser/tool.
+    *   **Fix**: Ensure your browser proxy is set to `127.0.0.1:8080` (or your custom port) for both HTTP and HTTPS.
 
 ---
 _Crafted with precision by Project Scalpel Team._

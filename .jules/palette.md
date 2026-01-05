@@ -1,3 +1,3 @@
-## 2024-05-24 - [Command Line Feedback]
-**Learning:** In CLI/TUI applications using `if/elif` chains for command handling, lack of an explicit `else` or default handler leaves users confused when they mistype commands, as there is no visual feedback that the input was processed but rejected.
-**Action:** Always implement a default "Unknown command" handler in command loops to provide immediate feedback to the user, ensuring they know the system is responsive but the command was invalid.
+## 2024-05-23 - [Color-coded HTTP Methods]
+**Learning:** Terminal-based UIs benefit significantly from color-coding key information (like HTTP methods) to improve scannability, similar to how GUI tools use icons/colors.
+**Action:** When working with CLI/TUI tools, look for "key columns" in tabular data that can be color-coded for quick visual filtering.
