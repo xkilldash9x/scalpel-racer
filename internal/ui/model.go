@@ -336,23 +336,30 @@ func (m Model) updateIntercepting(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch {
 		case key.Matches(msg, m.Keys.Tab):
-			// Cycle Strategies: h2 <-> h1 (h1 now includes packet sync)
-			if m.Strategy == "h2" {
+			// Cycle Strategies: h2 -> h1 -> h3 -> h2
+			switch m.Strategy {
+			case "h2":
 				m.Strategy = "h1"
-			} else {
+			case "h1":
+				m.Strategy = "h3"
+			default:
 				m.Strategy = "h2"
 			}
+			return m, nil
 
 		case key.Matches(msg, m.Keys.Enter):
 			idx := m.ReqTable.Cursor()
 			if meta := m.History.GetMeta(idx); meta != nil {
+				// Clone to avoid mutation of history
 				m.SelectedReq = meta.Req.Clone()
+
 				// If body is on disk, we must load it asynchronously
 				if meta.OnDisk {
 					m.State = StateLoading
 					return m, m.loadBodyCmd(meta.Req.OffloadPath)
 				}
-				// Otherwise, proceed
+
+				// Otherwise, proceed to Editor
 				m.Editor.SetValue(requestToText(m.SelectedReq))
 				m.State = StateEditing
 				m.Editor.Focus()
@@ -547,9 +554,10 @@ func (m *Model) runRaceCmd(req *models.CapturedRequest, strategy string, concurr
 		ctx, cancel := context.WithTimeout(ctxCopy, 45*time.Second)
 		defer cancel()
 
-		switch strategy {
-		case "h1", "first-seq":
-			// STRATEGY: H1 + Packet Synchronization (Hybrid)
+		// Packet Controller Logic
+		// We only use this for TCP-based protocols (H1/H2).
+		// H3 is UDP (QUIC), so a TCP packet sync controller is useless there.
+		if strategy == "h1" || strategy == "h2" {
 			targetIP, port := resolveTargetIPAndPort(req, resolver)
 			if targetIP != "" {
 				pc := packet.NewController(targetIP, port, concurrency, logger)
@@ -562,13 +570,23 @@ func (m *Model) runRaceCmd(req *models.CapturedRequest, strategy string, concurr
 					logger.Warn("Packet Controller failed to start (Root required?). Degrading to standard pipelining.", zap.Error(startErr))
 				}
 			}
+		}
 
-			// Pass the timed context to the engine
-			res, err = racer.RunH1Race(ctx, req, concurrency)
+		logger.Info("Starting Race", zap.String("strategy", strategy))
 
-		default:
-			// STRATEGY: H2 (Single Packet Attack)
+		switch strategy {
+		case "h3":
+			// H3 uses QUIC (UDP), handled inside the engine.
+			res, err = racer.RunH3Race(ctx, req, concurrency)
+		case "h2":
+			// H2 Single Packet Attack
 			res, err = racer.RunH2Race(ctx, req, concurrency)
+		case "h1", "first-seq":
+			// H1 Last-Byte Sync
+			res, err = racer.RunH1Race(ctx, req, concurrency)
+		default:
+			// Default fallback
+			res, err = racer.RunH1Race(ctx, req, concurrency)
 		}
 
 		if err != nil {

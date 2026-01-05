@@ -46,7 +46,16 @@ func (m Model) View() string {
 			"\n", m.ProgressBar.View())
 	case StateResults:
 		left := panelStyle.Render(m.ResTable.View())
-		right := panelStyle.Render(m.DiffView.View())
+
+		// UX Enhancement: Fixed Header for Diff View
+		// Separates metadata from the scrolling content and aligns columns
+		header := m.renderDiffHeader()
+		rightContent := lipgloss.JoinVertical(lipgloss.Left,
+			header,
+			m.DiffView.View(),
+		)
+		right := panelStyle.Render(rightContent)
+
 		content = lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 	}
 
@@ -85,6 +94,44 @@ func (m Model) renderStatusBar() string {
 			lipgloss.NewStyle().Width(5).Render(""),
 			m.Help.View(m.HelpKeyMap()),
 		),
+	)
+}
+
+// renderDiffHeader creates a fixed header row for the diff comparison
+func (m Model) renderDiffHeader() string {
+	if m.BaselineRes == nil || m.SuspectRes == nil {
+		return ""
+	}
+
+	width := m.DiffView.Width
+	half := (width / 2) - 4
+	if half < 10 {
+		half = 10
+	}
+
+	// Dynamic Styles
+	baseStyle := lipgloss.NewStyle().
+		Foreground(cFocus).
+		Bold(true).
+		Width(half).
+		Align(lipgloss.Left)
+
+	suspectStyle := lipgloss.NewStyle().
+		Foreground(cWarn).
+		Bold(true).
+		Width(half).
+		Align(lipgloss.Left)
+
+	sep := lipgloss.NewStyle().Foreground(cSub).SetString(" │ ")
+
+	// Content
+	bTitle := fmt.Sprintf("BASELINE [%d]", m.BaselineRes.StatusCode)
+	sTitle := fmt.Sprintf("SUSPECT #%d [%d]", m.SuspectRes.Index, m.SuspectRes.StatusCode)
+
+	return lipgloss.JoinHorizontal(lipgloss.Left,
+		baseStyle.Render(bTitle),
+		sep.Render(),
+		suspectStyle.Render(sTitle),
 	)
 }
 
@@ -220,6 +267,10 @@ func renderTextDiff(b, s []byte, width int) string {
 		half = 10
 	}
 
+	// Styles for proper alignment
+	colStyle := lipgloss.NewStyle().Width(half)
+	sep := " │ "
+
 	for i := 0; i < max; i++ {
 		bTxt := ""
 		sTxt := ""
@@ -234,7 +285,16 @@ func renderTextDiff(b, s []byte, width int) string {
 		if bTxt != sTxt {
 			sStyle = diffSuspectStyle
 		}
-		sb.WriteString(fmt.Sprintf("%-"+strconv.Itoa(half)+"s │ %s\n", diffBaseStyle.Render(bTxt), sStyle.Render(sTxt)))
+
+		// Fix: Use lipgloss for padding to handle ANSI codes correctly.
+		// Previous fmt.Sprintf("%-50s", coloredText) failed because ANSI codes were counted in length.
+		line := lipgloss.JoinHorizontal(lipgloss.Left,
+			colStyle.Render(diffBaseStyle.Render(bTxt)),
+			sep,
+			sStyle.Render(sTxt),
+		)
+
+		sb.WriteString(line + "\n")
 	}
 	return sb.String()
 }
@@ -353,7 +413,8 @@ func (m *Model) updateLayout() {
 		diffW = 10
 	}
 	m.DiffView.Width = diffW
-	m.DiffView.Height = h
+	// Reduced height to accommodate the fixed header (1 line)
+	m.DiffView.Height = h - 1
 
 	if m.State == StateResults {
 		m.updateDiffView()
