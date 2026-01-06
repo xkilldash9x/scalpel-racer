@@ -168,6 +168,12 @@ func (r *Racer) buildRequest(ctx context.Context, reqSpec *models.CapturedReques
 	if err != nil {
 		return nil, err
 	}
+
+	// Explicitly set Host from spec if present to handle IP-based URLs correctly
+	if h, ok := reqSpec.Headers["Host"]; ok {
+		req.Host = h
+	}
+
 	req.Header.Set("User-Agent", "Scalpel-Racer/Sequence")
 	req.Header.Set("X-Scalpel-Seq", label)
 	for k, v := range reqSpec.Headers {

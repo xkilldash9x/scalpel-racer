@@ -67,6 +67,14 @@ func (r *Racer) RunH2Race(ctx context.Context, reqSpec *models.CapturedRequest, 
 		}
 
 		req, _ := http.NewRequestWithContext(raceCtx, method, reqSpec.URL, bytes.NewReader(reqSpec.Body))
+
+		// Explicitly set Host from spec if present.
+		// Since the URL might be an IP address (rewritten by UI model), we must force
+		// the correct Virtual Host in the :authority pseudo-header.
+		if h, ok := reqSpec.Headers["Host"]; ok {
+			req.Host = h
+		}
+
 		req.Header.Set("User-Agent", "Scalpel-Racer/Go-H2")
 		req.Header.Set("X-Scalpel-ID", fmt.Sprintf("%d", i))
 		for k, v := range reqSpec.Headers {

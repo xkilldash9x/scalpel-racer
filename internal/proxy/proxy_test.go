@@ -1,3 +1,4 @@
+// FILENAME: internal/proxy/proxy_test.go
 package proxy_test
 
 import (
@@ -26,13 +27,11 @@ func TestCertGeneration(t *testing.T) {
 	certFile := filepath.Join(tmpDir, "test_ca.pem")
 	keyFile := filepath.Join(tmpDir, "test_ca.key")
 
-	// First, create the CA
 	ca, err := proxy.LoadOrCreateCA(certFile, keyFile)
 	if err != nil {
 		t.Fatalf("Failed to generate CA: %v", err)
 	}
 
-	// Then, load it
 	loadedCa, err := proxy.LoadOrCreateCA(certFile, keyFile)
 	if err != nil {
 		t.Fatalf("Failed to load CA: %v", err)
@@ -58,7 +57,6 @@ func TestCertGeneration(t *testing.T) {
 		tmpDirCorrupted := t.TempDir()
 		certFileCorrupted := filepath.Join(tmpDirCorrupted, "test_ca.pem")
 		keyFileCorrupted := filepath.Join(tmpDirCorrupted, "test_ca.key")
-		// create dummy files
 		err := os.WriteFile(certFileCorrupted, []byte("corrupted"), 0644)
 		if err != nil {
 			t.Fatalf("Failed to write corrupted cert file: %v", err)
@@ -67,7 +65,6 @@ func TestCertGeneration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to write corrupted key file: %v", err)
 		}
-
 		_, err = proxy.LoadOrCreateCA(certFileCorrupted, keyFileCorrupted)
 		if err == nil {
 			t.Fatal("Expected error when loading corrupted CA, but got nil")
@@ -134,7 +131,6 @@ func TestInterceptor_Integration(t *testing.T) {
 	})
 }
 
-// TestInterceptor_Stability verifies the proxy handles "chaos" without crashing.
 func TestInterceptor_Stability(t *testing.T) {
 	logger := zap.NewNop()
 	p, _ := proxy.NewInterceptor(proxy.InterceptorConfig{Port: 0, InsecureSkipVerify: true}, logger)
@@ -150,8 +146,6 @@ func TestInterceptor_Stability(t *testing.T) {
 		}
 		defer conn.Close()
 		conn.Write([]byte("\xDE\xAD\xBE\xEF\x00\x01\x02"))
-		// Expectation: Proxy closes connection, no panic.
-		// We read until EOF to ensure server closed it.
 		io.ReadAll(conn)
 	})
 
@@ -180,11 +174,9 @@ func TestInterceptor_Stability(t *testing.T) {
 		req, _ := http.NewRequest("CONNECT", secureTarget.URL, nil)
 		req.Write(conn)
 
-		// Read the "200 Connection established" response
 		br := bufio.NewReader(conn)
 		br.ReadString('\n')
 
-		// Send junk instead of a valid TLS handshake
 		conn.Write([]byte("this is not a valid tls handshake"))
 		io.ReadAll(conn)
 	})
@@ -196,17 +188,14 @@ func TestInterceptor_Stability(t *testing.T) {
 		}
 		fmt.Fprintf(conn, "POST http://example.com/ HTTP/1.1\r\nHost: example.com\r\nContent-Length: 100\r\n\r\n")
 		conn.Write([]byte("StartOfBody"))
-		conn.Close() // Abrupt close
-		// Expectation: Logs an error, but does not hang routine
+		conn.Close()
 	})
 }
 
-// FIX: Moved to standalone test to avoid race condition on p.Transport
 func TestInterceptor_UpstreamFailure(t *testing.T) {
 	logger := zap.NewNop()
 	p, _ := proxy.NewInterceptor(proxy.InterceptorConfig{Port: 0}, logger)
 
-	// Inject Transport BEFORE starting the proxy
 	p.UpstreamClient.Transport = &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return nil, errors.New("connection refused simulation")
@@ -274,11 +263,12 @@ func TestLimitWriter(t *testing.T) {
 		}
 
 		n, err = lw.Write([]byte(" world"))
-		if err != io.ErrShortWrite {
-			t.Errorf("Write did not return ErrShortWrite: got %v", err)
+		// FIX: SpongeLimitWriter returns nil error on overflow
+		if err != nil {
+			t.Errorf("Write returned error: %v", err)
 		}
-		if n != 0 {
-			t.Errorf("Write returned non-zero bytes on short write: got %d", n)
+		if n != 6 {
+			t.Errorf("Write returned wrong number of bytes: got %d", n)
 		}
 	})
 
@@ -293,7 +283,6 @@ func TestLimitWriter(t *testing.T) {
 	})
 }
 
-// errorWriter is a writer that always returns an error
 type errorWriter struct {
 	err error
 }
@@ -302,8 +291,6 @@ func (w *errorWriter) Write(p []byte) (n int, err error) {
 	return 0, w.err
 }
 
-
-// Test coverage for captureAndForwardStandard
 func TestInterceptor_captureAndForwardStandard(t *testing.T) {
 	logger := zap.NewNop()
 	p, _ := proxy.NewInterceptor(proxy.InterceptorConfig{Port: 0}, logger)

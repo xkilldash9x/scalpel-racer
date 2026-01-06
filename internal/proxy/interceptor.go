@@ -4,16 +4,11 @@ package proxy
 import (
 	"bufio"
 	"bytes"
-	"crypto/ecdsa"
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"os"
-	"os/user"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -33,9 +28,8 @@ type InterceptorConfig struct {
 	// Port is the TCP/UDP port to listen on.
 	Port int
 	// InsecureSkipVerify controls whether the proxy validates upstream TLS certificates.
-	// Set to true for capturing traffic from targets with self-signed certs.
 	InsecureSkipVerify bool
-	// CertDir allows overriding the default certificate storage location (~/.scalpel-racer/certs).
+	// CertDir allows overriding the default certificate storage location.
 	CertDir string
 	// MaxIdleConns controls the connection pool size for upstream requests. Defaults to 100.
 	MaxIdleConns int
@@ -47,16 +41,12 @@ type Interceptor struct {
 	Port           int
 	CaptureChan    chan *models.CapturedRequest
 	Logger         *zap.Logger
-	ca             tls.Certificate
-	caParsed       *x509.Certificate
-	serverKey      *ecdsa.PrivateKey
+	certManager    *CertManager
 	listener       net.Listener
 	udpConn        *net.UDPConn
 	quicServer     *http3.Server
 	UpstreamClient *http.Client
 
-	certCache    map[string]*tls.Certificate
-	certCacheMu  sync.RWMutex
 	mu           sync.RWMutex
 	closed       bool
 	shutdownOnce sync.Once
@@ -73,42 +63,9 @@ func NewInterceptor(cfg InterceptorConfig, logger *zap.Logger) (*Interceptor, er
 		cfg.IdleConnTimeout = 90 * time.Second
 	}
 
-	// Resolve certificate directory (Config override > Safe Default)
-	var certDir string
-	var err error
-	if cfg.CertDir != "" {
-		certDir = cfg.CertDir
-	} else {
-		certDir, err = resolveSafeCertDir(logger)
-		if err != nil {
-			return nil, fmt.Errorf("failed to resolve safe cert directory: %w", err)
-		}
-	}
-
-	// Ensure the directory exists with strict 0700 permissions
-	if err := os.MkdirAll(certDir, 0700); err != nil {
-		return nil, fmt.Errorf("failed to create cert dir: %w", err)
-	}
-
-	certPath := filepath.Join(certDir, "ca.pem")
-	keyPath := filepath.Join(certDir, "ca.key")
-
-	logger.Info("Loading CA identity", zap.String("path", certDir))
-
-	ca, err := LoadOrCreateCA(certPath, keyPath)
+	cm, err := NewCertManager(cfg.CertDir, logger)
 	if err != nil {
 		return nil, err
-	}
-
-	caParsed, err := x509.ParseCertificate(ca.Certificate[0])
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse CA certificate: %w", err)
-	}
-
-	// Generate a shared key for leaf certificates to avoid expensive key gen per request
-	serverKey, err := GenerateSharedKey()
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate shared key: %w", err)
 	}
 
 	// Robust Transport Configuration
@@ -136,10 +93,7 @@ func NewInterceptor(cfg InterceptorConfig, logger *zap.Logger) (*Interceptor, er
 		Port:        cfg.Port,
 		CaptureChan: make(chan *models.CapturedRequest, 100),
 		Logger:      logger,
-		ca:          ca,
-		caParsed:    caParsed,
-		serverKey:   serverKey,
-		certCache:   make(map[string]*tls.Certificate),
+		certManager: cm,
 		stopChan:    make(chan struct{}),
 		UpstreamClient: &http.Client{
 			Transport:     transport,
@@ -147,38 +101,6 @@ func NewInterceptor(cfg InterceptorConfig, logger *zap.Logger) (*Interceptor, er
 			CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}, nil
-}
-
-// resolveSafeCertDir resolves the directory with strict validation to prevent
-// path traversal or arbitrary file overwrite attacks when using defaults.
-func resolveSafeCertDir(logger *zap.Logger) (string, error) {
-	// 1. Determine the effective home directory
-	var homeDir string
-
-	// Prefer the user attempting to run sudo, but ONLY if we are actually root.
-	sudoUser := os.Getenv("SUDO_USER")
-	if sudoUser != "" && os.Geteuid() == 0 {
-		u, err := user.Lookup(sudoUser)
-		if err == nil {
-			homeDir = u.HomeDir
-			logger.Debug("Using SUDO_USER home for cert storage", zap.String("user", sudoUser))
-		}
-	}
-
-	if homeDir == "" {
-		h, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		homeDir = h
-	}
-
-	// 2. Hardcode the subdirectory. Do NOT allow env var overrides for the base path
-	// when running as root/sudo, as this allows attackers to target /etc or /bin.
-	targetDir := filepath.Join(homeDir, ".scalpel-racer", "certs")
-
-	// 3. Clean the path to resolve any ".."
-	return filepath.Clean(targetDir), nil
 }
 
 func (i *Interceptor) Start() error {
@@ -190,9 +112,10 @@ func (i *Interceptor) Start() error {
 	// Update port if 0 was passed
 	i.Port = i.listener.Addr().(*net.TCPAddr).Port
 
+	// RESTORED: QUIC/HTTP3 Server Setup
 	i.quicServer = &http3.Server{
 		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{i.ca},
+			Certificates: []tls.Certificate{i.certManager.GetCA()},
 			NextProtos:   []string{"h3"},
 		},
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -261,27 +184,37 @@ func (i *Interceptor) serveQUIC() {
 func (i *Interceptor) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
-	if err := clientConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		return
-	}
-
+	// Wrap in a buffered conn to peek at headers/protocol
 	br := bufio.NewReader(clientConn)
-	req, err := http.ReadRequest(br)
-
-	// Reset deadline strictly
-	_ = clientConn.SetReadDeadline(time.Time{})
-
-	if err != nil {
-		return
-	}
-
-	// Use BufferedConn to allow reading the already-buffered bytes from bufio
 	proxyConn := NewBufferedConn(clientConn, br)
 
-	if req.Method == http.MethodConnect {
-		i.handleHTTPS(proxyConn, req)
-	} else {
-		i.handleHTTP(proxyConn, req)
+	// Keep-Alive Loop for standard HTTP
+	for {
+		// Set idle timeout for reading the request line
+		if err := clientConn.SetReadDeadline(time.Now().Add(i.UpstreamClient.Transport.(*http.Transport).IdleConnTimeout)); err != nil {
+			return
+		}
+
+		req, err := http.ReadRequest(br)
+		if err != nil {
+			// Normal connection close or timeout (keep-alive idle)
+			return
+		}
+
+		// Reset deadline strictly for request processing
+		_ = clientConn.SetReadDeadline(time.Time{})
+
+		if req.Method == http.MethodConnect {
+			i.handleHTTPS(proxyConn, req)
+			// HTTPS tunnel takes over the connection, we are done
+			return
+		}
+
+		// Handle HTTP
+		keepAlive := i.handleHTTP(proxyConn, req)
+		if !keepAlive {
+			return
+		}
 	}
 }
 
@@ -296,28 +229,19 @@ func (i *Interceptor) handleHTTPS(clientConn net.Conn, req *http.Request) {
 		return
 	}
 
-	i.certCacheMu.RLock()
-	leaf, hit := i.certCache[host]
-	i.certCacheMu.RUnlock()
-
-	if !hit {
-		leaf, err = GenerateLeafCert(i.ca, i.caParsed, i.serverKey, host)
-		if err != nil {
-			i.Logger.Error("cert gen fail", zap.Error(err))
-			return
-		}
-		i.certCacheMu.Lock()
-		if len(i.certCache) > 1000 {
-			i.certCache = make(map[string]*tls.Certificate)
-		}
-		i.certCache[host] = leaf
-		i.certCacheMu.Unlock()
+	leaf, err := i.certManager.GetOrCreate(host)
+	if err != nil {
+		i.Logger.Error("cert gen fail", zap.Error(err))
+		return
 	}
 
-	tlsConfig := &tls.Config{Certificates: []tls.Certificate{*leaf}}
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{*leaf},
+		NextProtos:   []string{"http/1.1"}, // Enforce HTTP/1.1
+	}
 	tlsConn := tls.Server(clientConn, tlsConfig)
 
-	if err := tlsConn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+	if err := tlsConn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		return
 	}
 	if err := tlsConn.Handshake(); err != nil {
@@ -327,22 +251,36 @@ func (i *Interceptor) handleHTTPS(clientConn net.Conn, req *http.Request) {
 	defer tlsConn.Close()
 
 	tlsReader := bufio.NewReader(tlsConn)
-	secureReq, err := http.ReadRequest(tlsReader)
-	if err != nil {
-		return
-	}
 
-	secureReq.URL.Scheme = "https"
-	secureReq.URL.Host = req.URL.Host
-	i.captureAndForwardRaw(tlsConn, secureReq)
+	for {
+		// Idle timeout for keep-alive inside tunnel
+		if err := tlsConn.SetReadDeadline(time.Now().Add(60 * time.Second)); err != nil {
+			return
+		}
+
+		secureReq, err := http.ReadRequest(tlsReader)
+		if err != nil {
+			return
+		}
+
+		_ = tlsConn.SetReadDeadline(time.Time{})
+
+		secureReq.URL.Scheme = "https"
+		secureReq.URL.Host = req.URL.Host
+
+		keepAlive := i.captureAndForwardRaw(tlsConn, secureReq)
+		if !keepAlive {
+			return
+		}
+	}
 }
 
-func (i *Interceptor) handleHTTP(clientConn net.Conn, req *http.Request) {
+func (i *Interceptor) handleHTTP(clientConn net.Conn, req *http.Request) bool {
 	req.URL.Scheme = "http"
 	if req.URL.Host == "" {
 		req.URL.Host = req.Host
 	}
-	i.captureAndForwardRaw(clientConn, req)
+	return i.captureAndForwardRaw(clientConn, req)
 }
 
 type startTeeReadCloser struct {
@@ -350,8 +288,19 @@ type startTeeReadCloser struct {
 	io.Closer
 }
 
-func (i *Interceptor) captureAndForwardRaw(clientConn net.Conn, req *http.Request) {
+// captureAndForwardRaw returns true if the connection should be kept alive
+func (i *Interceptor) captureAndForwardRaw(clientConn net.Conn, req *http.Request) bool {
+	// Handle Expect: 100-continue (Deadlock fix)
+	if strings.EqualFold(req.Header.Get("Expect"), "100-continue") {
+		_, err := fmt.Fprintf(clientConn, "HTTP/1.1 100 Continue\r\n\r\n")
+		if err != nil {
+			return false
+		}
+		req.Header.Del("Expect")
+	}
+
 	var captureBuf bytes.Buffer
+	// Use SpongeLimitWriter to prevent aborting large requests
 	limitWriter := LimitWriter(&captureBuf, MaxCaptureSize)
 
 	proxyBody := &startTeeReadCloser{
@@ -368,9 +317,8 @@ func (i *Interceptor) captureAndForwardRaw(clientConn net.Conn, req *http.Reques
 	i.persistCapture(req, captureBuf.Bytes())
 
 	if err != nil {
-		// Use fmt.Fprintf carefully, ignoring errors as client might be gone
 		_, _ = fmt.Fprintf(clientConn, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-		return
+		return false
 	}
 	defer resp.Body.Close()
 
@@ -378,7 +326,10 @@ func (i *Interceptor) captureAndForwardRaw(clientConn net.Conn, req *http.Reques
 
 	if err := resp.Write(clientConn); err != nil {
 		i.Logger.Debug("response write fail", zap.Error(err))
+		return false
 	}
+
+	return !resp.Close && !req.Close
 }
 
 func (i *Interceptor) CaptureAndForwardStandard(w http.ResponseWriter, req *http.Request) {
@@ -436,7 +387,7 @@ func (i *Interceptor) persistCapture(req *http.Request, body []byte) {
 
 	captured := &models.CapturedRequest{
 		Method:   req.Method,
-		URL:      req.URL.String(), // Full URL kept for internal capture logic
+		URL:      req.URL.String(),
 		Headers:  headers,
 		Body:     body,
 		Protocol: req.Proto,
@@ -445,7 +396,6 @@ func (i *Interceptor) persistCapture(req *http.Request, body []byte) {
 	select {
 	case i.CaptureChan <- captured:
 	case <-i.stopChan:
-		// Do not write if we are stopping
 		return
 	default:
 		i.Logger.Warn("capture channel full, dropping request")
@@ -472,6 +422,10 @@ func (i *Interceptor) Close() {
 		if i.listener != nil {
 			i.listener.Close()
 		}
+		// FIX: Explicitly close the UDP connection to prevent resource leaks
+		if i.udpConn != nil {
+			i.udpConn.Close()
+		}
 		if i.quicServer != nil {
 			i.quicServer.Close()
 		}
@@ -485,28 +439,39 @@ func (i *Interceptor) Close() {
 // Utilities & Helper Functions
 // -----------------------------------------------------------------------------
 
-// limitWriter is a writer that writes to w but stops with an ErrShortWrite after n bytes.
-type limitWriter struct {
-	W io.Writer // underlying writer
-	N int64     // max bytes remaining
+// SpongeLimitWriter writes to W until N bytes are written.
+// After N bytes, it silently discards data but returns success.
+// This prevents io.TeeReader from failing when the capture buffer is full.
+type SpongeLimitWriter struct {
+	W io.Writer
+	N int64
 }
 
-func (l *limitWriter) Write(p []byte) (n int, err error) {
+func NewSpongeLimitWriter(w io.Writer, n int64) *SpongeLimitWriter {
+	return &SpongeLimitWriter{W: w, N: n}
+}
+
+func (l *SpongeLimitWriter) Write(p []byte) (n int, err error) {
 	if l.N <= 0 {
-		return 0, io.ErrShortWrite
+		return len(p), nil
 	}
+
 	if int64(len(p)) > l.N {
-		p = p[0:l.N]
-		err = io.ErrShortWrite
+		// Partial write to buffer
+		n, err = l.W.Write(p[:l.N])
+		l.N = 0
+		if err != nil {
+			return n, err
+		}
+		// Return len(p) so caller thinks we consumed it all
+		return len(p), nil
 	}
-	n, writeErr := l.W.Write(p)
-	if writeErr != nil {
-		err = writeErr
-	}
+
+	n, err = l.W.Write(p)
 	l.N -= int64(n)
-	return
+	return n, err
 }
 
 func LimitWriter(w io.Writer, n int64) io.Writer {
-	return &limitWriter{W: w, N: n}
+	return NewSpongeLimitWriter(w, n)
 }

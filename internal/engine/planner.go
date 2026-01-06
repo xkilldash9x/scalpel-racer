@@ -71,6 +71,13 @@ func PlanH1Attack(reqSpec *models.CapturedRequest) (*RacePlan, error) {
 		req.Header.Set(k, v)
 	}
 
+	// Explicitly set Host again on the reconstructed object.
+	// This handles the case where the caller uses this object, ensuring the
+	// Virtual Host is correct even if req.URL points to an IP address.
+	if h, ok := reqSpec.Headers["Host"]; ok {
+		req.Host = h
+	}
+
 	return &RacePlan{
 		WireStages:   wireStages,
 		CleanRequest: req,
@@ -115,6 +122,13 @@ func constructCleanRequest(reqSpec *models.CapturedRequest, bodyChunks [][]byte)
 			continue
 		}
 		req.Header.Set(k, v)
+	}
+
+	// Explicitly set Host from spec if present.
+	// This ensures the Host header in the serialized request matches the original
+	// capture, preserving Virtual Hosting even if the URL uses an IP address.
+	if h, ok := reqSpec.Headers["Host"]; ok {
+		req.Host = h
 	}
 
 	// BUG FIX: Enforce Keep-Alive to ensure the socket remains open for subsequent packet stages.

@@ -201,6 +201,13 @@ func (r *Racer) RunH3Race(ctx context.Context, reqSpec *models.CapturedRequest, 
 				return
 			}
 			req.ContentLength = int64(len(bodyData))
+
+			// CRITICAL: Explicitly set req.Host from headers.
+			// This ensures proper Virtual Hosting even if the URL points to an IP.
+			if h, ok := reqSpec.Headers["Host"]; ok {
+				req.Host = h
+			}
+
 			req.Header.Set("User-Agent", "Scalpel-Racer/Go-H3")
 			req.Header.Set("X-Scalpel-ID", fmt.Sprintf("%d", idx))
 			for k, v := range reqSpec.Headers {
