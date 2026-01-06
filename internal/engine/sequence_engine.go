@@ -171,6 +171,9 @@ func (r *Racer) buildRequest(ctx context.Context, reqSpec *models.CapturedReques
 	req.Header.Set("User-Agent", "Scalpel-Racer/Sequence")
 	req.Header.Set("X-Scalpel-Seq", label)
 	for k, v := range reqSpec.Headers {
+		if http.CanonicalHeaderKey(k) == "Host" {
+			req.Host = v
+		}
 		req.Header.Set(k, v)
 	}
 	return req, nil

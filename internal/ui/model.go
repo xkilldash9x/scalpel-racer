@@ -557,11 +557,45 @@ func (m *Model) runRaceCmd(req *models.CapturedRequest, strategy string, concurr
 		ctx, cancel := context.WithTimeout(ctxCopy, 45*time.Second)
 		defer cancel()
 
+		// Clone the request to modify it for the attack without affecting the UI state
+		attackReq := req.Clone()
+
+		// Resolve Target IP and Port
+		targetIP, port := resolveTargetIPAndPort(attackReq, resolver)
+
+		// 1. Rewrite URL to use IP to ensure direct connection to the monitored target
+		if targetIP != "" {
+			u, err := url.Parse(attackReq.URL)
+			if err == nil {
+				// Ensure Host header is preserved before rewriting URL
+				// FIX: Use case-insensitive check to avoid duplicate headers
+				hasHost := false
+				for k := range attackReq.Headers {
+					if strings.EqualFold(k, "Host") {
+						hasHost = true
+						break
+					}
+				}
+				if !hasHost {
+					attackReq.Headers["Host"] = u.Host
+				}
+
+				// Construct new host string (handle IPv6)
+				hostStr := targetIP
+				if strings.Contains(targetIP, ":") && !strings.HasPrefix(targetIP, "[") {
+					hostStr = fmt.Sprintf("[%s]", targetIP)
+				}
+
+				// Rewrite URL Host
+				u.Host = fmt.Sprintf("%s:%d", hostStr, port)
+				attackReq.URL = u.String()
+			}
+		}
+
 		// Packet Controller Logic
 		// We only use this for TCP-based protocols (H1/H2).
 		// H3 is UDP (QUIC), so a TCP packet sync controller is useless there.
 		if strategy == "h1" || strategy == "h2" {
-			targetIP, port := resolveTargetIPAndPort(req, resolver)
 			if targetIP != "" {
 				pc := packet.NewController(targetIP, port, concurrency, logger)
 				// Critical: We must ensure start doesn't indefinitely block handshake packets
@@ -581,16 +615,16 @@ func (m *Model) runRaceCmd(req *models.CapturedRequest, strategy string, concurr
 		switch strategy {
 		case "h3":
 			// H3 uses QUIC (UDP), handled inside the engine.
-			res, err = racer.RunH3Race(ctx, req, concurrency)
+			res, err = racer.RunH3Race(ctx, attackReq, concurrency)
 		case "h2":
 			// H2 Single Packet Attack
-			res, err = racer.RunH2Race(ctx, req, concurrency)
+			res, err = racer.RunH2Race(ctx, attackReq, concurrency)
 		case "h1", "first-seq":
 			// H1 Last-Byte Sync
-			res, err = racer.RunH1Race(ctx, req, concurrency)
+			res, err = racer.RunH1Race(ctx, attackReq, concurrency)
 		default:
 			// Default fallback
-			res, err = racer.RunH1Race(ctx, req, concurrency)
+			res, err = racer.RunH1Race(ctx, attackReq, concurrency)
 		}
 
 		if err != nil {

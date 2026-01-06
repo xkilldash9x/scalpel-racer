@@ -103,6 +103,11 @@ func constructCleanRequest(reqSpec *models.CapturedRequest, bodyChunks [][]byte)
 	for k, v := range reqSpec.Headers {
 		canonical := http.CanonicalHeaderKey(k)
 
+		// Explicitly set Host property from headers if present
+		if canonical == "Host" {
+			req.Host = v
+		}
+
 		// BUG FIX: Strip connection-control headers that disrupt pipelining.
 		if canonical == "Content-Length" || canonical == "Transfer-Encoding" || canonical == "Connection" {
 			// Validate format if it's Content-Length, even if we ignore the value for the override.

@@ -204,6 +204,9 @@ func (r *Racer) RunH3Race(ctx context.Context, reqSpec *models.CapturedRequest, 
 			req.Header.Set("User-Agent", "Scalpel-Racer/Go-H3")
 			req.Header.Set("X-Scalpel-ID", fmt.Sprintf("%d", idx))
 			for k, v := range reqSpec.Headers {
+				if http.CanonicalHeaderKey(k) == "Host" {
+					req.Host = v
+				}
 				req.Header.Set(k, v)
 			}
 
