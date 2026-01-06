@@ -90,7 +90,7 @@ func TestInterceptor_Integration(t *testing.T) {
 	}
 	defer p.Close()
 
-	proxyUrl, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", p.Port))
+	proxyUrl, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", p.Tcp.Port))
 	client := &http.Client{
 		Transport: &http.Transport{
 			Proxy:           http.ProxyURL(proxyUrl),
@@ -137,7 +137,7 @@ func TestInterceptor_Stability(t *testing.T) {
 	p.Start()
 	defer p.Close()
 
-	address := fmt.Sprintf("127.0.0.1:%d", p.Port)
+	address := fmt.Sprintf("127.0.0.1:%d", p.Tcp.Port)
 
 	t.Run("Junk Connection", func(t *testing.T) {
 		conn, err := net.Dial("tcp", address)
@@ -146,6 +146,9 @@ func TestInterceptor_Stability(t *testing.T) {
 		}
 		defer conn.Close()
 		conn.Write([]byte("\xDE\xAD\xBE\xEF\x00\x01\x02"))
+
+		// FIX: Set deadline to prevent deadlock if server keeps alive
+		conn.SetReadDeadline(time.Now().Add(1 * time.Second))
 		io.ReadAll(conn)
 	})
 
@@ -156,6 +159,34 @@ func TestInterceptor_Stability(t *testing.T) {
 		}
 		defer conn.Close()
 		conn.Write([]byte("GET / HTTP/1.1\r\n\r\n"))
+
+		// FIX: Set deadline. The server is now Keep-Alive, so it won't close!
+		conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		io.ReadAll(conn)
+	})
+
+	t.Run("Junk After HTTPS Connect", func(t *testing.T) {
+		secureTarget := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte("SecureData"))
+		}))
+		defer secureTarget.Close()
+
+		conn, err := net.Dial("tcp", address)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+
+		req, _ := http.NewRequest("CONNECT", secureTarget.URL, nil)
+		req.Write(conn)
+
+		br := bufio.NewReader(conn)
+		br.ReadString('\n') // Read "200 OK"
+
+		conn.Write([]byte("this is not a valid tls handshake"))
+
+		// FIX: Set deadline here too
+		conn.SetReadDeadline(time.Now().Add(1 * time.Second))
 		io.ReadAll(conn)
 	})
 
@@ -196,7 +227,7 @@ func TestInterceptor_UpstreamFailure(t *testing.T) {
 	logger := zap.NewNop()
 	p, _ := proxy.NewInterceptor(proxy.InterceptorConfig{Port: 0}, logger)
 
-	p.UpstreamClient.Transport = &http.Transport{
+	p.Client.Transport = &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return nil, errors.New("connection refused simulation")
 		},
@@ -205,7 +236,7 @@ func TestInterceptor_UpstreamFailure(t *testing.T) {
 	p.Start()
 	defer p.Close()
 
-	proxyUrl, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", p.Port))
+	proxyUrl, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", p.Tcp.Port))
 	client := &http.Client{
 		Transport: &http.Transport{Proxy: http.ProxyURL(proxyUrl)},
 	}
@@ -303,7 +334,7 @@ func TestInterceptor_captureAndForwardStandard(t *testing.T) {
 		}))
 		defer target.Close()
 
-		p.UpstreamClient.Transport = http.DefaultTransport
+		p.Client.Transport = http.DefaultTransport
 
 		req := httptest.NewRequest("GET", target.URL, nil)
 		rr := httptest.NewRecorder()
@@ -322,7 +353,7 @@ func TestInterceptor_captureAndForwardStandard(t *testing.T) {
 	})
 
 	t.Run("Upstream failure", func(t *testing.T) {
-		p.UpstreamClient.Transport = &http.Transport{
+		p.Client.Transport = &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return nil, errors.New("connection refused simulation")
 			},

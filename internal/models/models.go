@@ -10,15 +10,12 @@ import (
 
 // CapturedRequest represents the attack configuration.
 type CapturedRequest struct {
-	Method   string
-	URL      string
-	Headers  map[string]string
-	Body     []byte
-	Protocol string
-
-	// OffloadPath is populated if the body was written to disk during ingestion.
-	// This keeps the UI lightweight.
-	OffloadPath string `json:"-"`
+	Method      string            `json:"method"`
+	URL         string            `json:"url"`
+	Headers     map[string]string `json:"headers"`
+	Body        []byte            `json:"body,omitempty"`
+	Protocol    string            `json:"protocol"`
+	OffloadPath string            `json:"-"`
 }
 
 // Clone creates a deep copy of the request.
@@ -48,17 +45,14 @@ func (r *CapturedRequest) Clone() *CapturedRequest {
 
 // ScanResult represents the outcome of a single probe.
 type ScanResult struct {
-	Index       int
-	StatusCode  int
-	Duration    time.Duration
-	BodyHash    string
-	BodySnippet string
-	Body        []byte
-	Error       error
-
-	// New Field: Heuristic Flags
-	// e.g., "SEQ_LOCKED": "true", "LOCK_CONFIDENCE": "0.95"
-	Meta map[string]string
+	Index       int               `json:"index"`
+	StatusCode  int               `json:"status_code"`
+	Duration    time.Duration     `json:"duration_ns"`
+	BodyHash    string            `json:"body_hash"`
+	BodySnippet string            `json:"body_snippet"`
+	Body        []byte            `json:"-"` // Exclude raw body from JSON summary
+	Error       error             `json:"error,omitempty"`
+	Meta        map[string]string `json:"meta,omitempty"`
 }
 
 func NewScanResult(index int, statusCode int, duration time.Duration, body []byte, err error) ScanResult {

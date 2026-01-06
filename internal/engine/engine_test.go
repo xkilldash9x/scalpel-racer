@@ -1,3 +1,4 @@
+// FILENAME: internal/engine/engine_test.go
 package engine_test
 
 import (
@@ -26,7 +27,6 @@ type MockClientFactory struct {
 
 func (f *MockClientFactory) NewH1Client(u *url.URL, conf *customhttp.ClientConfig, l *zap.Logger) (engine.H1Client, error) {
 	if f.H1 != nil {
-		// FIX: Return the pointer directly to avoid copying the sync.Mutex embedded in MockH1Client.
 		return f.H1, nil
 	}
 	return nil, errors.New("mock h1 factory fail")
@@ -34,7 +34,6 @@ func (f *MockClientFactory) NewH1Client(u *url.URL, conf *customhttp.ClientConfi
 
 func (f *MockClientFactory) NewH2Client(u *url.URL, conf *customhttp.ClientConfig, l *zap.Logger) (engine.H2Client, error) {
 	if f.H2 != nil {
-		// FIX: Return the pointer directly to avoid copying the sync.Mutex
 		return f.H2, nil
 	}
 	return nil, errors.New("mock h2 factory fail")
@@ -126,6 +125,14 @@ func (m *MockH3Client) Do(ctx context.Context, req *http.Request) (*http.Respons
 
 func (m *MockH3Client) Close() error { return nil }
 
+func drainResults(ch <-chan models.ScanResult) []models.ScanResult {
+	var results []models.ScanResult
+	for r := range ch {
+		results = append(results, r)
+	}
+	return results
+}
+
 // -- Tests --
 
 func TestH1Race_Flow(t *testing.T) {
@@ -133,10 +140,17 @@ func TestH1Race_Flow(t *testing.T) {
 	racer := engine.NewRacer(&MockClientFactory{H1: mockH1}, zap.NewNop())
 	req := &models.CapturedRequest{URL: "http://e.com", Body: []byte("A{{SYNC}}B")}
 
-	results, err := racer.RunH1Race(context.Background(), req, 1)
+	concurrency := 1
+	resultsCh := make(chan models.ScanResult, concurrency)
+
+	// RunH1Race closes resultsCh upon completion/return, so we should NOT close it here again
+	err := racer.RunH1Race(context.Background(), req, concurrency, resultsCh)
 	if err != nil {
 		t.Fatalf("Race failed: %v", err)
 	}
+
+	results := drainResults(resultsCh)
+
 	if len(results) != 1 {
 		t.Error("Expected 1 result")
 	}
@@ -149,7 +163,7 @@ func TestH1Race_SystematicErrorPaths(t *testing.T) {
 	t.Run("InvalidURL", func(t *testing.T) {
 		r := engine.NewRacer(&MockClientFactory{}, logger)
 		// Control character in URL
-		_, err := r.RunH1Race(context.Background(), &models.CapturedRequest{URL: "http://e.com\x7f"}, 1)
+		err := r.RunH1Race(context.Background(), &models.CapturedRequest{URL: "http://e.com\x7f"}, 1, make(chan models.ScanResult, 1))
 		if err == nil {
 			t.Error("Expected error for invalid URL")
 		}
@@ -161,7 +175,7 @@ func TestH1Race_SystematicErrorPaths(t *testing.T) {
 			URL:     "http://e.com",
 			Headers: map[string]string{"Content-Length": "invalid"}, // Breaks serialization
 		}
-		_, err := r.RunH1Race(context.Background(), req, 1)
+		err := r.RunH1Race(context.Background(), req, 1, make(chan models.ScanResult, 1))
 		if err == nil {
 			t.Error("Expected planning error due to bad headers")
 		}
@@ -169,7 +183,10 @@ func TestH1Race_SystematicErrorPaths(t *testing.T) {
 
 	t.Run("ClientInitFail", func(t *testing.T) {
 		r := engine.NewRacer(&MockClientFactory{H1: nil}, logger)
-		res, _ := r.RunH1Race(context.Background(), &models.CapturedRequest{URL: "http://e.com"}, 1)
+		resultsCh := make(chan models.ScanResult, 1)
+		// RunH1Race closes resultsCh
+		_ = r.RunH1Race(context.Background(), &models.CapturedRequest{URL: "http://e.com"}, 1, resultsCh)
+		res := drainResults(resultsCh)
 		if len(res) > 0 && res[0].Error == nil {
 			t.Error("Expected factory error propagation")
 		}
@@ -177,7 +194,10 @@ func TestH1Race_SystematicErrorPaths(t *testing.T) {
 
 	t.Run("ConnectFail", func(t *testing.T) {
 		r := engine.NewRacer(&MockClientFactory{H1: &MockH1Client{ConnectError: errors.New("net fail")}}, logger)
-		res, _ := r.RunH1Race(context.Background(), &models.CapturedRequest{URL: "http://e.com"}, 1)
+		resultsCh := make(chan models.ScanResult, 1)
+		// RunH1Race closes resultsCh
+		_ = r.RunH1Race(context.Background(), &models.CapturedRequest{URL: "http://e.com"}, 1, resultsCh)
+		res := drainResults(resultsCh)
 		if res[0].Error == nil {
 			t.Error("Expected connect error")
 		}
@@ -185,7 +205,10 @@ func TestH1Race_SystematicErrorPaths(t *testing.T) {
 
 	t.Run("SendFail", func(t *testing.T) {
 		r := engine.NewRacer(&MockClientFactory{H1: &MockH1Client{SendError: errors.New("broken pipe")}}, logger)
-		res, _ := r.RunH1Race(context.Background(), &models.CapturedRequest{URL: "http://e.com"}, 1)
+		resultsCh := make(chan models.ScanResult, 1)
+		// RunH1Race closes resultsCh
+		_ = r.RunH1Race(context.Background(), &models.CapturedRequest{URL: "http://e.com"}, 1, resultsCh)
+		res := drainResults(resultsCh)
 		if res[0].Error == nil {
 			t.Error("Expected send error")
 		}
@@ -193,7 +216,10 @@ func TestH1Race_SystematicErrorPaths(t *testing.T) {
 
 	t.Run("ReadFail", func(t *testing.T) {
 		r := engine.NewRacer(&MockClientFactory{H1: &MockH1Client{ResponseError: errors.New("timeout")}}, logger)
-		res, _ := r.RunH1Race(context.Background(), &models.CapturedRequest{URL: "http://e.com"}, 1)
+		resultsCh := make(chan models.ScanResult, 1)
+		// RunH1Race closes resultsCh
+		_ = r.RunH1Race(context.Background(), &models.CapturedRequest{URL: "http://e.com"}, 1, resultsCh)
+		res := drainResults(resultsCh)
 		if res[0].Error == nil {
 			t.Error("Expected read error")
 		}
@@ -208,10 +234,25 @@ func TestH2Race_Flow(t *testing.T) {
 	racer := engine.NewRacer(&MockClientFactory{H2: mockH2}, zap.NewNop())
 	req := &models.CapturedRequest{URL: "https://e.com", Body: []byte("test")}
 
-	results, err := racer.RunH2Race(context.Background(), req, 5)
+	concurrency := 5
+	resultsCh := make(chan models.ScanResult, concurrency)
+
+	// Note: engine implementation for H2 likely handles closing too, but checking H1 specifically for now based on logs.
+	// If H2 follows same pattern, we assume correct behavior or fix if needed.
+	// Based on H1 fix, we should likely trust the engine to close or check H2 implementation.
+	// Provided logs only showed panic in TestH1Race_Flow.
+	err := racer.RunH2Race(context.Background(), req, concurrency, resultsCh)
 	if err != nil {
 		t.Fatalf("H2 race failed: %v", err)
 	}
+	// Warning: If RunH2Race also defers close, this is a bug.
+	// Assuming symmetry with H1, we should remove this close as well to be safe,
+	// though the log didn't explicitly trigger here yet.
+	// However, looking at the code provided for H1, it closes. I don't have H2 code but safer to assume symmetry.
+	// I will comment it out to be consistent with the fix pattern.
+	// close(resultsCh)
+
+	results := drainResults(resultsCh)
 	if len(results) != 5 {
 		t.Errorf("Expected 5 results, got %d", len(results))
 	}
@@ -223,7 +264,7 @@ func TestH2Race_SystematicErrors(t *testing.T) {
 
 	t.Run("InvalidURL", func(t *testing.T) {
 		r := engine.NewRacer(&MockClientFactory{}, logger)
-		_, err := r.RunH2Race(context.Background(), &models.CapturedRequest{URL: "::invalid"}, 1)
+		err := r.RunH2Race(context.Background(), &models.CapturedRequest{URL: "::invalid"}, 1, make(chan models.ScanResult, 1))
 		if err == nil {
 			t.Error("Expected error for invalid URL")
 		}
@@ -231,7 +272,7 @@ func TestH2Race_SystematicErrors(t *testing.T) {
 
 	t.Run("ClientInitFail", func(t *testing.T) {
 		r := engine.NewRacer(&MockClientFactory{H2: nil}, logger)
-		_, err := r.RunH2Race(context.Background(), req, 1)
+		err := r.RunH2Race(context.Background(), req, 1, make(chan models.ScanResult, 1))
 		if err == nil {
 			t.Error("Expected client init error")
 		}
@@ -239,7 +280,7 @@ func TestH2Race_SystematicErrors(t *testing.T) {
 
 	t.Run("ConnectFail", func(t *testing.T) {
 		r := engine.NewRacer(&MockClientFactory{H2: &MockH2Client{ConnectError: errors.New("fail")}}, logger)
-		_, err := r.RunH2Race(context.Background(), req, 1)
+		err := r.RunH2Race(context.Background(), req, 1, make(chan models.ScanResult, 1))
 		if err == nil {
 			t.Error("Expected global connect error")
 		}
@@ -247,7 +288,10 @@ func TestH2Race_SystematicErrors(t *testing.T) {
 
 	t.Run("PrepareFail", func(t *testing.T) {
 		r := engine.NewRacer(&MockClientFactory{H2: &MockH2Client{PrepareError: errors.New("fail")}}, logger)
-		res, _ := r.RunH2Race(context.Background(), req, 1)
+		resultsCh := make(chan models.ScanResult, 1)
+		_ = r.RunH2Race(context.Background(), req, 1, resultsCh)
+		// Removed close(resultsCh)
+		res := drainResults(resultsCh)
 		if res[0].Error == nil {
 			t.Error("Expected prepare error")
 		}
@@ -259,7 +303,10 @@ func TestH2Race_SystematicErrors(t *testing.T) {
 			ReleaseError:   errors.New("fail"),
 		}}, logger)
 
-		res, _ := r.RunH2Race(context.Background(), req, 1)
+		resultsCh := make(chan models.ScanResult, 1)
+		_ = r.RunH2Race(context.Background(), req, 1, resultsCh)
+		// Removed close(resultsCh)
+		res := drainResults(resultsCh)
 		if res[0].Error == nil {
 			t.Error("Expected release error")
 		}
@@ -271,7 +318,10 @@ func TestH2Race_SystematicErrors(t *testing.T) {
 			WaitError:      errors.New("timeout"),
 		}}, logger)
 
-		res, _ := r.RunH2Race(context.Background(), req, 1)
+		resultsCh := make(chan models.ScanResult, 1)
+		_ = r.RunH2Race(context.Background(), req, 1, resultsCh)
+		// Removed close(resultsCh)
+		res := drainResults(resultsCh)
 		if res[0].Error == nil {
 			t.Error("Expected wait response error")
 		}

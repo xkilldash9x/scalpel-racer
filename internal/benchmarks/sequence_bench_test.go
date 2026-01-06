@@ -1,4 +1,4 @@
-// FILENAME: internal/benchmarks/bench_test.go
+// FILENAME: internal/benchmarks/sequence_bench_test.go
 package benchmarks
 
 import (
@@ -33,10 +33,18 @@ func BenchmarkRaceOrchestration(b *testing.B) {
 	// Using RealClientFactory with invalid URL to measure init overhead
 	racer := engine.NewRacer(&engine.RealClientFactory{}, zap.NewNop())
 	req := &models.CapturedRequest{URL: "http://127.0.0.1:0", Body: []byte("A")}
+	concurrency := 1
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		racer.RunH1Race(context.Background(), req, 1)
+		resultsCh := make(chan models.ScanResult, concurrency)
+		go func() {
+			// RunH1Race closes resultsCh internally upon completion
+			_ = racer.RunH1Race(context.Background(), req, concurrency, resultsCh)
+		}()
+		for range resultsCh {
+			// consume results
+		}
 	}
 }
 

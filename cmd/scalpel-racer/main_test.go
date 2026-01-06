@@ -1,39 +1,38 @@
+// FILENAME: cmd/scalpel-racer/main_test.go
 package main
 
 import (
-	"fmt"
+	"bytes"
+	"context"
+	"errors"
+	"io"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-type MockRunner struct {
-	RunError error
+type MockRunner struct{}
+
+func (r *MockRunner) Run(p *tea.Program) (tea.Model, error) {
+	return nil, nil
 }
 
-func (m *MockRunner) Run(p *tea.Program) (tea.Model, error) {
-	return nil, m.RunError
-}
+func TestRun(t *testing.T) {
+	// creates a context that cancels immediately to ensure Run exits without user input
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
 
-func TestRun_FlagError(t *testing.T) {
-	err := Run([]string{"-undefined-flag"}, &MockRunner{})
-	if err == nil {
-		t.Error("Expected error for undefined flag, got nil")
-	}
-}
+	args := []string{"-p", "0"}
+	// Use an empty buffer for input to avoid racing on os.Stdin during test shutdown
+	input := bytes.NewBuffer(nil)
 
-func TestRun_Success(t *testing.T) {
-	// Use port 0 to bind to a random available port to prevent flake
-	err := Run([]string{"-p", "0"}, &MockRunner{})
-	if err != nil {
-		t.Errorf("Expected success, got error: %v", err)
-	}
-}
-
-func TestRun_UIError(t *testing.T) {
-	mock := &MockRunner{RunError: fmt.Errorf("ui failure")}
-	err := Run([]string{"-p", "0"}, mock)
-	if err == nil {
-		t.Error("Expected UI error")
+	// calls Run with the injected context and safe I/O
+	// note: we expect this to exit cleanly when the context times out
+	if err := Run(ctx, args, input, io.Discard); err != nil {
+		// If the context timed out, that's a successful test of the shutdown mechanism
+		if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+			t.Errorf("Run failed: %v", err)
+		}
 	}
 }

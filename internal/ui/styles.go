@@ -35,8 +35,8 @@ var (
 	diffSuspectStyle = lipgloss.NewStyle().Foreground(cWarn)
 
 	// Flags
-	outlierFlag = lipgloss.NewStyle().Foreground(cErr).Bold(true).SetString("!")
-	normalFlag  = lipgloss.NewStyle().SetString(" ")
+	outlierFlagStyle = lipgloss.NewStyle().Foreground(cErr).Bold(true)
+	normalFlagStyle  = lipgloss.NewStyle().Foreground(cSub)
 
 	// Empty State
 	emptyTitleStyle    = lipgloss.NewStyle().Foreground(cFocus).Bold(true)
