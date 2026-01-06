@@ -4,6 +4,7 @@ package ui
 import (
 	"os"
 	"runtime"
+	"sync"
 
 	"github.com/xkilldash9x/scalpel-racer/internal/models"
 	"go.uber.org/zap"
@@ -25,6 +26,7 @@ type RequestHistory struct {
 	size   int
 	limit  int
 	logger *zap.Logger
+	mu     sync.RWMutex
 }
 
 func NewRequestHistory(limit int, logger *zap.Logger) *RequestHistory {
@@ -35,12 +37,17 @@ func NewRequestHistory(limit int, logger *zap.Logger) *RequestHistory {
 	}
 }
 
+// Add inserts a request into the history ring buffer.
+// It handles disk offloading for large bodies and is thread-safe.
 func (h *RequestHistory) Add(req *models.CapturedRequest) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
 	stored := &StoredRequest{Req: req}
 
 	// Offload to disk if body is large
 	if len(req.Body) > BodyOffloadThreshold {
-		// -- Usage of os.CreateTemp replaces deprecated ioutil.TempFile --
+		// Use os.CreateTemp for safe temporary file creation
 		tmpfile, err := os.CreateTemp("", "scalpel-body-*.bin")
 		if err != nil {
 			h.logger.Error("Failed to create temp file for body offload", zap.Error(err))
@@ -52,10 +59,10 @@ func (h *RequestHistory) Add(req *models.CapturedRequest) {
 
 			if writeErr != nil {
 				h.logger.Error("Failed to write to temp file for body offload", zap.Error(writeErr))
-				os.Remove(tmpfile.Name())
+				_ = os.Remove(tmpfile.Name())
 			} else if closeErr != nil {
 				h.logger.Error("Failed to close temp file", zap.Error(closeErr))
-				os.Remove(tmpfile.Name())
+				_ = os.Remove(tmpfile.Name())
 			} else {
 				h.logger.Info("Offloaded large request body to disk", zap.String("path", tmpfile.Name()))
 				req.OffloadPath = tmpfile.Name()
@@ -66,13 +73,10 @@ func (h *RequestHistory) Add(req *models.CapturedRequest) {
 	}
 
 	// Ring Buffer Overwrite Logic
-	existing := h.buffer[h.head]
-	if existing != nil && existing.OnDisk {
-		// Clean up the old file if we are evicting it from history
-		if existing.Req.OffloadPath != "" {
-			os.Remove(existing.Req.OffloadPath)
-		}
-	}
+	// Note: We do NOT delete the old file here. If we delete the file associated
+	// with the evicted item, we risk crashing the UI if the user is currently
+	// viewing or editing that specific request (dangling reference).
+	// We rely on Close() to clean up all temp files on exit.
 
 	h.buffer[h.head] = stored
 	h.head = (h.head + 1) % h.limit
@@ -81,9 +85,11 @@ func (h *RequestHistory) Add(req *models.CapturedRequest) {
 	}
 }
 
-// GetMeta returns the storage wrapper.
-// We use this to check if we need to perform an async load.
+// GetMeta returns the storage wrapper safely.
 func (h *RequestHistory) GetMeta(index int) *StoredRequest {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
 	if h.size == 0 {
 		return nil
 	}
@@ -102,7 +108,11 @@ func (h *RequestHistory) GetMeta(index int) *StoredRequest {
 	return h.buffer[realIdx]
 }
 
+// List returns a slice of pointers to the requests in the history.
 func (h *RequestHistory) List() []*models.CapturedRequest {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
 	out := make([]*models.CapturedRequest, h.size)
 	start := (h.head - h.size + h.limit) % h.limit
 	for i := 0; i < h.size; i++ {
@@ -114,11 +124,17 @@ func (h *RequestHistory) List() []*models.CapturedRequest {
 	return out
 }
 
+// Close cleans up all temporary files created during the session.
 func (h *RequestHistory) Close() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
 	h.logger.Info("Cleaning up temporary files...")
+	// We iterate the entire buffer, not just the active size, just in case
+	// artifacts remain.
 	for _, item := range h.buffer {
 		if item != nil && item.OnDisk && item.Req.OffloadPath != "" {
-			os.Remove(item.Req.OffloadPath)
+			_ = os.Remove(item.Req.OffloadPath)
 		}
 	}
 	runtime.GC()

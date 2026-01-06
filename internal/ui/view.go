@@ -287,7 +287,6 @@ func renderTextDiff(b, s []byte, width int) string {
 		}
 
 		// Fix: Use lipgloss for padding to handle ANSI codes correctly.
-		// Previous fmt.Sprintf("%-50s", coloredText) failed because ANSI codes were counted in length.
 		line := lipgloss.JoinHorizontal(lipgloss.Left,
 			colStyle.Render(diffBaseStyle.Render(bTxt)),
 			sep,
@@ -329,13 +328,23 @@ func isBinary(data []byte) bool {
 }
 
 func clean(s string, w int) string {
-	// 1. Handle standard whitespace first (tab -> 2 spaces)
+	if w <= 0 {
+		return ""
+	}
+
+	// 1. Pre-truncate string to avoid massive allocation on huge lines.
+	// We allow 4x width as a rough heuristic for multi-byte chars, then refine.
+	if len(s) > w*4 {
+		s = s[:w*4]
+	}
+
+	// 2. Handle standard whitespace first (tab -> 2 spaces)
 	s = strings.ReplaceAll(s, "\t", "  ")
 
-	// 2. Strip Carriage Returns entirely
+	// 3. Strip Carriage Returns entirely
 	s = strings.ReplaceAll(s, "\r", "")
 
-	// 3. Replace other control characters
+	// 4. Replace other control characters
 	s = strings.Map(func(r rune) rune {
 		if unicode.IsPrint(r) {
 			return r
@@ -343,10 +352,7 @@ func clean(s string, w int) string {
 		return '·'
 	}, s)
 
-	// 4. Truncate to fit width (Panic Fix)
-	if w <= 0 {
-		return ""
-	}
+	// 5. Truncate to fit width
 	if utf8.RuneCountInString(s) > w {
 		if w < 3 {
 			return string([]rune(s)[:w])

@@ -472,6 +472,7 @@ func (m *Model) loadBodyCmd(path string) tea.Cmd {
 // It uses an injected Resolver to facilitate testing.
 func resolveTargetIPAndPort(req *models.CapturedRequest, r Resolver) (string, int) {
 	host := req.Headers["Host"]
+	// If Host header is missing, try to derive from URL
 	if host == "" {
 		if u, err := url.Parse(req.URL); err == nil {
 			host = u.Host
@@ -480,17 +481,18 @@ func resolveTargetIPAndPort(req *models.CapturedRequest, r Resolver) (string, in
 
 	// 1. Attempt to extract port from Host header first (Authoritative)
 	var hostPort int
-	if _, portStr, err := net.SplitHostPort(host); err == nil {
+	hostname := host
+	if h, portStr, err := net.SplitHostPort(host); err == nil {
+		hostname = h
 		if p, err := strconv.Atoi(portStr); err == nil {
 			hostPort = p
 		}
 	}
 
 	// 2. Resolve IP
-	// Strip port for lookup
-	hostname := host
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		hostname = h
+	// Fix: Don't resolve empty hostname
+	if hostname == "" {
+		return "", 0
 	}
 
 	// Use injected resolver
@@ -512,6 +514,7 @@ func resolveTargetIPAndPort(req *models.CapturedRequest, r Resolver) (string, in
 	}
 
 	// 3. Determine Port
+	// Default to 80, but try to detect HTTPS scheme from URL
 	port := 80
 	if u, err := url.Parse(req.URL); err == nil {
 		if u.Scheme == "https" {
@@ -561,6 +564,7 @@ func (m *Model) runRaceCmd(req *models.CapturedRequest, strategy string, concurr
 			targetIP, port := resolveTargetIPAndPort(req, resolver)
 			if targetIP != "" {
 				pc := packet.NewController(targetIP, port, concurrency, logger)
+				// Critical: We must ensure start doesn't indefinitely block handshake packets
 				if startErr := pc.Start(ctx); startErr == nil {
 					// Success: Controller is active.
 					defer pc.Close()
@@ -641,16 +645,42 @@ func textToRequest(text string, original *models.CapturedRequest) (*models.Captu
 		}
 	}
 	req.Body, _ = io.ReadAll(reader)
+
+	// -- Context Restoration --
+	// If the user provided a relative URL, we must try to preserve the scheme
+	// and host from the original request to prevent HTTP downgrades.
 	if _, ok := req.Headers["Host"]; !ok {
 		if h, ok := original.Headers["Host"]; ok {
 			req.Headers["Host"] = h
 		}
 	}
 
-	// Fix: Update Content-Length if it exists in the headers to match the new body.
-	// This prevents sending invalid HTTP requests where CL != Body Size.
-	if _, ok := req.Headers["Content-Length"]; ok {
+	// Fix: If original URL had a scheme and new one is relative, preserve scheme.
+	// This prevents "https://target" becoming "http://target" if user types "GET / ..."
+	if original != nil && !strings.HasPrefix(req.URL, "http") {
+		origURL, err := url.Parse(original.URL)
+		if err == nil && origURL.Scheme != "" {
+			// Reconstruct absolute URL
+			// Handle case where req.URL is just path
+			path := req.URL
+			if !strings.HasPrefix(path, "/") {
+				path = "/" + path
+			}
+			host := req.Headers["Host"]
+			if host == "" {
+				host = origURL.Host
+			}
+			req.URL = fmt.Sprintf("%s://%s%s", origURL.Scheme, host, path)
+		}
+	}
+
+	// Fix: Update Content-Length if it exists or if Body is present.
+	// Standard mandates Content-Length for non-empty bodies if not chunked.
+	if len(req.Body) > 0 {
 		req.Headers["Content-Length"] = strconv.Itoa(len(req.Body))
+	} else if _, ok := req.Headers["Content-Length"]; ok {
+		// If body is empty but header exists, set to 0 to be correct
+		req.Headers["Content-Length"] = "0"
 	}
 
 	return req, nil

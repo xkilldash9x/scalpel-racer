@@ -76,11 +76,18 @@ func TestUI_Workflow(t *testing.T) {
 	}
 
 	// 3. Toggle Strategy
+	// Cycle is h2 -> h1 -> h3 -> h2
 	m, _ = update(m, tea.KeyMsg{Type: tea.KeyTab})
 	if m.Strategy != "h1" {
 		t.Error("Strategy not toggled to h1")
 	}
-	m, _ = update(m, tea.KeyMsg{Type: tea.KeyTab}) // Toggle back
+
+	m, _ = update(m, tea.KeyMsg{Type: tea.KeyTab})
+	if m.Strategy != "h3" {
+		t.Error("Strategy not toggled to h3")
+	}
+
+	m, _ = update(m, tea.KeyMsg{Type: tea.KeyTab}) // Toggle back to h2
 	if m.Strategy != "h2" {
 		t.Error("Strategy not toggled back to h2")
 	}
@@ -97,6 +104,7 @@ func TestUI_Workflow(t *testing.T) {
 	}
 
 	// 5. Run Race (Mock)
+	// We are back on "h2" strategy, which is supported by MockFactory.
 	m, cmd := update(m, tea.KeyMsg{Type: tea.KeyCtrlS})
 	if m.State != StateRunning {
 		t.Error("Did not enter running state")
