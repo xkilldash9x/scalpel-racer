@@ -8,7 +8,7 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/florianl/go-nfqueue/v2 v2.0.2
 	github.com/google/gopacket v1.1.19
-	github.com/quic-go/quic-go v0.58.0
+	github.com/quic-go/quic-go v0.59.1
 	github.com/xkilldash9x/scalpel-cli v0.1.7
 	go.uber.org/zap v1.27.1
 )
